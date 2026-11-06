@@ -25,16 +25,21 @@ interface HostContext {
 }
 
 export function apply(ctx: HostContext, config: Config = Config({})): () => void {
-  return ctx.effect(async () => {
-    try {
-      const { composePlugin } = await import('./plugin.js');
-      const plugin = await composePlugin(ctx, config);
-      return () => plugin.dispose();
-    } catch (error) {
-      const code = toPublicError(error instanceof V2exError
-        ? error : new V2exError('incompatible_runtime')).code;
-      ctx.logger(name).warn(code);
-      return () => {};
-    }
-  }, 'v2ex-dsh-client: load');
+  try {
+    return ctx.effect(async () => {
+      try {
+        const { composePlugin } = await import('./plugin.js');
+        const plugin = await composePlugin(ctx, config);
+        return () => plugin.dispose();
+      } catch (error) {
+        const code = toPublicError(error instanceof V2exError
+          ? error : new V2exError('incompatible_runtime')).code;
+        ctx.logger(name).warn(code);
+        return () => {};
+      }
+    }, 'v2ex-dsh-client: load');
+  } catch {
+    ctx.logger(name).warn('incompatible_runtime');
+    return () => {};
+  }
 }
