@@ -99,7 +99,7 @@ export interface InterestProfile {
   source: 'manual' | 'history' | 'mixed';
 }
 
-export interface InterestEditFlags { labels: boolean; preferredNodes: boolean; exclusions: boolean }
+export interface InterestEditFlags { labels: boolean; preferredNodes: boolean; exclusions: boolean; legacyManual?: boolean }
 
 export interface Recommendation {
   topic: TopicListItem;

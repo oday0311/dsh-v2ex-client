@@ -58,7 +58,10 @@ function abortAware<T>(run: () => Promise<T>, signal: AbortSignal): Promise<T> {
     const abort = () => finish(reject, new V2exError('timeout'));
     signal.addEventListener('abort', abort, { once: true });
     if (signal.aborted) { abort(); return; }
-    Promise.resolve().then(run).then(value => finish(resolve as (value: never) => void, value), error => finish(reject, error));
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw new V2exError('timeout');
+      return run();
+    }).then(value => finish(resolve as (value: never) => void, value), error => finish(reject, error));
   });
 }
 
@@ -172,7 +175,7 @@ export class InterestService {
       if (effective.aborted || epoch !== this.accessEpoch) throw new V2exError('timeout');
       const { profile: latest, edits } = await this.state();
       if (!latest.authorized || effective.aborted || epoch !== this.accessEpoch) throw new V2exError('history_access_denied');
-      const firstSeed = latest.source === 'manual' && structuralRevision === this.structuralRevision;
+      const firstSeed = latest.source === 'manual' && !edits.legacyManual && structuralRevision === this.structuralRevision;
       return this.save({ ...latest,
         labels: edits.labels ? firstSeed ? mergeWeighted(learnedLabels, latest.labels) : latest.labels : learnedLabels,
         preferredNodes: edits.preferredNodes ? firstSeed ? mergeWeighted(learnedNodes, latest.preferredNodes) : latest.preferredNodes : learnedNodes,

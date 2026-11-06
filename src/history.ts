@@ -14,7 +14,7 @@ const record = (value: unknown): value is Record<string, unknown> =>
 const arrayField = (value: unknown, key: string): unknown[] | null =>
   Array.isArray(value) ? value : record(value) && Array.isArray(value[key]) ? value[key] as unknown[] : null;
 const badSource = /(?:^|[^A-Za-z0-9])(assistant|model|tool|plugin|system|developer|function|agent|bot)(?=$|[^A-Za-z0-9])/i;
-const credentialPattern = /\bV2EX_PERSONAL_ACCESS_TOKEN\s*[:=]\s*\S+|\bAuthorization\s*:?\s*Bearer\s+\S+|\b(?:token|api[-_]?key|password|secret)\s*[:=]\s*(?:["'][^"'\r\n]{12,}["']|[A-Za-z0-9_./+=-]{12,})/i;
+const credentialPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\bV2EX_PERSONAL_ACCESS_TOKEN\s*[:=]\s*\S+|\bAuthorization\s*:?\s*Bearer\s+\S+|\b(?:token|api[-_]?key|password|secret)\s*[:=]\s*(?:["'][^"'\r\n]{12,}["']|[A-Za-z0-9_./+=-]{12,})/i;
 const MAX_MESSAGE_BYTES = 4096;
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -71,6 +71,7 @@ function userText(event: Record<string, unknown>): string {
   for (const block of blocks) {
     if (!record(block) || block.type !== 'text' || typeof block.text !== 'string' ||
       Object.keys(block).some(key => !['type', 'text'].includes(key))) continue;
+    if (block.text.length > MAX_MESSAGE_BYTES) return '';
     const size = Buffer.byteLength(block.text);
     if (size > MAX_MESSAGE_BYTES || bytes + size + (parts.length ? 1 : 0) > MAX_MESSAGE_BYTES) return '';
     bytes += size + (parts.length ? 1 : 0);

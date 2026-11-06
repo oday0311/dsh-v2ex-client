@@ -140,3 +140,31 @@ test('oversized blocks and aggregate message bytes are rejected rather than trun
   assert.ok(!result.includes('private context'));
   assert.ok(result.includes('safe user text'));
 });
+
+test('unlabeled canonical UUID-shaped credentials discard the entire message', async () => {
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return [
+      { type: 'user/message', content: [{ type: 'text', text: 'private context 11111111-2222-4333-8444-555555555555' }] },
+      { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+});
+
+test('oversized strings are rejected before UTF-8 byte scanning', async () => {
+  const oversized = 'x'.repeat(20_000);
+  const original = Buffer.byteLength;
+  let scannedOversized = false;
+  Buffer.byteLength = ((value: string | ArrayBufferView | ArrayBuffer, ...rest: unknown[]) => {
+    if (value === oversized) scannedOversized = true;
+    return original(value as string, ...(rest as [BufferEncoding]));
+  }) as typeof Buffer.byteLength;
+  try {
+    const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+      async filterEvents() { return [
+        { type: 'user/message', content: [{ type: 'text', text: oversized }] },
+        { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+      ]; } }));
+    assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+    assert.equal(scannedOversized, false);
+  } finally { Buffer.byteLength = original; }
+});

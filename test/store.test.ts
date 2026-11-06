@@ -3,6 +3,7 @@ import test from 'node:test';
 import type { Domain } from '@deepseek-ai/dsh-storage-domain';
 import { DomainContentStore, v2exDomainSpec } from '../src/store.js';
 import type { Recommendation, TopicListItem } from '../src/contract.js';
+import { InterestService } from '../src/interests.js';
 
 type TableName = 'cache' | 'summaries' | 'recommendations';
 function memoryDomain() {
@@ -164,6 +165,15 @@ test('legacy profile is read as unauthorized structured data without changing do
     exclusions: ['ads'], feedback: [{ topicId: 42, interested: false }],
     updatedAt: '2026-11-06T00:00:00Z', source: 'manual' });
   assert.equal(v2exDomainSpec.version, 1);
+  const store = new DomainContentStore(memory.domain);
+  const service = new InterestService(store, { async readEligibleUserText() { return 'interest'; } },
+    { async completeJson() { return { labels: [{ name: 'Learned', weight: 1 }],
+      preferredNodes: [], exclusions: ['new'] }; } } as never);
+  await service.authorize();
+  const relearned = await service.relearn();
+  assert.deepEqual(relearned.labels, profile?.labels);
+  assert.deepEqual(relearned.preferredNodes, profile?.preferredNodes);
+  assert.deepEqual(relearned.exclusions, profile?.exclusions);
 });
 
 test('legacy mixed profiles preserve edits conservatively and clear resets private flags', async () => {
@@ -179,6 +189,26 @@ test('legacy mixed profiles preserve edits conservatively and clear resets priva
   await store.clearProfile();
   assert.deepEqual(await store.getProfileEdits(), { labels: false, preferredNodes: false, exclusions: false });
   assert.equal(await store.getProfile(), null);
+});
+
+test('legacy manual profile without edit metadata retains human fields after restart and relearn', async () => {
+  const memory = memoryDomain();
+  const oldProfile = { authorized: true, learningPaused: false,
+    labels: [{ name: 'Manual', weight: 1 }], preferredNodes: [{ name: 'manual-node', weight: 1 }], exclusions: [],
+    feedback: [], updatedAt: '2026-11-06T00:00:00Z', source: 'manual' as const };
+  await memory.domain.global.set({ settings: memory.readGlobal().settings, profile: oldProfile } as never);
+  const store = new DomainContentStore(memory.domain);
+  const service = new InterestService(store, { async readEligibleUserText() { return 'interest'; } },
+    { async completeJson() { return { labels: [{ name: 'Learned', weight: 1 }],
+      preferredNodes: [{ name: 'learned-node', weight: 1 }], exclusions: ['learned-exclusion'] }; } } as never);
+  const learned = await service.relearn();
+  assert.deepEqual(learned.labels, oldProfile.labels);
+  assert.deepEqual(learned.preferredNodes, oldProfile.preferredNodes);
+  assert.deepEqual(learned.exclusions, []);
+  const restarted = new InterestService(store, { async readEligibleUserText() { return 'interest'; } },
+    { async completeJson() { return { labels: [{ name: 'New', weight: 1 }], preferredNodes: [], exclusions: [] }; } } as never);
+  assert.deepEqual((await restarted.relearn()).labels, oldProfile.labels);
+  assert.equal('profileEdits' in (await store.getProfile() as object), false);
 });
 
 test('summary writes validate before replacement and evict oldest beyond 300', async () => {

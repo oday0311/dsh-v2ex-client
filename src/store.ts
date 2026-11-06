@@ -28,7 +28,7 @@ export const InterestProfileSchema = z.strictObject({
   updatedAt: timestamp, source: z.enum(['manual', 'history', 'mixed']),
 });
 export const InterestEditFlagsSchema = z.strictObject({
-  labels: z.boolean(), preferredNodes: z.boolean(), exclusions: z.boolean(),
+  labels: z.boolean(), preferredNodes: z.boolean(), exclusions: z.boolean(), legacyManual: z.boolean().optional(),
 });
 const noInterestEdits: InterestEditFlags = { labels: false, preferredNodes: false, exclusions: false };
 
@@ -198,6 +198,9 @@ export class DomainContentStore implements ContentStore {
     const parsed = InterestEditFlagsSchema.safeParse(current.profileEdits);
     if (parsed.success) return structuredClone(parsed.data);
     if (current.profileEdits !== undefined) throw new V2exError('invalid_response');
+    if (current.profile && (current.profile.source === 'manual' || !Object.hasOwn(current.profile, 'source'))) {
+      return { labels: true, preferredNodes: true, exclusions: true, legacyManual: true };
+    }
     return current.profile?.source === 'mixed' ? { labels: true, preferredNodes: true, exclusions: true } : { ...noInterestEdits };
   }
   async putInterestState(profile: InterestProfile, edits: InterestEditFlags): Promise<void> {

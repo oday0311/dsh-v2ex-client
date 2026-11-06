@@ -171,3 +171,32 @@ test('durable edit flags preserve only edited fields and feedback-only profiles 
   assert.deepEqual(feedback.preferredNodes.map(item => item.name), ['node3']);
   assert.deepEqual(feedback.feedback, [{ topicId: 1, interested: true }]);
 });
+
+test('clear between abort listener setup and scheduled work prevents history and model I/O', async () => {
+  for (const stage of ['history', 'model'] as const) {
+    const store = new FakeContentStore();
+    let reads = 0;
+    let models = 0;
+    const service = new InterestService(store, { async readEligibleUserText() { reads++; return 'interest'; } },
+      { async completeJson() { models++; return { labels: [], preferredNodes: [], exclusions: [] }; } } as never);
+    await service.authorize();
+    const original = AbortSignal.prototype.addEventListener;
+    let registrations = 0;
+    let clearing: Promise<void> | undefined;
+    AbortSignal.prototype.addEventListener = function (...args: Parameters<typeof original>) {
+      original.apply(this, args);
+      if (args[0] === 'abort' && ++registrations === (stage === 'history' ? 1 : 2)) {
+        queueMicrotask(() => { clearing = service.clear(); });
+      }
+    } as typeof original;
+    try {
+      await assert.rejects(service.relearn(), { code: 'timeout' });
+      await clearing;
+      await Promise.resolve();
+      await Promise.resolve();
+      assert.equal(reads, stage === 'history' ? 0 : 1);
+      assert.equal(models, 0);
+      assert.equal(await store.getProfile(), null);
+    } finally { AbortSignal.prototype.addEventListener = original; }
+  }
+});
