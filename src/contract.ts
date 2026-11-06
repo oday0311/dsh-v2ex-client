@@ -89,11 +89,14 @@ export interface TopicAiSummary {
 }
 
 export interface InterestProfile {
+  authorized: boolean;
+  learningPaused: boolean;
   labels: Array<{ name: string; weight: number }>;
-  preferredNodes: string[];
-  excludedTerms: string[];
+  preferredNodes: Array<{ name: string; weight: number }>;
+  exclusions: string[];
   feedback: Array<{ topicId: number; interested: boolean }>;
   updatedAt: string;
+  source: 'manual' | 'history' | 'mixed';
 }
 
 export interface Recommendation {

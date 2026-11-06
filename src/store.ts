@@ -17,13 +17,26 @@ export const PluginSettingsSchema = z.strictObject({
   quietHours: z.strictObject({ start: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), end: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/) }).nullable(),
 });
 
+const WeightedLabelSchema = z.strictObject({ name: z.string().trim().min(1).max(80), weight: z.number().finite().min(0).max(1) });
+const WeightedNodeSchema = z.strictObject({ name: nodeName, weight: z.number().finite().min(0).max(1) });
 export const InterestProfileSchema = z.strictObject({
+  authorized: z.boolean(), learningPaused: z.boolean(),
+  labels: z.array(WeightedLabelSchema).max(100),
+  preferredNodes: z.array(WeightedNodeSchema).max(100),
+  exclusions: z.array(z.string().trim().min(1).max(100)).max(100),
+  feedback: z.array(z.strictObject({ topicId, interested: z.boolean() })).max(500),
+  updatedAt: timestamp, source: z.enum(['manual', 'history', 'mixed']),
+});
+
+const LegacyProfileSchema = z.strictObject({
   labels: z.array(z.strictObject({ name: z.string().trim().min(1).max(80), weight: z.number().finite().min(-1).max(1) })).max(100),
   preferredNodes: z.array(nodeName).max(100),
   excludedTerms: z.array(z.string().trim().min(1).max(100)).max(100),
-  feedback: z.array(z.strictObject({ topicId, interested: z.boolean() })).max(500),
-  updatedAt: timestamp,
-});
+  feedback: z.array(z.strictObject({ topicId, interested: z.boolean() })).max(500), updatedAt: timestamp,
+}).transform((old): InterestProfile => ({ authorized: false, learningPaused: false,
+  labels: old.labels.map(item => ({ ...item, weight: Math.max(0, item.weight) })),
+  preferredNodes: old.preferredNodes.map(name => ({ name, weight: 1 })),
+  exclusions: old.excludedTerms, feedback: old.feedback, updatedAt: old.updatedAt, source: 'manual' }));
 
 const TopicListItemSchema = z.strictObject({
   id: topicId, title: z.string().min(1).max(500),
@@ -63,7 +76,7 @@ export const defaultSettings: PluginSettings = {
 export const v2exDomainSpec = defineDomain({
   name: 'v2ex_client', version: 1,
   global: {
-    schema: z.strictObject({ settings: PluginSettingsSchema, profile: InterestProfileSchema.nullable() }),
+    schema: z.strictObject({ settings: PluginSettingsSchema, profile: z.union([InterestProfileSchema, LegacyProfileSchema]).nullable() }),
     initial: { settings: defaultSettings, profile: null as InterestProfile | null },
   },
   tables: {
@@ -163,7 +176,13 @@ export class DomainContentStore implements ContentStore {
     const parsed = parseWrite(PluginSettingsSchema, settings);
     await this.updateGlobal((current) => ({ ...current, settings: parsed }));
   }
-  async getProfile(): Promise<InterestProfile | null> { return structuredClone(this.domain.global.get().profile); }
+  async getProfile(): Promise<InterestProfile | null> {
+    const profile = this.domain.global.get().profile;
+    if (profile === null) return null;
+    const parsed = z.union([InterestProfileSchema, LegacyProfileSchema]).safeParse(profile);
+    if (!parsed.success) throw new V2exError('invalid_response');
+    return structuredClone(parsed.data);
+  }
   async putProfile(profile: InterestProfile): Promise<void> {
     const parsed = parseWrite(InterestProfileSchema, profile);
     await this.updateGlobal((current) => ({ ...current, profile: parsed }));

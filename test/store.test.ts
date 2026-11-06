@@ -142,11 +142,27 @@ test('concurrent settings and profile writes preserve both global fields', async
     await originalSet(value);
   };
   const settingsWrite = store.putSettings({ ...(await store.getSettings()), refreshIntervalMinutes: 15 });
-  const profileWrite = store.putProfile({ labels: [], preferredNodes: ['tech'], excludedTerms: [], feedback: [], updatedAt: '2026-11-06T00:00:00Z' });
+  const profileWrite = store.putProfile({ authorized: false, learningPaused: false, labels: [],
+    preferredNodes: [{ name: 'tech', weight: 1 }], exclusions: [], feedback: [],
+    updatedAt: '2026-11-06T00:00:00Z', source: 'manual' });
   releaseFirst();
   await Promise.all([settingsWrite, profileWrite]);
   assert.equal((await store.getSettings()).refreshIntervalMinutes, 15);
-  assert.deepEqual((await store.getProfile())?.preferredNodes, ['tech']);
+  assert.deepEqual((await store.getProfile())?.preferredNodes, [{ name: 'tech', weight: 1 }]);
+});
+
+test('legacy profile is read as unauthorized structured data without changing domain version', async () => {
+  const memory = memoryDomain();
+  await memory.domain.global.set({ settings: memory.readGlobal().settings,
+    profile: { labels: [{ name: 'Rust', weight: -0.4 }], preferredNodes: ['tech'],
+      excludedTerms: ['ads'], feedback: [{ topicId: 42, interested: false }],
+      updatedAt: '2026-11-06T00:00:00Z' } } as never);
+  const profile = await new DomainContentStore(memory.domain).getProfile();
+  assert.deepEqual(profile, { authorized: false, learningPaused: false,
+    labels: [{ name: 'Rust', weight: 0 }], preferredNodes: [{ name: 'tech', weight: 1 }],
+    exclusions: ['ads'], feedback: [{ topicId: 42, interested: false }],
+    updatedAt: '2026-11-06T00:00:00Z', source: 'manual' });
+  assert.equal(v2exDomainSpec.version, 1);
 });
 
 test('summary writes validate before replacement and evict oldest beyond 300', async () => {

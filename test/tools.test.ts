@@ -49,7 +49,7 @@ test('plugin composition registers and unregisters browsing and summary tools', 
     get(name: string) { assert.equal(name, 'connection'); return { fetch: { register() { return () => {}; } } }; },
   };
   const plugin = await composePlugin(host as never, Config({}));
-  assert.deepEqual(names.sort(), ['v2ex_hot', 'v2ex_latest', 'v2ex_node_topics', 'v2ex_summarize_topic', 'v2ex_topic']);
+  assert.deepEqual(names.sort(), ['v2ex_hot', 'v2ex_interest_profile', 'v2ex_latest', 'v2ex_node_topics', 'v2ex_summarize_topic', 'v2ex_topic']);
   await plugin.dispose();
   await plugin.dispose();
   assert.deepEqual(removed.sort(), names);

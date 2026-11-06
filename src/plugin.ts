@@ -5,9 +5,11 @@ import { AuthService, DshCredentialVault, type CredentialProvider } from './cred
 import { v2exDomainSpec, DomainContentStore } from './store.js';
 import { ContentCache, RequestBudget } from './cache.js';
 import { ContentService } from './content-service.js';
-import { createBrowsingTools, createSummaryTool } from './tools.js';
+import { createBrowsingTools, createInterestTool, createSummaryTool } from './tools.js';
 import { DshModelGateway } from './model-gateway.js';
 import { IntelligenceService } from './intelligence.js';
+import { InterestService } from './interests.js';
+import { DshHistoryReader } from './history.js';
 import { registerV2exHttpRoutes, type FetchConnection } from './http-routes.js';
 import type { Domain } from '@deepseek-ai/dsh-storage-domain';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
@@ -21,6 +23,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     reflect?: { get(name: string): unknown };
     llm?: unknown;
     agentDefaultModel?: unknown;
+    sessionQuery?: unknown;
   };
   if (!host.credentials || !host.storageDomain || !host.tools) {
     throw new V2exError('incompatible_runtime');
@@ -51,9 +54,17 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       get llm() { return optional('llm'); },
       get agentDefaultModel() { return optional('agentDefaultModel'); },
     } as never), store);
+    const interests = new InterestService(store, new DshHistoryReader(() => {
+      try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }
+      catch { return undefined; }
+    }), new DshModelGateway({
+      get llm() { return optional('llm'); },
+      get agentDefaultModel() { return optional('agentDefaultModel'); },
+    } as never));
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
-    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence }));
+    disposers.push(host.tools.register(createInterestTool(interests)));
+    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence, interests }));
   } catch (error) {
     for (const dispose of disposers.reverse()) { try { await dispose(); } catch { /* Preserve startup error. */ } }
     await domain.close();
