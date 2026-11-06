@@ -301,3 +301,27 @@ test('a delayed mark-read write cannot restore an evicted recommendation', async
   await Promise.all([read, insert]);
   assert.equal(memory.tables.recommendations.size, 500);
 });
+
+test('account-scoped interests and recommendation batches survive reload without exposing legacy state', async () => {
+  const memory = memoryDomain();
+  const first = new DomainContentStore(memory.domain);
+  const alice = 'a'.repeat(64) + ':'; const bob = 'b'.repeat(64) + ':';
+  const legacy = { authorized: true, learningPaused: false, labels: [{ name: 'legacy', weight: 1 }],
+    preferredNodes: [], exclusions: [], feedback: [], updatedAt: '2026-11-07T00:00:00Z', source: 'manual' as const };
+  await first.putProfile(legacy);
+  assert.equal(await first.getProfile(alice), null);
+  await first.putInterestState({ ...legacy, labels: [{ name: 'Alice', weight: 1 }] },
+    { labels: true, preferredNodes: false, exclusions: true }, alice);
+  await first.putInterestState({ ...legacy, labels: [{ name: 'Bob', weight: 1 }] },
+    { labels: false, preferredNodes: true, exclusions: false }, bob);
+  await first.putRecommendationBatch(alice, { generatedAt: '2026-11-07T00:00:00Z', topicIds: [1] });
+  const reloaded = new DomainContentStore(memory.domain);
+  assert.deepEqual((await reloaded.getProfile(alice))?.labels.map(value => value.name), ['Alice']);
+  assert.deepEqual((await reloaded.getProfile(bob))?.labels.map(value => value.name), ['Bob']);
+  assert.equal((await reloaded.getProfile())?.labels[0]?.name, 'legacy');
+  assert.deepEqual(await reloaded.getProfileEdits(alice), { labels: true, preferredNodes: false, exclusions: true });
+  assert.deepEqual(await reloaded.getRecommendationBatch(alice), { generatedAt: '2026-11-07T00:00:00Z', topicIds: [1] });
+  await reloaded.clearProfile(bob);
+  assert.equal(await reloaded.getProfile(bob), null);
+  assert.equal((await reloaded.getProfile(alice))?.labels[0]?.name, 'Alice');
+});

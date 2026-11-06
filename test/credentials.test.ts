@@ -72,6 +72,17 @@ test('verified account scope remains available offline in memory and clears on l
   await assert.rejects(auth.account(), { code: 'not_authenticated' });
 });
 
+test('logout revalidates an externally replaced credential before choosing the cleanup account', async () => {
+  const vault = new FakeCredentialVault(); const cleaned: Array<string | null> = [];
+  const api = { async readToken() { return { scope: 'everything' }; },
+    async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+  const auth = new AuthService(api as never, vault, async account => { cleaned.push(account); });
+  await auth.login('ALICE_FAKE_VALUE');
+  vault.value = 'BOB_FAKE_VALUE';
+  await auth.logout(true);
+  assert.deepEqual(cleaned, ['bob']);
+});
+
 test('DSH vault uses the plugin-owned reference for resolve, write, clear, and describe', async () => {
   const values = new Map<string, string>();
   const refs: string[] = [];

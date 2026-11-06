@@ -47,20 +47,20 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       get llm() { return optional('llm'); },
       get agentDefaultModel() { return optional('agentDefaultModel'); },
     } as never);
+    let auth!: AuthService;
     const interests = new InterestService(store, new DshHistoryReader(() => {
       try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }
       catch { return undefined; }
-    }), model);
-    const auth = new AuthService(api, vault, async () => {
-      await interests.clear();
-      for (const [key] of domain.table('recommendations').entries()) {
-        await domain.table('recommendations').delete(key);
-      }
+    }), model, undefined, () => auth.account());
+    let recommendations!: RecommendationService;
+    auth = new AuthService(api, vault, async (account) => {
+      await (account ? Promise.all([interests.clear(account), recommendations.clear(account)]) :
+        Promise.all([interests.clearLegacy(), recommendations.clearLegacy()]));
     });
     const service = new ContentService(api, vault,
       new ContentCache(store), new RequestBudget());
     const intelligence = new IntelligenceService(model, store);
-    const recommendations = new RecommendationService(store, intelligence, () => auth.account(), undefined, interests);
+    recommendations = new RecommendationService(store, intelligence, () => auth.account(), undefined, interests);
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));

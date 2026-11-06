@@ -4,6 +4,7 @@ import { V2exError } from './errors.js';
 import type { HistoryReader } from './history.js';
 import type { ModelGateway } from './model-gateway.js';
 import { InterestProfileSchema } from './store.js';
+import { accountScope, resolveAccountScope } from './account-scope.js';
 
 const weighted = z.strictObject({ name: z.string().trim().min(1).max(80), weight: z.number().finite().min(0).max(1) });
 const modelProfile = z.strictObject({
@@ -77,37 +78,43 @@ export class InterestService {
   private structuralRevision = 0;
   constructor(private readonly store: Pick<ContentStore, 'getProfile' | 'getProfileEdits' | 'putInterestState' | 'clearProfile'>,
     private readonly history: HistoryReader, private readonly model: ModelGateway,
-    private readonly clock: () => Date = () => new Date()) {}
+    private readonly clock: () => Date = () => new Date(), private readonly account?: () => Promise<string>) {}
 
   private serialized<T>(operation: () => Promise<T>): Promise<T> {
     const task = this.queue.then(operation);
     this.queue = task.then(() => {}, () => {});
     return task;
   }
-  private async state(): Promise<{ profile: InterestProfile; edits: InterestEditFlags }> {
-    return { profile: await this.store.getProfile() ?? initial(this.clock), edits: await this.store.getProfileEdits() };
+  private scope(account?: string): Promise<string | undefined> {
+    if (account !== undefined) return Promise.resolve(accountScope(account));
+    return this.account ? resolveAccountScope(this.account) : Promise.resolve(undefined);
   }
-  private async save(profile: InterestProfile, edits: InterestEditFlags): Promise<InterestProfile> {
+  private async state(scope?: string): Promise<{ profile: InterestProfile; edits: InterestEditFlags }> {
+    return { profile: await this.store.getProfile(scope) ?? initial(this.clock), edits: await this.store.getProfileEdits(scope) };
+  }
+  private async save(profile: InterestProfile, edits: InterestEditFlags, scope?: string): Promise<InterestProfile> {
     const parsed = InterestProfileSchema.safeParse(profile);
     if (!parsed.success) throw new V2exError('invalid_response');
-    await this.store.putInterestState(parsed.data, edits);
+    await this.store.putInterestState(parsed.data, edits, scope);
     return parsed.data;
   }
-  get(): Promise<InterestProfile> { return this.serialized(async () => (await this.state()).profile); }
-  authorize(): Promise<InterestProfile> { return this.serialized(async () => {
-    const { profile, edits } = await this.state();
-    return this.save({ ...profile, authorized: true, updatedAt: this.clock().toISOString() }, edits);
+  async get(): Promise<InterestProfile> { const scope = await this.scope(); return this.serialized(async () => (await this.state(scope)).profile); }
+  async authorize(): Promise<InterestProfile> { const scope = await this.scope(); return this.serialized(async () => {
+    const { profile, edits } = await this.state(scope);
+    return this.save({ ...profile, authorized: true, updatedAt: this.clock().toISOString() }, edits, scope);
   }); }
-  revoke(): Promise<InterestProfile> { this.accessEpoch++; for (const active of this.activeRelearn) active.abort(); return this.serialized(async () => {
-    const { profile, edits } = await this.state();
-    return this.save({ ...profile, authorized: false, updatedAt: this.clock().toISOString() }, edits);
+  revoke(): Promise<InterestProfile> { this.accessEpoch++; for (const active of this.activeRelearn) active.abort(); const scope = this.scope(); return this.serialized(async () => {
+    const resolvedScope = await scope;
+    const { profile, edits } = await this.state(resolvedScope);
+    return this.save({ ...profile, authorized: false, updatedAt: this.clock().toISOString() }, edits, resolvedScope);
   }); }
-  clear(): Promise<void> { this.accessEpoch++; for (const active of this.activeRelearn) active.abort();
-    return this.serialized(() => this.store.clearProfile()); }
-  update(edit: InterestEdit): Promise<InterestProfile> { return this.serialized(async () => {
+  clear(account?: string): Promise<void> { this.accessEpoch++; for (const active of this.activeRelearn) active.abort(); const scope = this.scope(account);
+    return this.serialized(async () => this.store.clearProfile(await scope)); }
+  clearLegacy(): Promise<void> { return this.serialized(() => this.store.clearProfile()); }
+  async update(edit: InterestEdit): Promise<InterestProfile> { const scope = await this.scope(); return this.serialized(async () => {
     const parsed = editSchema.safeParse(edit);
     if (!parsed.success) throw new V2exError('invalid_request');
-    const { profile: old, edits } = await this.state();
+    const { profile: old, edits } = await this.state(scope);
     const structuralEdit = parsed.data.labels !== undefined || parsed.data.preferredNodes !== undefined ||
       parsed.data.exclusions !== undefined;
     const nextEdits = { ...edits, labels: edits.labels || parsed.data.labels !== undefined,
@@ -119,16 +126,16 @@ export class InterestService {
       exclusions: parsed.data.exclusions === undefined ? old.exclusions : exclusions(parsed.data.exclusions),
       source: structuralEdit ? old.source === 'manual' ? 'manual' as const : 'mixed' as const : old.source,
       updatedAt: this.clock().toISOString() };
-    const saved = await this.save(next, nextEdits);
+    const saved = await this.save(next, nextEdits, scope);
     if (structuralEdit) this.structuralRevision++;
     return saved;
   }); }
-  recordFeedback(topicId: number, interested: boolean): Promise<InterestProfile> { return this.serialized(async () => {
+  async recordFeedback(topicId: number, interested: boolean, account?: string): Promise<InterestProfile> { const scope = await this.scope(account); return this.serialized(async () => {
     if (!Number.isSafeInteger(topicId) || topicId < 1 || typeof interested !== 'boolean') throw new V2exError('invalid_request');
-    const { profile: old, edits } = await this.state();
+    const { profile: old, edits } = await this.state(scope);
     const feedback = [...old.feedback.filter(item => item.topicId !== topicId), { topicId, interested }].slice(-500);
     return this.save({ ...old, feedback, source: old.source === 'history' ? 'mixed' : old.source,
-      updatedAt: this.clock().toISOString() }, edits);
+      updatedAt: this.clock().toISOString() }, edits, scope);
   }); }
   async perform(action: string, payload?: unknown, signal?: AbortSignal): Promise<InterestProfile> {
     if (action === 'get' && payload === undefined) return this.get();
@@ -144,9 +151,10 @@ export class InterestService {
     throw new V2exError('invalid_request');
   }
   async relearn(signal?: AbortSignal): Promise<InterestProfile> {
+    const scope = await this.scope();
     const epoch = this.accessEpoch;
     const { controller, structuralRevision } = await this.serialized(async () => {
-      const { profile } = await this.state();
+      const { profile } = await this.state(scope);
       if (!profile.authorized || epoch !== this.accessEpoch) throw new V2exError('history_access_denied');
       if (signal?.aborted) throw new V2exError('timeout');
       const active = new AbortController();
@@ -173,7 +181,8 @@ export class InterestService {
     const learnedNodes = normalize(parsed.data.preferredNodes);
     return await this.serialized(async () => {
       if (effective.aborted || epoch !== this.accessEpoch) throw new V2exError('timeout');
-      const { profile: latest, edits } = await this.state();
+      if (await this.scope() !== scope) throw new V2exError('history_access_denied');
+      const { profile: latest, edits } = await this.state(scope);
       if (!latest.authorized || effective.aborted || epoch !== this.accessEpoch) throw new V2exError('history_access_denied');
       const firstSeed = latest.source === 'manual' && !edits.legacyManual && structuralRevision === this.structuralRevision;
       return this.save({ ...latest,
@@ -181,7 +190,7 @@ export class InterestService {
         preferredNodes: edits.preferredNodes ? firstSeed ? mergeWeighted(learnedNodes, latest.preferredNodes) : latest.preferredNodes : learnedNodes,
         exclusions: edits.exclusions ? latest.exclusions : exclusions(parsed.data.exclusions),
         source: edits.labels || edits.preferredNodes || edits.exclusions || latest.feedback.length ? 'mixed' : 'history',
-        updatedAt: this.clock().toISOString() }, edits);
+        updatedAt: this.clock().toISOString() }, edits, scope);
     });
     } finally {
       signal?.removeEventListener('abort', abort);

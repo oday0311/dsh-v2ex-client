@@ -4,6 +4,7 @@ import { RecommendationService } from '../src/recommendations.js';
 import { V2exError } from '../src/errors.js';
 import { FakeContentStore } from './helpers/fakes.js';
 import type { InterestProfile, TopicListItem } from '../src/contract.js';
+import { accountScope } from '../src/account-scope.js';
 
 const at = '2026-11-07T00:00:00.000Z';
 const topic = (id: number, title: string, node = 'dev', updated = at): TopicListItem => ({
@@ -28,7 +29,9 @@ class RecordingModel {
 
 function service(options: { store?: FakeContentStore; interest?: InterestProfile | null; model?: RecordingModel; account?: string } = {}) {
   const store = options.store ?? new FakeContentStore();
-  store.profile = options.interest === undefined ? profile() : options.interest;
+  const interest = options.interest === undefined ? profile() : options.interest;
+  if (interest) store.accountProfiles.set(accountScope(options.account ?? 'alice'), { profile: interest,
+    edits: { labels: false, preferredNodes: false, exclusions: false } });
   const model = options.model ?? new RecordingModel({ items: [] });
   return { store, model, recommender: new RecommendationService(store, model as never,
     async () => options.account ?? 'alice', () => new Date(at)) };
@@ -91,7 +94,7 @@ test('refresh preserves existing read and feedback state for the same topic', as
 
 test('concurrent refresh cannot overwrite a later read or not-interested action', async () => {
   const store = new FakeContentStore();
-  store.profile = profile();
+  store.accountProfiles.set(accountScope('alice'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
   let release!: () => void;
   const gate = new Promise<void>(resolve => { release = resolve; });
   const model = { async rankRecommendationCandidates() {
@@ -116,7 +119,8 @@ test('concurrent refresh cannot overwrite a later read or not-interested action'
 
 test('recommendations are account-scoped while manual interests work without history authorization', async () => {
   const shared = new FakeContentStore();
-  shared.profile = profile();
+  shared.accountProfiles.set(accountScope('alice'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  shared.accountProfiles.set(accountScope('bob'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
   const alice = service({ store: shared, account: 'alice', model: new RecordingModel({ items: [{ topicId: 1, score: 0.9, reason: 'A', matchedInterests: [] }] }) }).recommender;
   await alice.refreshCandidates([topic(1, 'TypeScript')]);
   const bob = service({ store: shared, account: 'bob' }).recommender;
@@ -146,7 +150,7 @@ test('credential-shaped profile values and topics never reach the model, and lar
 });
 
 test('a slower older refresh cannot overwrite a newer ranking', async () => {
-  const store = new FakeContentStore(); store.profile = profile();
+  const store = new FakeContentStore(); store.accountProfiles.set(accountScope('alice'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
   let entered!: () => void; let release!: () => void;
   const started = new Promise<void>(resolve => { entered = resolve; });
   const gate = new Promise<void>(resolve => { release = resolve; });
@@ -180,4 +184,76 @@ test('profile feedback suppresses stored items even if the recommendation write 
     read: false, feedback: null,
   });
   assert.deepEqual((await f.recommender.list()).items, []);
+});
+
+test('list reapplies current exclusions and uses durable batch freshness rather than score order', async () => {
+  const store = new FakeContentStore();
+  store.accountProfiles.set(accountScope('alice'), { profile: profile({ exclusions: ['crypto'] }), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  const scope = '2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90:';
+  await store.putRecommendation(`${scope}1`, { topic: topic(1, 'crypto sale'), score: 1, reason: 'old', matchedInterests: [],
+    generatedAt: '2026-11-01T00:00:00.000Z', read: false, feedback: null });
+  await store.putRecommendation(`${scope}2`, { topic: topic(2, 'TypeScript'), score: 0.1, reason: 'new', matchedInterests: [],
+    generatedAt: '2026-11-07T00:00:00.000Z', read: false, feedback: null });
+  await store.putRecommendationBatch(scope, { generatedAt: '2026-11-07T00:00:00.000Z', topicIds: [1, 2] });
+  const recommender = new RecommendationService(store, new RecordingModel({ items: [] }) as never,
+    async () => 'alice', () => new Date('2026-11-07T00:10:00.000Z'));
+  const listed = await recommender.list();
+  assert.deepEqual(listed.items.map(value => value.topic.id), [2]);
+  assert.equal(listed.generatedAt, '2026-11-07T00:00:00.000Z');
+  assert.equal(listed.stale, false);
+  assert.equal(listed.source, 'stored');
+});
+
+test('an empty successful refresh prunes the account batch and remains honestly fresh after reload', async () => {
+  const store = new FakeContentStore(); store.accountProfiles.set(accountScope('alice'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  const scope = '2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90:';
+  await store.putRecommendation(`${scope}1`, { topic: topic(1, 'old'), score: 1, reason: 'old', matchedInterests: [],
+    generatedAt: '2026-11-01T00:00:00.000Z', read: true, feedback: 'interested' });
+  const first = new RecommendationService(store, new RecordingModel({ items: [] }) as never,
+    async () => 'alice', () => new Date(at));
+  const refreshed = await first.refreshCandidates([topic(2, 'TypeScript')]);
+  assert.deepEqual(refreshed.items, []);
+  assert.equal(refreshed.generatedAt, at);
+  assert.equal(refreshed.source, 'generated');
+  const reloaded = new RecommendationService(store, new RecordingModel({ items: [] }) as never,
+    async () => 'alice', () => new Date('2026-11-07T00:10:00.000Z'));
+  const listed = await reloaded.list();
+  assert.deepEqual(listed.items, []);
+  assert.equal(listed.generatedAt, at);
+  assert.equal(listed.stale, false);
+  assert.equal(listed.source, 'stored');
+  assert.equal(store.recommendations.size, 0);
+});
+
+test('clear invalidates a non-cooperative in-flight refresh before deleting account data', async () => {
+  const store = new FakeContentStore(); store.accountProfiles.set(accountScope('alice'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const intelligence = { async rankRecommendationCandidates() {
+    entered(); await held; return { items: [{ topicId: 1, score: 1, reason: 'late', matchedInterests: [] }] };
+  } };
+  const recommender = new RecommendationService(store, intelligence as never, async () => 'alice', () => new Date(at));
+  const refresh = recommender.refreshCandidates([topic(1, 'TypeScript')]);
+  await started;
+  const clearing = recommender.clear('alice');
+  await clearing;
+  release();
+  await assert.rejects(refresh, { code: 'timeout' });
+  assert.equal(store.recommendations.size, 0);
+  assert.equal(store.recommendationBatches.size, 0);
+});
+
+test('account replacement during refresh prevents any result from committing to either account', async () => {
+  const store = new FakeContentStore(); store.accountProfiles.set(accountScope('alice'), { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } }); let account = 'alice';
+  let entered!: () => void; let release!: () => void;
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const recommender = new RecommendationService(store, { async rankRecommendationCandidates() {
+    entered(); await held; return { items: [{ topicId: 1, score: 1, reason: 'late', matchedInterests: [] }] };
+  } } as never, async () => account, () => new Date(at));
+  const refresh = recommender.refreshCandidates([topic(1, 'TypeScript')]);
+  await started; account = 'bob'; release();
+  await assert.rejects(refresh, { code: 'timeout' });
+  assert.equal(store.recommendations.size, 0);
 });

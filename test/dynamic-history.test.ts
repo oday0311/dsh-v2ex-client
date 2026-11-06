@@ -3,14 +3,17 @@ import test from 'node:test';
 import { Context } from '@deepseek-ai/cordis';
 import { composePlugin } from '../src/plugin.js';
 import { Config } from '../src/index.js';
+import { MEMBER_OK, TOKEN, TOKEN_OK } from './fixtures/v2ex.js';
+import { jsonResponse } from './helpers/fakes.js';
 
 test('late and replaced sessionQuery is resolved only after stored authorization', async () => {
   const ctx = new Context();
-  let global = { settings: {}, profile: null as unknown };
+  let global: Record<string, unknown> = { settings: {}, profile: null };
   const tables = { cache: new Map(), summaries: new Map(), recommendations: new Map() };
   const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
-  ctx.provide('credentials', { async resolve() { return undefined; }, async unset() {}, async set() {},
-    async describe() { return { configured: false, writable: true }; } });
+  let stored: string | undefined = TOKEN;
+  ctx.provide('credentials', { async resolve() { return stored ? { value: stored } : undefined; }, async unset() { stored = undefined; }, async set(_ref: string, value: string) { stored = value; },
+    async describe() { return { configured: stored !== undefined, writable: true }; } });
   ctx.provide('storageDomain', { async open() { return {
     global: { get: () => structuredClone(global), set: async (next: typeof global) => { global = structuredClone(next); } },
     table(name: keyof typeof tables) { const map = tables[name]; return { entries: () => map.entries(), delete: async (key: string) => map.delete(key) }; },
@@ -33,6 +36,11 @@ test('late and replaced sessionQuery is resolved only after stored authorization
     yield { type: 'finish', reason: { kind: 'stop' } };
   } };
   let plugin: Awaited<ReturnType<typeof composePlugin>> | undefined;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async (input: RequestInfo | URL) => {
+    const path = new URL(String(input)).pathname;
+    return jsonResponse(path.endsWith('/token') ? TOKEN_OK : MEMBER_OK, 200, { 'content-type': 'application/json' });
+  }) as typeof fetch;
   try {
     plugin = await composePlugin(ctx, Config({}));
     assert.equal((await response('POST', { action: 'relearn' })).status, 403);
@@ -68,7 +76,8 @@ test('late and replaced sessionQuery is resolved only after stored authorization
     assert.equal((await logout).status, 200);
     await learning;
     assert.equal(global.profile, null);
-    assert.equal((await response('GET').then(value => value.json()) as { data: { authorized: boolean } }).data.authorized, false);
+    assert.deepEqual(global.accountProfiles, {});
+    assert.equal((await response('GET')).status, 401);
     await removeHeld(); await removeLlm(); await removeModel();
-  } finally { await plugin?.dispose(); await ctx.fiber.dispose(); }
+  } finally { globalThis.fetch = originalFetch; await plugin?.dispose(); await ctx.fiber.dispose(); }
 });

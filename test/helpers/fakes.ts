@@ -1,5 +1,5 @@
 import type { CredentialVault } from '../../src/credentials.js';
-import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from '../../src/contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, TopicAiSummary } from '../../src/contract.js';
 
 export class FakeCredentialVault implements CredentialVault {
   value: string | undefined;
@@ -35,6 +35,8 @@ export function jsonResponse(value: unknown, status = 200, headers?: HeadersInit
 export class FakeContentStore implements ContentStore {
   readonly cache = new Map<string, CacheRecord>();
   readonly recommendations = new Map<string, Recommendation>();
+  readonly recommendationBatches = new Map<string, RecommendationBatch>();
+  readonly accountProfiles = new Map<string, { profile: InterestProfile; edits: InterestEditFlags }>();
   readonly summaries = new Map<string, TopicAiSummary>();
   settings: PluginSettings = {
     refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
@@ -48,13 +50,20 @@ export class FakeContentStore implements ContentStore {
   async deleteCache(key: string) { this.cache.delete(key); }
   async getSettings() { return this.settings; }
   async putSettings(value: PluginSettings) { this.settings = value; }
-  async getProfile() { return this.profile; }
-  async putProfile(value: InterestProfile) { this.profile = value; }
-  async getProfileEdits() { return { ...this.profileEdits }; }
-  async putInterestState(profile: InterestProfile, edits: InterestEditFlags) {
-    this.profile = profile; this.profileEdits = { ...edits };
+  async getProfile(scope?: string) { return scope ? this.accountProfiles.get(scope)?.profile ?? null : this.profile; }
+  async putProfile(value: InterestProfile, scope?: string) {
+    if (scope) this.accountProfiles.set(scope, { profile: value, edits: this.accountProfiles.get(scope)?.edits ?? { labels: false, preferredNodes: false, exclusions: false } });
+    else this.profile = value;
   }
-  async clearProfile() { this.profile = null; this.profileEdits = { labels: false, preferredNodes: false, exclusions: false }; }
+  async getProfileEdits(scope?: string) { return { ...(scope ? this.accountProfiles.get(scope)?.edits ?? { labels: false, preferredNodes: false, exclusions: false } : this.profileEdits) }; }
+  async putInterestState(profile: InterestProfile, edits: InterestEditFlags, scope?: string) {
+    if (scope) this.accountProfiles.set(scope, { profile, edits: { ...edits } });
+    else { this.profile = profile; this.profileEdits = { ...edits }; }
+  }
+  async clearProfile(scope?: string) {
+    if (scope) this.accountProfiles.delete(scope);
+    else { this.profile = null; this.profileEdits = { labels: false, preferredNodes: false, exclusions: false }; }
+  }
   async getRecommendation(key: string) { return this.recommendations.get(key); }
   async putRecommendation(key: string, value: Recommendation) {
     const previous = this.recommendations.get(key);
@@ -69,6 +78,16 @@ export class FakeContentStore implements ContentStore {
     const value = this.recommendations.get(key);
     if (!value) throw new Error('not found');
     this.recommendations.set(key, { ...value, feedback });
+  }
+  async deleteRecommendation(key: string) { this.recommendations.delete(key); }
+  async getRecommendationBatch(scope: string) { return this.recommendationBatches.get(scope) ?? null; }
+  async putRecommendationBatch(scope: string, batch: RecommendationBatch) { this.recommendationBatches.set(scope, batch); }
+  async clearRecommendations(scope: string) {
+    for (const key of this.recommendations.keys()) if (key.startsWith(scope)) this.recommendations.delete(key);
+    this.recommendationBatches.delete(scope);
+  }
+  async clearLegacyRecommendations() {
+    for (const key of this.recommendations.keys()) if (/^[1-9]\d*$/.test(key)) this.recommendations.delete(key);
   }
   async getSummary(key: string) { return this.summaries.get(key); }
   async putSummary(key: string, value: TopicAiSummary) { this.summaries.set(key, value); }

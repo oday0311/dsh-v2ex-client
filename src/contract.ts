@@ -117,6 +117,7 @@ export interface RecommendationList {
   stale: boolean;
   source: 'generated' | 'stored';
 }
+export interface RecommendationBatch { generatedAt: string; topicIds: number[] }
 
 export interface CacheRecord<T = unknown> {
   value: T;
@@ -139,15 +140,20 @@ export interface ContentStore {
   deleteCache(key: string): Promise<void>;
   getSettings(): Promise<PluginSettings>;
   putSettings(settings: PluginSettings): Promise<void>;
-  getProfile(): Promise<InterestProfile | null>;
-  putProfile(profile: InterestProfile): Promise<void>;
-  clearProfile(): Promise<void>;
-  getProfileEdits(): Promise<InterestEditFlags>;
-  putInterestState(profile: InterestProfile, edits: InterestEditFlags): Promise<void>;
+  getProfile(scope?: string): Promise<InterestProfile | null>;
+  putProfile(profile: InterestProfile, scope?: string): Promise<void>;
+  clearProfile(scope?: string): Promise<void>;
+  getProfileEdits(scope?: string): Promise<InterestEditFlags>;
+  putInterestState(profile: InterestProfile, edits: InterestEditFlags, scope?: string): Promise<void>;
   getRecommendation(key: string): Promise<Recommendation | undefined>;
   putRecommendation(key: string, recommendation: Recommendation): Promise<void>;
   markRead(key: string): Promise<void>;
   setRecommendationFeedback(key: string, value: Recommendation['feedback']): Promise<void>;
+  deleteRecommendation(key: string): Promise<void>;
+  getRecommendationBatch(scope: string): Promise<RecommendationBatch | null>;
+  putRecommendationBatch(scope: string, batch: RecommendationBatch): Promise<void>;
+  clearRecommendations(scope: string): Promise<void>;
+  clearLegacyRecommendations(): Promise<void>;
   getSummary?(key: string): Promise<TopicAiSummary | undefined>;
   putSummary?(key: string, summary: TopicAiSummary): Promise<void>;
   listRecommendations?(scope?: string): Promise<Recommendation[]>;

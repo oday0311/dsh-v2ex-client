@@ -31,7 +31,7 @@ export class AuthService {
   constructor(
     private readonly api: V2exApi,
     private readonly vault: CredentialVault,
-    private readonly clearPersonalData: () => Promise<void> = async () => {},
+    private readonly clearPersonalData: (account: string | null) => Promise<void> = async () => {},
   ) {}
 
   async status(): Promise<AccountStatus> {
@@ -75,10 +75,14 @@ export class AuthService {
   }
 
   async logout(clearPersonalData: boolean): Promise<void> {
+    let account: string | null = null;
+    if (clearPersonalData) {
+      try { account = await this.account(); } catch { account = null; }
+    }
     await this.vault.clear();
     this.verifiedUsername = null;
     this.verifiedCredentialDigest = null;
-    if (clearPersonalData) await this.clearPersonalData();
+    if (clearPersonalData) await this.clearPersonalData(account);
   }
 
   private async validate(token: string, writable: boolean): Promise<AccountStatus> {

@@ -200,3 +200,53 @@ test('clear between abort listener setup and scheduled work prevents history and
     } finally { AbortSignal.prototype.addEventListener = original; }
   }
 });
+
+test('interest state is durably isolated across verified accounts and legacy global state is quarantined', async () => {
+  const store = new FakeContentStore();
+  store.profile = { authorized: true, learningPaused: false, labels: [{ name: 'legacy-private', weight: 1 }],
+    preferredNodes: [], exclusions: [], feedback: [], updatedAt: '2026-11-07T00:00:00.000Z', source: 'manual' };
+  let account = 'alice';
+  const history = { async readEligibleUserText() { return 'unused'; } };
+  const model = { async completeJson() { return { labels: [], preferredNodes: [], exclusions: [] }; } };
+  const make = () => new InterestService(store, history, model as never, () => new Date('2026-11-07T00:00:00.000Z'), async () => account);
+  const first = make();
+  assert.deepEqual((await first.get()).labels, []);
+  await first.authorize();
+  await first.update({ labels: [{ name: 'Alice', weight: 1 }], exclusions: ['alice-only'] });
+  await first.recordFeedback(1, false);
+  account = 'bob';
+  assert.deepEqual((await first.get()).labels, []);
+  await first.authorize();
+  await first.update({ labels: [{ name: 'Bob', weight: 1 }] });
+  await first.recordFeedback(2, true);
+  const reloaded = make();
+  assert.deepEqual((await reloaded.get()).labels.map(value => value.name), ['Bob']);
+  await reloaded.revoke();
+  await reloaded.clear();
+  assert.deepEqual((await reloaded.get()).labels, []);
+  account = 'alice';
+  const alice = await make().get();
+  assert.equal(alice.authorized, true);
+  assert.deepEqual(alice.labels.map(value => value.name), ['Alice']);
+  assert.deepEqual(alice.feedback, [{ topicId: 1, interested: false }]);
+  assert.deepEqual(store.profile?.labels.map(value => value.name), ['legacy-private']);
+});
+
+test('account switch during relearn prevents the old account result from committing', async () => {
+  const store = new FakeContentStore(); let account = 'alice';
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  const service = new InterestService(store, { async readEligibleUserText() { return 'Alice'; } },
+    { async completeJson() { entered(); await gate; return { labels: [{ name: 'Alice learned', weight: 1 }], preferredNodes: [], exclusions: [] }; } } as never,
+    () => new Date('2026-11-07T00:00:00.000Z'), async () => account);
+  await service.authorize();
+  const learning = service.relearn();
+  await started;
+  account = 'bob';
+  release();
+  await assert.rejects(learning, { code: 'history_access_denied' });
+  assert.deepEqual((await service.get()).labels, []);
+  account = 'alice';
+  assert.deepEqual((await service.get()).labels, []);
+});

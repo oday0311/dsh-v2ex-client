@@ -1,6 +1,6 @@
 import { defineDomain, domainTable, type Domain, type KvTable } from '@deepseek-ai/dsh-storage-domain';
 import { z } from 'zod';
-import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from './contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, TopicAiSummary } from './contract.js';
 import { V2exError } from './errors.js';
 import { assertPage, assertTopicId } from './validation.js';
 
@@ -31,6 +31,7 @@ export const InterestEditFlagsSchema = z.strictObject({
   labels: z.boolean(), preferredNodes: z.boolean(), exclusions: z.boolean(), legacyManual: z.boolean().optional(),
 });
 const noInterestEdits: InterestEditFlags = { labels: false, preferredNodes: false, exclusions: false };
+const accountScope = z.string().regex(/^[0-9a-f]{64}:$/);
 
 const LegacyProfileSchema = z.strictObject({
   labels: z.array(z.strictObject({ name: z.string().trim().min(1).max(80), weight: z.number().finite().min(-1).max(1) })).max(100),
@@ -76,6 +77,12 @@ const LegacyRecommendationSchema = z.strictObject({
   topic: TopicListItemSchema, score: z.number().finite().min(0).max(1), reason: z.string().min(1).max(1000),
   read: z.boolean(), createdAt: timestamp,
 }).transform((old): Recommendation => ({ ...old, matchedInterests: [], generatedAt: old.createdAt, feedback: null }));
+const RecommendationBatchSchema = z.strictObject({ generatedAt: timestamp, topicIds: z.array(topicId).max(500) });
+const AccountInterestStateSchema = z.strictObject({ profile: InterestProfileSchema, edits: InterestEditFlagsSchema });
+const AccountProfilesSchema = z.record(accountScope, AccountInterestStateSchema)
+  .refine(value => Object.keys(value).length <= 20);
+const RecommendationBatchesSchema = z.record(accountScope, RecommendationBatchSchema)
+  .refine(value => Object.keys(value).length <= 20);
 
 export const defaultSettings: PluginSettings = {
   refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
@@ -86,8 +93,10 @@ export const v2exDomainSpec = defineDomain({
   name: 'v2ex_client', version: 1,
   global: {
     schema: z.strictObject({ settings: PluginSettingsSchema, profile: z.union([InterestProfileSchema, LegacyProfileSchema]).nullable(),
-      profileEdits: InterestEditFlagsSchema.optional() }),
-    initial: { settings: defaultSettings, profile: null as InterestProfile | null, profileEdits: noInterestEdits },
+      profileEdits: InterestEditFlagsSchema.optional(), accountProfiles: AccountProfilesSchema.optional(),
+      recommendationBatches: RecommendationBatchesSchema.optional() }),
+    initial: { settings: defaultSettings, profile: null as InterestProfile | null, profileEdits: noInterestEdits,
+      accountProfiles: {}, recommendationBatches: {} },
   },
   tables: {
     cache: domainTable<string, CacheRecord>(CacheRecordSchema),
@@ -109,6 +118,19 @@ function parseWrite<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
   if (!parsed.success) throw new V2exError('invalid_request');
   return parsed.data;
+}
+
+function assertAccountScope(scope: string): string {
+  if (!accountScope.safeParse(scope).success) throw new V2exError('invalid_request');
+  return scope;
+}
+
+interface GlobalState {
+  settings: PluginSettings;
+  profile: InterestProfile | null;
+  profileEdits?: InterestEditFlags;
+  accountProfiles?: Record<string, { profile: InterestProfile; edits: InterestEditFlags }>;
+  recommendationBatches?: Record<string, RecommendationBatch>;
 }
 
 export class DomainContentStore implements ContentStore {
@@ -147,8 +169,7 @@ export class DomainContentStore implements ContentStore {
     });
   }
 
-  private updateGlobal(change: (current: { settings: PluginSettings; profile: InterestProfile | null; profileEdits?: InterestEditFlags }) =>
-    { settings: PluginSettings; profile: InterestProfile | null; profileEdits?: InterestEditFlags }): Promise<void> {
+  private updateGlobal(change: (current: GlobalState) => GlobalState): Promise<void> {
     const write = this.globalWrites.then(() => this.domain.global.set(change(this.domain.global.get())));
     this.globalWrites = write.catch(() => {});
     return write;
@@ -187,19 +208,30 @@ export class DomainContentStore implements ContentStore {
     const parsed = parseWrite(PluginSettingsSchema, settings);
     await this.updateGlobal((current) => ({ ...current, settings: parsed }));
   }
-  async getProfile(): Promise<InterestProfile | null> {
+  async getProfile(scope?: string): Promise<InterestProfile | null> {
+    if (scope !== undefined) {
+      const state = (this.domain.global.get() as GlobalState).accountProfiles?.[assertAccountScope(scope)];
+      return state ? structuredClone(state.profile) : null;
+    }
     const profile = this.domain.global.get().profile;
     if (profile === null) return null;
     const parsed = z.union([InterestProfileSchema, LegacyProfileSchema]).safeParse(profile);
     if (!parsed.success) throw new V2exError('invalid_response');
     return structuredClone(parsed.data);
   }
-  async putProfile(profile: InterestProfile): Promise<void> {
+  async putProfile(profile: InterestProfile, scope?: string): Promise<void> {
     const parsed = parseWrite(InterestProfileSchema, profile);
+    if (scope !== undefined) {
+      const key = assertAccountScope(scope);
+      await this.updateGlobal((current) => ({ ...current, accountProfiles: { ...(current.accountProfiles ?? {}),
+        [key]: { profile: parsed, edits: current.accountProfiles?.[key]?.edits ?? { ...noInterestEdits } } } }));
+      return;
+    }
     await this.updateGlobal((current) => ({ ...current, profile: parsed }));
   }
-  async getProfileEdits(): Promise<InterestEditFlags> {
-    const current = this.domain.global.get();
+  async getProfileEdits(scope?: string): Promise<InterestEditFlags> {
+    const current = this.domain.global.get() as GlobalState;
+    if (scope !== undefined) return structuredClone(current.accountProfiles?.[assertAccountScope(scope)]?.edits ?? noInterestEdits);
     const parsed = InterestEditFlagsSchema.safeParse(current.profileEdits);
     if (parsed.success) return structuredClone(parsed.data);
     if (current.profileEdits !== undefined) throw new V2exError('invalid_response');
@@ -208,12 +240,26 @@ export class DomainContentStore implements ContentStore {
     }
     return current.profile?.source === 'mixed' ? { labels: true, preferredNodes: true, exclusions: true } : { ...noInterestEdits };
   }
-  async putInterestState(profile: InterestProfile, edits: InterestEditFlags): Promise<void> {
+  async putInterestState(profile: InterestProfile, edits: InterestEditFlags, scope?: string): Promise<void> {
     const parsedProfile = parseWrite(InterestProfileSchema, profile);
     const parsedEdits = parseWrite(InterestEditFlagsSchema, edits);
+    if (scope !== undefined) {
+      const key = assertAccountScope(scope);
+      await this.updateGlobal((current) => ({ ...current, accountProfiles: { ...(current.accountProfiles ?? {}),
+        [key]: { profile: parsedProfile, edits: parsedEdits } } }));
+      return;
+    }
     await this.updateGlobal((current) => ({ ...current, profile: parsedProfile, profileEdits: parsedEdits }));
   }
-  async clearProfile(): Promise<void> {
+  async clearProfile(scope?: string): Promise<void> {
+    if (scope !== undefined) {
+      const key = assertAccountScope(scope);
+      await this.updateGlobal((current) => {
+        const profiles = { ...(current.accountProfiles ?? {}) }; delete profiles[key];
+        return { ...current, accountProfiles: profiles };
+      });
+      return;
+    }
     await this.updateGlobal((current) => ({ ...current, profile: null, profileEdits: { ...noInterestEdits } }));
   }
 
@@ -253,6 +299,34 @@ export class DomainContentStore implements ContentStore {
       const value = table.get(key);
       if (!value) throw new V2exError('not_found');
       await table.put(key, { ...value, feedback });
+    });
+  }
+  async deleteRecommendation(key: string): Promise<void> {
+    await this.serialize('recommendations', () => this.domain.table('recommendations').delete(key));
+  }
+  async getRecommendationBatch(scope: string): Promise<RecommendationBatch | null> {
+    return structuredClone((this.domain.global.get() as GlobalState).recommendationBatches?.[assertAccountScope(scope)] ?? null);
+  }
+  async putRecommendationBatch(scope: string, batch: RecommendationBatch): Promise<void> {
+    const key = assertAccountScope(scope); const parsed = parseWrite(RecommendationBatchSchema, batch);
+    await this.updateGlobal((current) => ({ ...current,
+      recommendationBatches: { ...(current.recommendationBatches ?? {}), [key]: parsed } }));
+  }
+  async clearRecommendations(scope: string): Promise<void> {
+    const key = assertAccountScope(scope);
+    await this.serialize('recommendations', async () => {
+      const table = this.domain.table('recommendations');
+      for (const [entryKey] of table.entries()) if (entryKey.startsWith(key)) await table.delete(entryKey);
+    });
+    await this.updateGlobal((current) => {
+      const batches = { ...(current.recommendationBatches ?? {}) }; delete batches[key];
+      return { ...current, recommendationBatches: batches };
+    });
+  }
+  async clearLegacyRecommendations(): Promise<void> {
+    await this.serialize('recommendations', async () => {
+      const table = this.domain.table('recommendations');
+      for (const [key] of table.entries()) if (/^[1-9]\d*$/.test(key)) await table.delete(key);
     });
   }
   async listRecommendations(scope?: string): Promise<Recommendation[]> {
