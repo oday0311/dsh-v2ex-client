@@ -101,6 +101,7 @@ export class DshReminderSink implements ReminderSink {
         if (result && typeof result === 'object' && typeof (result as PromiseLike<unknown>).then === 'function') {
           await result;
         }
+        if (signal?.aborted || agent !== this.latest || this.disposedAgents.has(agent as object)) break;
         delivered.push(notice.noticeId);
       }
       catch { break; }

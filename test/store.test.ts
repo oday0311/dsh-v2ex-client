@@ -176,7 +176,9 @@ test('refresh settings and notification claims are durable and isolated by accou
   const reloaded = new DomainContentStore(memory.domain);
   assert.equal((await reloaded.getSettings(alice)).refreshIntervalMinutes, 15);
   assert.deepEqual((await reloaded.getPendingNotifications(alice)).map(value => value.topicId).sort(), [1, 2, 3]);
-  await reloaded.markNotificationSent(alice, one[0]!.noticeId);
+  await reloaded.markNotificationSent(alice, { ...one[0]!, reason: 'Changed after prepare' });
+  assert.equal((await reloaded.getPendingNotifications(alice)).some(value => value.noticeId === one[0]!.noticeId), true);
+  await reloaded.markNotificationSent(alice, one[0]!);
   assert.deepEqual(await reloaded.enqueuePendingNotifications(alice, [notice(one[0]!.topicId)]), []);
   assert.deepEqual((await reloaded.enqueuePendingNotifications(bob, [notice(1)])).map(value => value.topicId), [1]);
   await reloaded.clearRefreshState(alice);

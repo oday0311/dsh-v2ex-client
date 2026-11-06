@@ -35,6 +35,9 @@ export interface RefreshServiceOptions {
   clock?: RefreshClock;
 }
 
+type DeliveryMode = 'cached' | 'normal';
+interface PreparedDelivery { mode: DeliveryMode; lease: IdentityLease; pending: PendingReminderNotice[]; key: string }
+
 const systemClock: RefreshClock = {
   now: () => new Date(),
   every(ms, task) { const timer = setInterval(task, ms); return () => clearInterval(timer); },
@@ -70,6 +73,24 @@ function abortAware<T>(work: () => Promise<T>, signal: AbortSignal): Promise<T> 
   });
 }
 
+function deliveryKey(mode: DeliveryMode, lease: IdentityLease): string {
+  return `${mode}:${lease.account}:${lease.scope}:${lease.credentialFingerprint}:${lease.generation}`;
+}
+
+function linkAbortSignals(primary: AbortSignal, identity?: AbortSignal): {
+  signal: AbortSignal; release: () => void;
+} {
+  const controller = new AbortController(); const signals = identity ? [primary, identity] : [primary];
+  const abort = () => controller.abort();
+  for (const signal of signals) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener('abort', abort, { once: true });
+  }
+  return { signal: controller.signal, release: () => {
+    for (const signal of signals) signal.removeEventListener('abort', abort);
+  } };
+}
+
 function nodeNames(settings: PluginSettings, profile: InterestProfile | null): string[] {
   const values = [...settings.scannedNodes, ...(profile?.preferredNodes.map(value => value.name) ?? [])];
   return [...new Set(values)].slice(0, MAX_NODES);
@@ -78,7 +99,7 @@ function nodeNames(settings: PluginSettings, profile: InterestProfile | null): s
 export class RefreshService {
   private readonly clock: RefreshClock;
   private active?: { promise: Promise<void>; controller: AbortController };
-  private delivery?: { promise: Promise<void>; controller: AbortController };
+  private delivery?: { key: string; promise: Promise<void>; controller: AbortController };
   private stopTimer?: () => void;
   private timerMinutes?: number;
   private disposing?: Promise<void>;
@@ -165,20 +186,30 @@ export class RefreshService {
   }
 
   drainPending(expectedLease?: IdentityLease): Promise<void> {
-    return this.startDelivery(expectedLease, false);
+    return this.attemptDelivery('normal', expectedLease);
   }
 
   private drainCachedPending(): Promise<void> {
     if (!this.options.identity.withCachedMutation) return Promise.resolve();
-    return this.startDelivery(undefined, true);
+    return this.attemptDelivery('cached');
   }
 
-  private startDelivery(expectedLease: IdentityLease | undefined, cachedOnly: boolean): Promise<void> {
+  private async attemptDelivery(mode: DeliveryMode, expectedLease?: IdentityLease): Promise<void> {
     if (this.disposed) return Promise.reject(new V2exError('timeout'));
-    if (this.delivery) return this.delivery.promise;
+    const prepared = await this.prepareDelivery(mode, expectedLease);
+    if (!prepared) return;
+    const current = this.delivery;
+    if (current) {
+      if (current.key === prepared.key) return current.promise;
+      await current.promise.catch(() => {});
+      return this.attemptDelivery(mode, prepared.lease);
+    }
+    if (this.disposed) throw new V2exError('timeout');
     const controller = new AbortController();
-    const delivery = { controller, promise: Promise.resolve() as Promise<void> };
-    delivery.promise = this.deliverPending(controller.signal, expectedLease, cachedOnly)
+    const linked = linkAbortSignals(controller.signal, prepared.lease.signal);
+    const delivery = { key: prepared.key, controller, promise: Promise.resolve() as Promise<void> };
+    delivery.promise = this.deliverPrepared(prepared, linked.signal)
+      .finally(linked.release)
       .finally(() => { if (this.delivery === delivery) this.delivery = undefined; });
     this.delivery = delivery;
     return delivery.promise;
@@ -186,21 +217,33 @@ export class RefreshService {
 
   handleReminderIdle(): Promise<void> { return this.drainPending(); }
 
-  private async deliverPending(signal: AbortSignal, expectedLease?: IdentityLease, cachedOnly = false): Promise<void> {
-    const deliver = async (lease: IdentityLease) => {
-      if (signal.aborted) throw new V2exError('timeout');
+  private async prepareDelivery(mode: DeliveryMode, expectedLease?: IdentityLease): Promise<PreparedDelivery | undefined> {
+    const prepare = async (lease: IdentityLease): Promise<PreparedDelivery | undefined> => {
+      if (this.disposed || lease.signal?.aborted) throw new V2exError('timeout');
       const settings = await this.options.store.getSettings(lease.scope);
       if (settings.quietHours && isQuietTime(this.clock.now(), settings.quietHours)) return;
       const pending = await this.options.store.getPendingNotifications(lease.scope);
       if (!pending.length) return;
-      const delivered = new Set(await abortAware(() => this.options.reminders.notify(pending, signal), signal));
-      for (const notice of pending) {
+      return { mode, lease, pending: pending.slice(0, 20), key: deliveryKey(mode, lease) };
+    };
+    if (mode === 'cached') return this.options.identity.withCachedMutation?.(prepare, expectedLease);
+    return this.options.identity.withMutation(prepare, expectedLease);
+  }
+
+  private async deliverPrepared(prepared: PreparedDelivery, signal: AbortSignal): Promise<void> {
+    const delivered = new Set(await abortAware(() => this.options.reminders.notify(prepared.pending, signal), signal));
+    if (signal.aborted) throw new V2exError('timeout');
+    const finalize = async (lease: IdentityLease) => {
+      if (signal.aborted) throw new V2exError('timeout');
+      for (const notice of prepared.pending) {
         if (signal.aborted) throw new V2exError('timeout');
-        if (delivered.has(notice.noticeId)) await this.options.store.markNotificationSent(lease.scope, notice.noticeId);
+        if (delivered.has(notice.noticeId)) await this.options.store.markNotificationSent(lease.scope, notice);
       }
     };
-    if (cachedOnly) { await this.options.identity.withCachedMutation?.(deliver, expectedLease); return; }
-    await this.options.identity.withMutation(deliver, expectedLease);
+    if (prepared.mode === 'cached') {
+      await this.options.identity.withCachedMutation?.(finalize, prepared.lease); return;
+    }
+    await this.options.identity.withMutation(finalize, prepared.lease);
   }
 
   clear(account: string): Promise<void> {

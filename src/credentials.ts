@@ -20,6 +20,7 @@ export interface IdentityLease {
   readonly scope: string;
   readonly credentialFingerprint: string;
   readonly generation: number;
+  readonly signal?: AbortSignal;
 }
 
 export interface IdentityLeaseProvider {
@@ -49,6 +50,7 @@ export class AuthService {
   private verifiedUsername: string | null = null;
   private verifiedCredentialDigest: string | null = null;
   private authGeneration = 0;
+  private identityController = new AbortController();
   private fence: Promise<void> = Promise.resolve();
   constructor(
     private readonly api: V2exApi,
@@ -57,6 +59,7 @@ export class AuthService {
   ) {}
 
   private invalidate(clearIdentity = true): void {
+    this.identityController.abort(); this.identityController = new AbortController();
     this.authGeneration++;
     if (clearIdentity) { this.verifiedUsername = null; this.verifiedCredentialDigest = null; }
   }
@@ -75,7 +78,8 @@ export class AuthService {
   private cachedLeaseUnlocked(): IdentityLease | undefined {
     if (!this.verifiedUsername || !this.verifiedCredentialDigest) return undefined;
     return { account: this.verifiedUsername, scope: accountScope(this.verifiedUsername),
-      credentialFingerprint: this.verifiedCredentialDigest, generation: this.authGeneration };
+      credentialFingerprint: this.verifiedCredentialDigest, generation: this.authGeneration,
+      signal: this.identityController.signal };
   }
 
   status(): Promise<AccountStatus> { return this.fenced(() => this.statusUnlocked()); }
@@ -142,7 +146,7 @@ export class AuthService {
       if (!status.authenticated || !status.username) throw new V2exError('not_authenticated');
     }
     return { account: this.verifiedUsername!, scope: accountScope(this.verifiedUsername!),
-      credentialFingerprint: digest, generation: this.authGeneration };
+      credentialFingerprint: digest, generation: this.authGeneration, signal: this.identityController.signal };
   }
 
   async assertLease(lease: IdentityLease): Promise<void> {

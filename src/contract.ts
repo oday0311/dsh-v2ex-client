@@ -152,7 +152,7 @@ export interface ContentStore {
   putSettings(settings: PluginSettings, scope?: string): Promise<void>;
   enqueuePendingNotifications(scope: string, notices: PendingReminderNotice[]): Promise<PendingReminderNotice[]>;
   getPendingNotifications(scope: string): Promise<PendingReminderNotice[]>;
-  markNotificationSent(scope: string, noticeId: string): Promise<void>;
+  markNotificationSent(scope: string, notice: PendingReminderNotice): Promise<void>;
   clearRefreshState(scope: string): Promise<void>;
   getProfile(scope?: string): Promise<InterestProfile | null>;
   putProfile(profile: InterestProfile, scope?: string): Promise<void>;

@@ -128,6 +128,10 @@ const PendingReminderNoticeSchema = z.strictObject({
   node: z.string().refine(value => validReminderField(value, 64)),
   reason: z.string().refine(value => validReminderField(value, 500)), createdAt: timestamp,
 }).refine(value => !isUnsafeReminder(value));
+function sameReminderNotice(left: PendingReminderNotice, right: PendingReminderNotice): boolean {
+  return left.noticeId === right.noticeId && left.topicId === right.topicId && left.title === right.title &&
+    left.node === right.node && left.reason === right.reason && left.createdAt === right.createdAt;
+}
 const NotificationStateSchema = z.strictObject({ sent: NotificationBitmapSchema,
   pending: z.array(PendingReminderNoticeSchema).max(20) });
 const NotificationStatesSchema = z.record(accountScope, z.union([
@@ -300,15 +304,15 @@ export class DomainContentStore implements ContentStore {
     const state = (this.domain.global.get() as GlobalState).notificationStates?.[assertAccountScope(scope)];
     return structuredClone(state?.pending ?? []);
   }
-  async markNotificationSent(scope: string, noticeId: string): Promise<void> {
+  async markNotificationSent(scope: string, value: PendingReminderNotice): Promise<void> {
     const key = assertAccountScope(scope);
-    if (!z.uuid().safeParse(noticeId).success) throw new V2exError('invalid_request');
+    const expected = parseWrite(PendingReminderNoticeSchema, value);
     await this.updateGlobal((current) => {
       const state = current.notificationStates?.[key]; if (!state) return current;
-      const notice = state.pending.find(value => value.noticeId === noticeId); if (!notice) return current;
-      const sent = Buffer.from(state.sent, 'base64'); markNotification(sent, notice.topicId);
+      const notice = state.pending.find(notice => sameReminderNotice(notice, expected)); if (!notice) return current;
+      const sent = Buffer.from(state.sent, 'base64'); markNotification(sent, expected.topicId);
       return { ...current, notificationStates: { ...(current.notificationStates ?? {}),
-        [key]: { sent: sent.toString('base64'), pending: state.pending.filter(value => value.noticeId !== noticeId) } } };
+        [key]: { sent: sent.toString('base64'), pending: state.pending.filter(value => value.noticeId !== expected.noticeId) } } };
     });
   }
   async clearRefreshState(scope: string): Promise<void> {

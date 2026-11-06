@@ -118,3 +118,15 @@ test('notice truncation is Unicode-safe after malformed input repair', async () 
   assert.deepEqual(await sink.notify([notice]), [notice.noticeId]);
   assert.match(JSON.stringify(target.messages[0]), /😀/); await ctx.fiber.dispose();
 });
+
+test('abort while followup is pending stops the batch without reporting delivery', async () => {
+  const ctx = new Context(); const sink = new DshReminderSink(); let calls = 0; let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const target = { status: 'idle', root: true, async followup() { calls++; await gate; } };
+  sink.bind(ctx as never); emit(ctx, 'agent/status', { agent: target, status: 'running' });
+  const controller = new AbortController();
+  const delivery = sink.notify([createReminderNotice(item), createReminderNotice({ ...item,
+    topic: { ...item.topic, id: 2 } })], controller.signal);
+  while (!calls) await Promise.resolve(); controller.abort(); release();
+  assert.deepEqual(await delivery, []); assert.equal(calls, 1); await ctx.fiber.dispose();
+});

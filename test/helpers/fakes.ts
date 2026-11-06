@@ -71,9 +71,12 @@ export class FakeContentStore implements ContentStore {
     this.notificationStates.set(scope, state); return accepted;
   }
   async getPendingNotifications(scope: string) { return structuredClone(this.notificationStates.get(scope)?.pending ?? []); }
-  async markNotificationSent(scope: string, noticeId: string) { await this.beforeNotificationSent?.();
-    const state = this.notificationStates.get(scope); const notice = state?.pending.find(value => value.noticeId === noticeId);
-    if (state && notice) { state.sent.add(notice.topicId); state.pending = state.pending.filter(value => value.noticeId !== noticeId); } }
+  async markNotificationSent(scope: string, expected: PendingReminderNotice) { await this.beforeNotificationSent?.();
+    const state = this.notificationStates.get(scope); const notice = state?.pending.find(value =>
+      value.noticeId === expected.noticeId && value.topicId === expected.topicId && value.title === expected.title &&
+      value.node === expected.node && value.reason === expected.reason && value.createdAt === expected.createdAt);
+    if (state && notice) { state.sent.add(notice.topicId);
+      state.pending = state.pending.filter(value => value.noticeId !== expected.noticeId); } }
   async clearRefreshState(scope: string) { this.accountSettings.delete(scope); this.notificationStates.delete(scope); }
   async getProfile(scope?: string) { await this.beforeProfileRead?.(); return scope ? this.accountProfiles.get(scope)?.profile ?? null : this.profile; }
   async putProfile(value: InterestProfile, scope?: string) {
