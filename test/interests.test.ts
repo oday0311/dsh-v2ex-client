@@ -1,15 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { InterestService } from '../src/interests.js';
-import { FakeContentStore } from './helpers/fakes.js';
+import { FakeContentStore, FakeCredentialVault } from './helpers/fakes.js';
 import { accountScope } from '../src/account-scope.js';
 import { V2exError } from '../src/errors.js';
-import type { IdentityLease, IdentityLeaseProvider } from '../src/credentials.js';
+import { AuthService, type IdentityLease, type IdentityLeaseProvider } from '../src/credentials.js';
 
 function testIdentity(resolve: () => Promise<string>): IdentityLeaseProvider {
-  return { async lease() { const account = await resolve(); const scope = accountScope(account);
-    return { account, scope, credentialFingerprint: scope, generation: 0 }; },
-  async assertLease(lease) { if ((await this.lease()).scope !== lease.scope) throw new V2exError('not_authenticated'); } };
+  const lease = async () => { const account = await resolve(); const scope = accountScope(account);
+    return { account, scope, credentialFingerprint: scope, generation: 0 }; };
+  return { async withRead(operation) { const current = await lease(); const result = await operation(current);
+      if ((await lease()).scope !== current.scope) throw new V2exError('not_authenticated'); return result; },
+    async withMutation(operation, expected) { const current = await lease();
+      if (expected && expected.scope !== current.scope) throw new V2exError('not_authenticated');
+      const result = await operation(current); if ((await lease()).scope !== current.scope) throw new V2exError('not_authenticated'); return result; } };
 }
 
 test('authorization precedes every history read and manual edits do not read', async () => {
@@ -263,10 +267,14 @@ test('account switch during relearn prevents the old account result from committ
 test('delayed interest get rejects an A to B to A lease change instead of returning Alice data', async () => {
   const store = new FakeContentStore(); const state = { account: 'alice', fingerprint: 'alice-one', generation: 1 };
   const identity: IdentityLeaseProvider = {
-    async lease(): Promise<IdentityLease> { return { account: state.account, scope: accountScope(state.account),
-      credentialFingerprint: state.fingerprint, generation: state.generation }; },
-    async assertLease(lease) { if (lease.scope !== accountScope(state.account) || lease.credentialFingerprint !== state.fingerprint ||
-      lease.generation !== state.generation) throw new V2exError('not_authenticated'); },
+    async withRead(operation) { const lease: IdentityLease = { account: state.account, scope: accountScope(state.account),
+      credentialFingerprint: state.fingerprint, generation: state.generation }; const result = await operation(lease);
+      if (lease.scope !== accountScope(state.account) || lease.credentialFingerprint !== state.fingerprint ||
+        lease.generation !== state.generation) throw new V2exError('not_authenticated'); return result; },
+    async withMutation(operation, expected) { const lease: IdentityLease = { account: state.account, scope: accountScope(state.account),
+      credentialFingerprint: state.fingerprint, generation: state.generation };
+      if (expected && (expected.generation !== lease.generation || expected.credentialFingerprint !== lease.credentialFingerprint)) throw new V2exError('not_authenticated');
+      return operation(lease); },
   };
   store.accountProfiles.set(accountScope('alice'), { profile: { authorized: true, learningPaused: false,
     labels: [{ name: 'Alice private', weight: 1 }], preferredNodes: [], exclusions: [], feedback: [],
@@ -281,4 +289,23 @@ test('delayed interest get rejects an A to B to A lease change instead of return
   Object.assign(state, { account: 'bob', fingerprint: 'bob', generation: 2 });
   Object.assign(state, { account: 'alice', fingerprint: 'alice-two', generation: 3 }); release();
   await assert.rejects(reading, { code: 'not_authenticated' });
+});
+
+test('an auth transition waits for a guarded interest write and the write does not reject after persisting', async () => {
+  const vault = new FakeCredentialVault();
+  const api = { async readToken() { return { scope: 'everything' }; },
+    async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+  const auth = new AuthService(api as never, vault);
+  await auth.login('ALICE_FAKE_VALUE');
+  const store = new FakeContentStore(); let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }); const started = new Promise<void>(resolve => { entered = resolve; });
+  store.beforeInterestPut = async () => { entered(); await gate; };
+  const service = new InterestService(store, { async readEligibleUserText() { return ''; } },
+    { async completeJson() { return {}; } } as never, undefined, auth);
+  const update = service.update({ labels: [{ name: 'Alice guarded', weight: 1 }] }); await started;
+  let loginSettled = false; const login = auth.login('BOB_FAKE_VALUE').finally(() => { loginSettled = true; });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(loginSettled, false);
+  release(); await update; await login;
+  assert.deepEqual(store.accountProfiles.get(accountScope('alice'))?.profile.labels.map(item => item.name), ['Alice guarded']);
+  assert.equal(await auth.account(), 'bob');
 });

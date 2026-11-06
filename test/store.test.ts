@@ -350,3 +350,30 @@ test('recommendation snapshot replacement is atomic, preserves actions, and surv
   const empty = await new DomainContentStore(memory.domain).getRecommendationSnapshot(scope);
   assert.deepEqual(empty, { batch: { generatedAt: '2026-11-07T01:00:00Z', topicIds: [], generation: 4 }, items: [] });
 });
+
+test('published snapshot is a one-way migration barrier for hidden legacy recommendation rows', async () => {
+  const memory = memoryDomain(); const scope = 'a'.repeat(64) + ':'; const key = `${scope}1`;
+  const first = new DomainContentStore(memory.domain); await first.putRecommendation(key, recommendation);
+  await first.replaceRecommendationBatch(scope, { generatedAt: '2026-11-07T00:00:00Z', topicIds: [], generation: 1 }, []);
+  const reloaded = new DomainContentStore(memory.domain);
+  assert.equal(await reloaded.getRecommendation(key), undefined);
+  await reloaded.markRead(key);
+  await assert.rejects(reloaded.setRecommendationFeedback(key, 'not_interested'), { code: 'not_found' });
+  assert.equal((memory.tables.recommendations.get(key) as Recommendation).read, false);
+  assert.equal((memory.tables.recommendations.get(key) as Recommendation).feedback, null);
+  assert.deepEqual(await reloaded.listRecommendations(scope), []);
+});
+
+test('clearing a pre-marker snapshot persists the migration barrier before legacy cleanup', async () => {
+  const memory = memoryDomain(); const scope = 'a'.repeat(64) + ':'; const key = `${scope}1`;
+  const store = new DomainContentStore(memory.domain); await store.putRecommendation(key, recommendation);
+  await store.replaceRecommendationBatch(scope, { generatedAt: '2026-11-07T00:00:00Z', topicIds: [], generation: 1 }, []);
+  const oldGlobal = structuredClone(memory.readGlobal()) as typeof v2exDomainSpec.global.initial;
+  delete (oldGlobal as { migratedRecommendationScopes?: unknown }).migratedRecommendationScopes;
+  await memory.domain.global.set(oldGlobal);
+  memory.failNextDelete('recommendations', key);
+  await assert.rejects(store.clearRecommendations(scope));
+  const reloaded = new DomainContentStore(memory.domain);
+  assert.equal(await reloaded.getRecommendation(key), undefined);
+  assert.deepEqual(await reloaded.listRecommendations(scope), []);
+});

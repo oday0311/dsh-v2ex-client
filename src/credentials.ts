@@ -23,8 +23,13 @@ export interface IdentityLease {
 }
 
 export interface IdentityLeaseProvider {
-  lease(): Promise<IdentityLease>;
-  assertLease(lease: IdentityLease): Promise<void>;
+  withRead<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T>;
+  withMutation<T>(operation: (lease: IdentityLease, guard: IdentityMutationGuard) => Promise<T>, expected?: IdentityLease): Promise<T>;
+}
+
+export interface IdentityMutationGuard {
+  readonly lease: IdentityLease;
+  run<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T>;
 }
 
 export class DshCredentialVault implements CredentialVault {
@@ -42,6 +47,7 @@ export class AuthService {
   private verifiedUsername: string | null = null;
   private verifiedCredentialDigest: string | null = null;
   private authGeneration = 0;
+  private fence: Promise<void> = Promise.resolve();
   constructor(
     private readonly api: V2exApi,
     private readonly vault: CredentialVault,
@@ -53,7 +59,20 @@ export class AuthService {
     if (clearIdentity) { this.verifiedUsername = null; this.verifiedCredentialDigest = null; }
   }
 
-  async status(): Promise<AccountStatus> {
+  private fenced<T>(operation: () => Promise<T>): Promise<T> {
+    const task = this.fence.then(operation);
+    this.fence = task.then(() => {}, () => {});
+    return task;
+  }
+
+  private sameLease(left: IdentityLease, right: IdentityLease): boolean {
+    return left.generation === right.generation && left.scope === right.scope &&
+      left.credentialFingerprint === right.credentialFingerprint && left.account === right.account;
+  }
+
+  status(): Promise<AccountStatus> { return this.fenced(() => this.statusUnlocked()); }
+
+  private async statusUnlocked(): Promise<AccountStatus> {
     const token = await this.vault.resolve();
     const { writable } = await this.vault.describe();
     if (!token) {
@@ -74,7 +93,7 @@ export class AuthService {
     return status;
   }
 
-  async login(candidate: string): Promise<AccountStatus> {
+  login(candidate: string): Promise<AccountStatus> { return this.fenced(async () => {
     this.invalidate(false);
     if (typeof candidate !== 'string' || candidate.length < 1 || candidate.length > 4096 || /[\r\n]/.test(candidate)) {
       throw new V2exError('invalid_request');
@@ -94,13 +113,15 @@ export class AuthService {
     this.verifiedUsername = status.username;
     this.verifiedCredentialDigest = digest;
     return status;
-  }
+  }); }
 
   async account(): Promise<string> {
-    return (await this.lease()).account;
+    return this.withRead(async lease => lease.account);
   }
 
-  async lease(): Promise<IdentityLease> {
+  lease(): Promise<IdentityLease> { return this.withRead(async lease => lease); }
+
+  private async leaseUnlocked(): Promise<IdentityLease> {
     const token = await this.vault.resolve();
     if (!token) {
       if (this.verifiedUsername !== null || this.verifiedCredentialDigest !== null) this.invalidate();
@@ -109,7 +130,7 @@ export class AuthService {
     const digest = createHash('sha256').update(token).digest('hex');
     if (!this.verifiedUsername || this.verifiedCredentialDigest !== digest) {
       if (this.verifiedCredentialDigest !== null && this.verifiedCredentialDigest !== digest) this.invalidate();
-      const status = await this.status();
+      const status = await this.statusUnlocked();
       if (!status.authenticated || !status.username) throw new V2exError('not_authenticated');
     }
     return { account: this.verifiedUsername!, scope: accountScope(this.verifiedUsername!),
@@ -117,23 +138,44 @@ export class AuthService {
   }
 
   async assertLease(lease: IdentityLease): Promise<void> {
-    const current = await this.lease();
-    if (current.generation !== lease.generation || current.scope !== lease.scope ||
-      current.credentialFingerprint !== lease.credentialFingerprint || current.account !== lease.account) {
-      throw new V2exError('not_authenticated');
-    }
+    await this.withRead(async current => { if (!this.sameLease(current, lease)) throw new V2exError('not_authenticated'); });
   }
 
-  async logout(clearPersonalData: boolean): Promise<void> {
+  withRead<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T> {
+    return this.fenced(async () => {
+      const lease = await this.leaseUnlocked(); const result = await operation(lease);
+      const current = await this.leaseUnlocked();
+      if (!this.sameLease(current, lease)) throw new V2exError('not_authenticated');
+      return result;
+    });
+  }
+
+  withMutation<T>(operation: (lease: IdentityLease, guard: IdentityMutationGuard) => Promise<T>, expected?: IdentityLease): Promise<T> {
+    return this.fenced(async () => {
+      const lease = await this.leaseUnlocked();
+      if (expected && !this.sameLease(lease, expected)) throw new V2exError('not_authenticated');
+      let active = true;
+      const guard: IdentityMutationGuard = { lease, run: async nested => {
+        if (!active) throw new V2exError('not_authenticated'); return nested(lease);
+      } };
+      try {
+        const result = await operation(lease, guard); const current = await this.leaseUnlocked();
+        if (!this.sameLease(current, lease)) throw new V2exError('not_authenticated');
+        return result;
+      } finally { active = false; }
+    });
+  }
+
+  logout(clearPersonalData: boolean): Promise<void> { return this.fenced(async () => {
     this.invalidate(false);
     let account: string | null = null;
     if (clearPersonalData) {
-      try { account = await this.account(); } catch { account = null; }
+      try { account = (await this.leaseUnlocked()).account; } catch { account = null; }
     }
     await this.vault.clear();
     this.invalidate();
     if (clearPersonalData) await this.clearPersonalData(account);
-  }
+  }); }
 
   private async validate(token: string, writable: boolean): Promise<AccountStatus> {
     const info = await this.api.readToken(token);

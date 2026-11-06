@@ -48,7 +48,11 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       get agentDefaultModel() { return optional('agentDefaultModel'); },
     } as never);
     let auth!: AuthService;
-    const identity = { lease: () => auth.lease(), assertLease: (lease: import('./credentials.js').IdentityLease) => auth.assertLease(lease) };
+    const identity = {
+      withRead: <T>(operation: (lease: import('./credentials.js').IdentityLease) => Promise<T>) => auth.withRead(operation),
+      withMutation: <T>(operation: (lease: import('./credentials.js').IdentityLease, guard: import('./credentials.js').IdentityMutationGuard) => Promise<T>, expected?: import('./credentials.js').IdentityLease) =>
+        auth.withMutation(operation, expected),
+    };
     const interests = new InterestService(store, new DshHistoryReader(() => {
       try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }
       catch { return undefined; }

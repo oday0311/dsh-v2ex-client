@@ -2,10 +2,11 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { RecommendationService } from '../src/recommendations.js';
 import { V2exError } from '../src/errors.js';
-import { FakeContentStore } from './helpers/fakes.js';
+import { FakeContentStore, FakeCredentialVault } from './helpers/fakes.js';
 import type { InterestProfile, TopicListItem } from '../src/contract.js';
 import { accountScope } from '../src/account-scope.js';
 import type { IdentityLease, IdentityLeaseProvider } from '../src/credentials.js';
+import { AuthService } from '../src/credentials.js';
 
 const at = '2026-11-07T00:00:00.000Z';
 const topic = (id: number, title: string, node = 'dev', updated = at): TopicListItem => ({
@@ -32,19 +33,29 @@ class MutableIdentity implements IdentityLeaseProvider {
   generation = 1;
   account = 'alice';
   fingerprint = 'alice-credential';
-  async lease(): Promise<IdentityLease> { return { account: this.account, scope: accountScope(this.account),
+  private lease(): IdentityLease { return { account: this.account, scope: accountScope(this.account),
     credentialFingerprint: this.fingerprint, generation: this.generation }; }
-  async assertLease(lease: IdentityLease): Promise<void> {
+  private assert(lease: IdentityLease): void {
     if (lease.account !== this.account || lease.scope !== accountScope(this.account) ||
       lease.credentialFingerprint !== this.fingerprint || lease.generation !== this.generation) throw new V2exError('not_authenticated');
+  }
+  async withRead<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T> {
+    const lease = this.lease(); const result = await operation(lease); this.assert(lease); return result;
+  }
+  async withMutation<T>(operation: (lease: IdentityLease) => Promise<T>, expected?: IdentityLease): Promise<T> {
+    const lease = this.lease(); if (expected) this.assert(expected); const result = await operation(lease); this.assert(lease); return result;
   }
   switch(account: string, fingerprint: string) { this.account = account; this.fingerprint = fingerprint; this.generation++; }
 }
 
 function testIdentity(resolve: () => Promise<string> = async () => 'alice'): IdentityLeaseProvider {
-  return { async lease() { const account = await resolve(); const scope = accountScope(account);
-    return { account, scope, credentialFingerprint: scope, generation: 0 }; },
-  async assertLease(lease) { if ((await this.lease()).scope !== lease.scope) throw new V2exError('not_authenticated'); } };
+  const lease = async () => { const account = await resolve(); const scope = accountScope(account);
+    return { account, scope, credentialFingerprint: scope, generation: 0 }; };
+  return { async withRead(operation) { const current = await lease(); const result = await operation(current);
+      if ((await lease()).scope !== current.scope) throw new V2exError('not_authenticated'); return result; },
+    async withMutation(operation, expected) { const current = await lease();
+      if (expected && expected.scope !== current.scope) throw new V2exError('not_authenticated');
+      const result = await operation(current); if ((await lease()).scope !== current.scope) throw new V2exError('not_authenticated'); return result; } };
 }
 
 function service(options: { store?: FakeContentStore; interest?: InterestProfile | null; model?: RecordingModel; account?: string } = {}) {
@@ -320,4 +331,45 @@ test('clear invalidates before a delayed atomic publish and late refresh cannot 
   const clearing = recommender.clear('alice'); release();
   await assert.rejects(refresh, { code: 'timeout' }); await clearing;
   assert.equal(await store.getRecommendationSnapshot(scope), null);
+});
+
+test('active empty snapshot hides legacy rows from get, feedback, read, and reload', async () => {
+  const store = new FakeContentStore(); const identity = new MutableIdentity(); const scope = accountScope('alice');
+  store.accountProfiles.set(scope, { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  await store.putRecommendation(`${scope}99`, { topic: topic(99, 'legacy hidden'), score: 1, reason: 'legacy',
+    matchedInterests: [], generatedAt: at, read: false, feedback: null });
+  await store.replaceRecommendationBatch(scope, { generatedAt: at, topicIds: [], generation: 1 }, []);
+  let feedbackCalls = 0;
+  const recommender = new RecommendationService(store, new RecordingModel({ items: [] }) as never, identity,
+    () => new Date(at), { async recordFeedback() { feedbackCalls++; } });
+  assert.deepEqual((await recommender.list()).items, []);
+  await assert.rejects(recommender.feedback({ topicId: 99, value: 'not_interested' }), { code: 'not_found' });
+  await recommender.markRead(99);
+  assert.equal(feedbackCalls, 0);
+  assert.equal(store.recommendations.get(`${scope}99`), undefined);
+  assert.deepEqual((await store.getRecommendationSnapshot(scope))?.items, []);
+});
+
+test('auth replacement waits for guarded recommendation feedback and read writes', async () => {
+  for (const action of ['feedback', 'read'] as const) {
+    const vault = new FakeCredentialVault(); const api = { async readToken() { return { scope: 'everything' }; },
+      async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+    const auth = new AuthService(api as never, vault); await auth.login('ALICE_FAKE_VALUE');
+    const store = new FakeContentStore(); const scope = accountScope('alice');
+    store.accountProfiles.set(scope, { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+    await store.replaceRecommendationBatch(scope, { generatedAt: at, topicIds: [1], generation: 1 },
+      [{ topic: topic(1, 'guarded'), score: 1, reason: 'guarded', matchedInterests: [], generatedAt: at, read: false, feedback: null }]);
+    let release!: () => void; let entered!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; }); const started = new Promise<void>(resolve => { entered = resolve; });
+    if (action === 'feedback') store.beforeSetFeedback = async () => { entered(); await gate; };
+    else store.beforeMarkRead = async () => { entered(); await gate; };
+    const recommender = new RecommendationService(store, new RecordingModel({ items: [] }) as never, auth, () => new Date(at));
+    const mutation = action === 'feedback' ? recommender.feedback({ topicId: 1, value: 'interested' }) : recommender.markRead(1);
+    await started; let loginSettled = false; const login = auth.login('BOB_FAKE_VALUE').finally(() => { loginSettled = true; });
+    await new Promise(resolve => setImmediate(resolve)); assert.equal(loginSettled, false);
+    release(); await mutation; await login;
+    const item = (await store.getRecommendationSnapshot(scope))?.items[0];
+    assert.equal(action === 'feedback' ? item?.feedback : item?.read, action === 'feedback' ? 'interested' : true);
+    assert.equal(await auth.account(), 'bob');
+  }
 });

@@ -2,7 +2,7 @@ import type { ContentStore, InterestProfile, Recommendation, RecommendationList,
 import { V2exError } from './errors.js';
 import { RecommendationRankingSchema, type IntelligenceService } from './intelligence.js';
 import { accountScope } from './account-scope.js';
-import type { IdentityLease, IdentityLeaseProvider } from './credentials.js';
+import type { IdentityLease, IdentityLeaseProvider, IdentityMutationGuard } from './credentials.js';
 
 const MAX_INPUT_BYTES = 32 * 1024;
 const MAX_CANDIDATES = 500;
@@ -60,18 +60,16 @@ export class RecommendationService {
   private readonly intelligence: Pick<IntelligenceService, 'rankRecommendationCandidates'>,
   identity: IdentityLeaseProvider,
   private readonly clock: () => Date = () => new Date(),
-  private readonly feedbackSink?: { recordFeedback(topicId: number, interested: boolean, lease?: IdentityLease): Promise<unknown> }) {
+  private readonly feedbackSink?: { recordFeedback(topicId: number, interested: boolean, guard?: IdentityMutationGuard): Promise<unknown> }) {
     this.identity = identity;
   }
 
-  private async assertRefresh(lease: IdentityLease, epoch: number, signal: AbortSignal): Promise<void> {
-    if (signal.aborted || this.refreshEpoch.get(lease.scope) !== epoch) throw new V2exError('timeout');
-    try { await this.identity.assertLease(lease); } catch { throw new V2exError('timeout'); }
+  private assertRefresh(lease: IdentityLease, epoch: number, signal: AbortSignal): void {
     if (signal.aborted || this.refreshEpoch.get(lease.scope) !== epoch) throw new V2exError('timeout');
   }
 
   clear(account?: string): Promise<void> {
-    if (account === undefined) return this.identity.lease().then(lease => this.clear(lease.account));
+    if (account === undefined) return this.identity.withMutation(async lease => this.clear(lease.account));
     const scope = accountScope(account);
     this.refreshEpoch.set(scope, (this.refreshEpoch.get(scope) ?? 0) + 1);
     for (const controller of this.activeRefresh.get(scope) ?? []) controller.abort();
@@ -81,7 +79,13 @@ export class RecommendationService {
   clearLegacy(): Promise<void> { return this.store.clearLegacyRecommendations(); }
 
   async refreshCandidates(candidates: TopicListItem[], signal?: AbortSignal): Promise<RecommendationRefresh> {
-    const lease = await this.identity.lease(); const scope = lease.scope;
+    if (!Array.isArray(candidates) || candidates.length > MAX_CANDIDATES) throw new V2exError('invalid_request');
+    const loaded = await this.identity.withRead(async lease => {
+      try { const [profile, settings, snapshot] = await Promise.all([this.store.getProfile(lease.scope), this.store.getSettings(),
+        this.store.getRecommendationSnapshot(lease.scope)]); return { lease, profile, settings, stored: snapshot?.items ?? [] }; }
+      catch { throw new V2exError('ai_unavailable'); }
+    });
+    const { lease, profile, settings, stored } = loaded; const scope = lease.scope;
     const epoch = (this.refreshEpoch.get(scope) ?? 0) + 1;
     this.refreshEpoch.set(scope, epoch);
     const controller = new AbortController();
@@ -92,17 +96,9 @@ export class RecommendationService {
     if (signal?.aborted) controller.abort();
     const effective = controller.signal;
     try {
-    if (!Array.isArray(candidates) || candidates.length > MAX_CANDIDATES) throw new V2exError('invalid_request');
     if (effective.aborted) throw new V2exError('timeout');
-    let profile: InterestProfile | null;
-    let settings;
-    try { [profile, settings] = await Promise.all([this.store.getProfile(scope), this.store.getSettings()]); }
-    catch { throw new V2exError('ai_unavailable'); }
     const excluded = profile?.exclusions.map(value => value.toLocaleLowerCase('en')) ?? [];
-    let stored: Recommendation[];
-    try { stored = (await this.store.getRecommendationSnapshot(scope))?.items ?? []; }
-    catch { throw new V2exError('ai_unavailable'); }
-    await this.assertRefresh(lease, epoch, effective);
+    this.assertRefresh(lease, epoch, effective);
     const negative = new Set([...(profile?.feedback.filter(value => !value.interested).map(value => value.topicId) ?? []),
       ...stored.filter(value => value.feedback === 'not_interested').map(value => value.topic.id)]);
     const deduped = new Map<number, TopicListItem>();
@@ -136,7 +132,7 @@ export class RecommendationService {
       if (!parsed.success) throw new V2exError('invalid_response');
       rankedItems = parsed.data.items;
     }
-    await this.assertRefresh(lease, epoch, effective);
+    this.assertRefresh(lease, epoch, effective);
     const allowed = new Map(considered.map(value => [value.id, value]));
     const seen = new Set<number>();
     if (rankedItems.some(value => !allowed.has(value.topicId) || seen.has(value.topicId) || !seen.add(value.topicId) ||
@@ -147,14 +143,18 @@ export class RecommendationService {
     const topicIds = rankedItems.map(value => value.topicId);
     const replacements = rankedItems.map(ranked => ({ topic: allowed.get(ranked.topicId)!, score: ranked.score,
       reason: ranked.reason, matchedInterests: ranked.matchedInterests, generatedAt, read: false, feedback: null }));
-    await this.assertRefresh(lease, epoch, effective);
+    this.assertRefresh(lease, epoch, effective);
     let published;
-    try { published = await this.store.replaceRecommendationBatch(scope, { generatedAt, topicIds, generation: epoch }, replacements); }
-    catch (error) { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); }
-    try { await this.assertRefresh(lease, epoch, effective); }
+    try { published = await this.identity.withMutation(async () => {
+      this.assertRefresh(lease, epoch, effective);
+      return this.store.replaceRecommendationBatch(scope, { generatedAt, topicIds, generation: epoch }, replacements);
+    }, lease); }
+    catch (error) { if (error instanceof V2exError && error.code === 'not_authenticated') throw new V2exError('timeout');
+      throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); }
+    try { this.assertRefresh(lease, epoch, effective); }
     catch (error) { await this.store.discardRecommendationBatch(scope, epoch); throw error; }
     const items = published.items.filter(item => item.feedback !== 'not_interested').sort(order);
-    await this.assertRefresh(lease, epoch, effective);
+    this.assertRefresh(lease, epoch, effective);
     return { items, consideredTopicIds, generatedAt, stale: false, source: 'generated' };
     } finally {
       signal?.removeEventListener('abort', externalAbort);
@@ -163,45 +163,37 @@ export class RecommendationService {
   }
 
   async list(): Promise<RecommendationList> {
-    const lease = await this.identity.lease(); const scope = lease.scope;
-    let interval: number; let snapshot;
-    let profile: InterestProfile | null;
-    try { [snapshot, interval, profile] = await Promise.all([this.store.getRecommendationSnapshot(scope),
-      this.store.getSettings().then(value => value.refreshIntervalMinutes), this.store.getProfile(scope)]); }
-    catch { throw new V2exError('ai_unavailable'); }
-    await this.identity.assertLease(lease);
-    let items = snapshot?.items ?? []; const batch = snapshot?.batch;
-    const negative = new Set(profile?.feedback.filter(value => !value.interested).map(value => value.topicId) ?? []);
-    const exclusions = profile?.exclusions.map(value => value.toLocaleLowerCase('en')) ?? [];
-    const batchIds = new Set(batch?.topicIds ?? []);
-    items = items.filter(item => batchIds.has(item.topic.id) && item.feedback !== 'not_interested' && !negative.has(item.topic.id) &&
-      !exclusions.some(term => `${item.topic.title}\n${item.topic.node.name}`.toLocaleLowerCase('en').includes(term))).sort(order);
-    const generatedAt = batch?.generatedAt ?? null;
-    const stale = generatedAt === null || this.clock().getTime() - Date.parse(generatedAt) > interval * 60_000;
-    const result = { items, generatedAt, stale, source: 'stored' as const };
-    await this.identity.assertLease(lease); return result;
+    return this.identity.withRead(async lease => {
+      let interval: number; let snapshot; let profile: InterestProfile | null;
+      try { [snapshot, interval, profile] = await Promise.all([this.store.getRecommendationSnapshot(lease.scope),
+        this.store.getSettings().then(value => value.refreshIntervalMinutes), this.store.getProfile(lease.scope)]); }
+      catch { throw new V2exError('ai_unavailable'); }
+      let items = snapshot?.items ?? []; const batch = snapshot?.batch;
+      const negative = new Set(profile?.feedback.filter(value => !value.interested).map(value => value.topicId) ?? []);
+      const exclusions = profile?.exclusions.map(value => value.toLocaleLowerCase('en')) ?? [];
+      const batchIds = new Set(batch?.topicIds ?? []);
+      items = items.filter(item => batchIds.has(item.topic.id) && item.feedback !== 'not_interested' && !negative.has(item.topic.id) &&
+        !exclusions.some(term => `${item.topic.title}\n${item.topic.node.name}`.toLocaleLowerCase('en').includes(term))).sort(order);
+      const generatedAt = batch?.generatedAt ?? null;
+      const stale = generatedAt === null || this.clock().getTime() - Date.parse(generatedAt) > interval * 60_000;
+      return { items, generatedAt, stale, source: 'stored' as const };
+    });
   }
 
   async feedback(input: { topicId: number; value: RecommendationFeedback }): Promise<void> {
     if (!Number.isSafeInteger(input?.topicId) || input.topicId < 1 ||
       (input.value !== 'interested' && input.value !== 'not_interested')) throw new V2exError('invalid_request');
-    const lease = await this.identity.lease(); const scope = lease.scope;
-    try {
-      const key = `${scope}${input.topicId}`;
+    return this.identity.withMutation(async (lease, guard) => {
+      const key = `${lease.scope}${input.topicId}`;
       if (!await this.store.getRecommendation(key)) throw new V2exError('not_found');
-      await this.identity.assertLease(lease);
-      await this.feedbackSink?.recordFeedback(input.topicId, input.value === 'interested', lease);
-      await this.identity.assertLease(lease);
+      await this.feedbackSink?.recordFeedback(input.topicId, input.value === 'interested', guard);
       await this.store.setRecommendationFeedback(key, input.value);
-      await this.identity.assertLease(lease);
-    } catch (error) { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); }
+    }).catch(error => { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); });
   }
 
   async markRead(topicId: number): Promise<void> {
     if (!Number.isSafeInteger(topicId) || topicId < 1) throw new V2exError('invalid_request');
-    const lease = await this.identity.lease();
-    try { await this.identity.assertLease(lease); await this.store.markRead(`${lease.scope}${topicId}`);
-      await this.identity.assertLease(lease); }
-    catch (error) { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); }
+    await this.identity.withMutation(lease => this.store.markRead(`${lease.scope}${topicId}`))
+      .catch(error => { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); });
   }
 }

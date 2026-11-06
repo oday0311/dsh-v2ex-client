@@ -36,11 +36,15 @@ export class FakeContentStore implements ContentStore {
   readonly cache = new Map<string, CacheRecord>();
   readonly recommendations = new Map<string, Recommendation>();
   readonly recommendationBatches = new Map<string, RecommendationBatch>();
+  readonly migratedRecommendationScopes = new Set<string>();
   readonly accountProfiles = new Map<string, { profile: InterestProfile; edits: InterestEditFlags }>();
   readonly summaries = new Map<string, TopicAiSummary>();
   beforeRecommendationSnapshot?: () => Promise<void>;
   beforeRecommendationPublish?: () => Promise<void>;
   beforeProfileRead?: () => Promise<void>;
+  beforeInterestPut?: () => Promise<void>;
+  beforeMarkRead?: () => Promise<void>;
+  beforeSetFeedback?: () => Promise<void>;
   failNextRecommendationPublish = false;
   private recommendationOperation: Promise<void> = Promise.resolve();
   settings: PluginSettings = {
@@ -62,6 +66,7 @@ export class FakeContentStore implements ContentStore {
   }
   async getProfileEdits(scope?: string) { return { ...(scope ? this.accountProfiles.get(scope)?.edits ?? { labels: false, preferredNodes: false, exclusions: false } : this.profileEdits) }; }
   async putInterestState(profile: InterestProfile, edits: InterestEditFlags, scope?: string) {
+    await this.beforeInterestPut?.();
     if (scope) this.accountProfiles.set(scope, { profile, edits: { ...edits } });
     else { this.profile = profile; this.profileEdits = { ...edits }; }
   }
@@ -69,17 +74,30 @@ export class FakeContentStore implements ContentStore {
     if (scope) this.accountProfiles.delete(scope);
     else { this.profile = null; this.profileEdits = { labels: false, preferredNodes: false, exclusions: false }; }
   }
-  async getRecommendation(key: string) { return this.recommendations.get(key); }
+  async getRecommendation(key: string) {
+    const scope = /^[0-9a-f]{64}:/.exec(key)?.[0];
+    if (scope && this.migratedRecommendationScopes.has(scope)) {
+      const batch = this.recommendationBatches.get(scope);
+      return batch?.topicIds.includes(Number(key.slice(scope.length))) ? this.recommendations.get(key) : undefined;
+    }
+    return this.recommendations.get(key);
+  }
   async putRecommendation(key: string, value: Recommendation) {
     const previous = this.recommendations.get(key);
     this.recommendations.set(key, previous ? { ...value, read: previous.read || value.read,
       feedback: previous.feedback ?? value.feedback } : value);
   }
   async markRead(key: string) {
+    await this.beforeMarkRead?.();
+    const scope = /^[0-9a-f]{64}:/.exec(key)?.[0];
+    if (scope && this.migratedRecommendationScopes.has(scope) && !this.recommendationBatches.get(scope)?.topicIds.includes(Number(key.slice(scope.length)))) return;
     const value = this.recommendations.get(key);
     if (value) this.recommendations.set(key, { ...value, read: true });
   }
   async setRecommendationFeedback(key: string, feedback: Recommendation['feedback']) {
+    await this.beforeSetFeedback?.();
+    const scope = /^[0-9a-f]{64}:/.exec(key)?.[0];
+    if (scope && this.migratedRecommendationScopes.has(scope) && !this.recommendationBatches.get(scope)?.topicIds.includes(Number(key.slice(scope.length)))) throw new Error('not found');
     const value = this.recommendations.get(key);
     if (!value) throw new Error('not found');
     this.recommendations.set(key, { ...value, feedback });
@@ -106,6 +124,7 @@ export class FakeContentStore implements ContentStore {
       for (const key of previous.keys()) this.recommendations.delete(key);
       for (const item of next) this.recommendations.set(`${scope}${item.topic.id}`, structuredClone(item));
       this.recommendationBatches.set(scope, structuredClone(batch));
+      this.migratedRecommendationScopes.add(scope);
       result = { batch: structuredClone(batch), items: structuredClone(next) };
     });
     this.recommendationOperation = operation.then(() => {}, () => {});
@@ -127,6 +146,7 @@ export class FakeContentStore implements ContentStore {
   }
   async getSummary(key: string) { return this.summaries.get(key); }
   async putSummary(key: string, value: TopicAiSummary) { this.summaries.set(key, value); }
-  async listRecommendations(scope?: string) { return [...this.recommendations.entries()]
+  async listRecommendations(scope?: string) { if (scope && this.migratedRecommendationScopes.has(scope) && !this.recommendationBatches.has(scope)) return [];
+    return [...this.recommendations.entries()]
     .filter(([key]) => scope === undefined || key.startsWith(scope)).map(([, value]) => value); }
 }
