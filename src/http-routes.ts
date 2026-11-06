@@ -1,12 +1,14 @@
 import type { AuthService } from './credentials.js';
 import type { ContentService } from './content-service.js';
-import type { AccountStatus, ApiResult, Cached, ReplyItem, TopicThread } from './contract.js';
+import type { AccountStatus, ApiResult, Cached, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
 import { V2exError, toPublicError } from './errors.js';
 import { assertNodeName, assertPage, assertTopicId } from './validation.js';
 
 const PREFIX = '/api/v2ex';
 const MAX_LOGIN_BYTES = 4 * 1024;
 const MAX_RESPONSE_BYTES = 256 * 1024;
+const PAGE_SIZE = 20;
+const MAX_EMBEDDED_REPLY_PAGES = 3;
 const ROUTED_METHODS = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD', 'OPTIONS'];
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
@@ -50,21 +52,34 @@ function accountStatus(value: unknown, secrets: Array<string | undefined>): Acco
     expiresAt: status.expiresAt as string | null };
 }
 
-function boundedReplies(result: Cached<ReplyItem[]>): Cached<ReplyItem[]> & { truncated: boolean; omittedReplies: number } {
-  const replies = result.value.slice(0, 40);
-  const value = replies.map(reply => ({ ...reply, content: reply.content.slice(0, 512) }));
-  return { ...result, value, truncated: replies.length < result.value.length ||
-    replies.some(reply => reply.content.length > 512), omittedReplies: result.value.length - replies.length };
+function boundedTopicPage(result: Cached<TopicPage>): Cached<TopicPage> & { truncated: boolean; omittedItems: number } {
+  const items = result.value.items.slice(0, PAGE_SIZE);
+  const omittedItems = result.value.items.length - items.length;
+  return { ...result, value: { ...result.value, items, hasMore: result.value.hasMore || omittedItems > 0 },
+    truncated: omittedItems > 0, omittedItems };
 }
 
-function boundedTopic(result: Cached<TopicThread>): Cached<TopicThread> & { truncated: boolean; omittedReplies: number } {
-  const replies = result.value.replies.slice(0, 20);
-  const content = result.value.content.slice(0, 8_000);
-  const value = { ...result.value, content, replies: replies.map(reply => ({ ...reply, content: reply.content.slice(0, 512) })),
-    hasMoreReplies: result.value.hasMoreReplies || replies.length < result.value.replies.length };
+function boundedHot(result: Cached<TopicListItem[]>): Cached<TopicListItem[]> & { truncated: boolean; omittedItems: number } {
+  const value = result.value.slice(0, PAGE_SIZE);
+  const omittedItems = result.value.length - value.length;
+  return { ...result, value, truncated: omittedItems > 0, omittedItems };
+}
+
+function boundedReplies(result: Cached<ReplyItem[]>): Cached<ReplyItem[]> & { truncated: boolean; omittedReplies: number } {
+  if (result.value.length > PAGE_SIZE) throw new V2exError('invalid_response');
+  const value = result.value.map(reply => ({ ...reply, content: reply.content.slice(0, 256) }));
+  return { ...result, value, truncated: result.value.some(reply => reply.content.length > 256), omittedReplies: 0 };
+}
+
+function boundedTopic(result: Cached<TopicThread>, replyPages: number): Cached<TopicThread> & { truncated: boolean; omittedReplies: number } {
+  if (result.value.replyPage !== replyPages || result.value.replies.length > replyPages * PAGE_SIZE) {
+    throw new V2exError('invalid_response');
+  }
+  const replies = result.value.replies;
+  const content = result.value.content.slice(0, 4_000);
+  const value = { ...result.value, content, replies: replies.map(reply => ({ ...reply, content: reply.content.slice(0, 256) })) };
   return { ...result, value, truncated: content.length < result.value.content.length ||
-    replies.length < result.value.replies.length || replies.some(reply => reply.content.length > 512),
-    omittedReplies: result.value.replies.length - replies.length };
+    replies.some(reply => reply.content.length > 256), omittedReplies: 0 };
 }
 
 function statusFor(code: ReturnType<typeof toPublicError>['code']): number {
@@ -169,11 +184,11 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
       }
       if (path === '/latest') {
         const input = params(query, ['page']);
-        return json({ ok: true, data: await services.content.latest({ page: page(input.get('page')) }, request.signal) });
+        return json({ ok: true, data: boundedTopicPage(await services.content.latest({ page: page(input.get('page')) }, request.signal)) });
       }
       if (path === '/hot') {
         params(query, []);
-        return json({ ok: true, data: await services.content.hot(request.signal) });
+        return json({ ok: true, data: boundedHot(await services.content.hot(request.signal)) });
       }
       if (path === '/node') {
         const input = params(query, ['node']);
@@ -181,13 +196,15 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
       }
       if (path === '/node/topics') {
         const input = params(query, ['node', 'page']);
-        return json({ ok: true, data: await services.content.nodeTopics({ node: assertNodeName(input.get('node')), page: page(input.get('page')) }, request.signal) });
+        return json({ ok: true, data: boundedTopicPage(await services.content.nodeTopics({ node: assertNodeName(input.get('node')), page: page(input.get('page')) }, request.signal)) });
       }
       if (path === '/topic') {
         const input = params(query, ['topic', 'replyPages']);
         const replyPages = input.get('replyPages');
-        if (replyPages !== null && !/^(?:0|[1-9]|10)$/.test(replyPages)) throw new V2exError('invalid_request');
-        return json({ ok: true, data: boundedTopic(await services.content.topic({ topic: String(assertTopicId(input.get('topic'))), replyPages: replyPages === null ? 0 : Number(replyPages) }, request.signal)) });
+        if (replyPages !== null && !/^(?:0|[1-9][0-9]*)$/.test(replyPages)) throw new V2exError('invalid_request');
+        const coveredPages = replyPages === null ? 0 : Number(replyPages);
+        if (coveredPages > MAX_EMBEDDED_REPLY_PAGES) throw new V2exError('invalid_request');
+        return json({ ok: true, data: boundedTopic(await services.content.topic({ topic: String(assertTopicId(input.get('topic'))), replyPages: coveredPages }, request.signal), coveredPages) });
       }
       if (path === '/replies') {
         const input = params(query, ['topic', 'page']);

@@ -182,7 +182,7 @@ test('all browsing responses stay within a valid 256 KiB JSON envelope', async (
     credential: { async resolve() { return undefined; } }, auth: {} as never,
     content: Object.fromEntries(['latest', 'hot', 'node', 'nodeTopics', 'topic', 'replies'].map(name => [name, async () => cached])),
   } as never);
-  for (const path of ['/latest', '/hot', '/node?node=python', '/node/topics?node=python', '/topic?topic=1&replyPages=10', '/replies?topic=1']) {
+  for (const path of ['/latest', '/hot', '/node?node=python', '/node/topics?node=python', '/topic?topic=1&replyPages=3', '/replies?topic=1']) {
     const url = new URL(`/api/v2ex${path}`, 'https://host.test');
     const response = await routes.get(url.pathname)!.fetch(new Request(url));
     const text = await response.text();
@@ -200,22 +200,93 @@ test('large topic and reply content remains usable with explicit truncation meta
   registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } }, {
     credential: { async resolve() { return undefined; } }, auth: {} as never,
     content: { async topic() { return { ...base, value: { topic: { id: 1, title: 'A' }, content: noisy,
-      replies, replyPage: 10, hasMoreReplies: false, stale: false } }; },
-    async replies() { return { ...base, value: replies }; } },
+      replies, replyPage: 3, hasMoreReplies: false, stale: false } }; },
+    async replies() { return { ...base, value: replies.slice(0, 20) }; } },
   } as never);
-  for (const path of ['/topic?topic=1&replyPages=10', '/replies?topic=1']) {
+  for (const path of ['/topic?topic=1&replyPages=3', '/replies?topic=1']) {
     const url = new URL(`/api/v2ex${path}`, 'https://host.test');
     const response = await routes.get(url.pathname)!.fetch(new Request(url));
     const body = await response.json() as { ok: boolean; data: { truncated: boolean; omittedReplies: number; value: { content?: string; replies?: unknown[] } | unknown[] } };
     assert.equal(response.status, 200);
     assert.equal(body.ok, true);
     assert.equal(body.data.truncated, true);
-    assert.ok(body.data.omittedReplies > 0);
+    assert.equal(body.data.omittedReplies, 0);
     assert.ok(Buffer.byteLength(JSON.stringify(body)) <= 256 * 1024);
     if (path.startsWith('/topic')) {
-      assert.equal((body.data.value as { replies: unknown[] }).replies.length, 20);
+      assert.equal((body.data.value as { replies: unknown[] }).replies.length, 60);
       assert.match((body.data.value as { content: string }).content, /^\u0000/);
-    } else assert.equal((body.data.value as unknown[]).length, 40);
+    } else assert.equal((body.data.value as unknown[]).length, 20);
+  }
+});
+
+test('topic reply coverage never advances past replies the browser received', async () => {
+  const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  const calls: string[] = [];
+  const reply = (id: number) => ({ id, author: { username: 'alice' }, content: '\u0000\\😀'.repeat(10_000), createdAt: '2026-11-06T00:00:00Z' });
+  const cached = { stale: false, source: 'network', fetchedAt: '2026-11-06T00:00:00Z' };
+  registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } }, {
+    credential: { async resolve() { return undefined; } }, auth: {} as never,
+    content: {
+      async topic(input: { replyPages: number }) {
+        calls.push(`topic:${input.replyPages}`);
+        return { ...cached, value: { topic: { id: 1 }, content: 'body',
+          replies: Array.from({ length: input.replyPages * 20 }, (_, index) => reply(index + 1)),
+          replyPage: input.replyPages, hasMoreReplies: true, stale: false } };
+      },
+      async replies(input: { page: number }) {
+        calls.push(`replies:${input.page}`);
+        return { ...cached, value: Array.from({ length: 20 }, (_, index) => reply((input.page - 1) * 20 + index + 1)) };
+      },
+    },
+  } as never);
+  const topicRoute = routes.get('/api/v2ex/topic')!;
+  const invalid = await topicRoute.fetch(new Request('https://host.test/api/v2ex/topic?topic=1&replyPages=10'));
+  assert.equal(invalid.status, 400);
+  assert.deepEqual(calls, []);
+  const response = await topicRoute.fetch(new Request('https://host.test/api/v2ex/topic?topic=1&replyPages=3'));
+  const body = await response.json() as { ok: boolean; data: { value: { replies: Array<{ id: number }>; replyPage: number; hasMoreReplies: boolean }; truncated: boolean; omittedReplies: number } };
+  assert.equal(response.status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data.value.replyPage, 3);
+  assert.deepEqual(body.data.value.replies.map(reply => reply.id), Array.from({ length: 60 }, (_, index) => index + 1));
+  assert.equal(body.data.omittedReplies, 0);
+  assert.equal(body.data.truncated, true);
+  assert.equal(body.data.value.hasMoreReplies, true);
+  assert.ok(Buffer.byteLength(JSON.stringify(body)) <= 256 * 1024);
+  const next = await routes.get('/api/v2ex/replies')!.fetch(new Request('https://host.test/api/v2ex/replies?topic=1&page=4'));
+  const nextBody = await next.json() as { data: { value: Array<{ id: number }> } };
+  assert.equal(next.status, 200);
+  assert.deepEqual(nextBody.data.value.map(reply => reply.id), Array.from({ length: 20 }, (_, index) => index + 61));
+  assert.deepEqual(calls, ['topic:3', 'replies:4']);
+});
+
+test('large valid topic lists return bounded success and truthful omission metadata', async () => {
+  const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  const noisy = '\u0000\\😀'.repeat(125);
+  const item = { id: 1, title: noisy, node: { name: 'python', title: '\u0000'.repeat(200) },
+    author: { username: '\u0000'.repeat(64) }, replyCount: 2, createdAt: '2026-11-06T00:00:00Z',
+    lastReplyAt: null, url: 'https://www.v2ex.com/t/1' };
+  const items = Array.from({ length: 100 }, (_, index) => ({ ...item, id: index + 1 }));
+  const cached = { stale: false, source: 'network', fetchedAt: '2026-11-06T00:00:00Z' };
+  registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } }, {
+    credential: { async resolve() { return undefined; } }, auth: {} as never,
+    content: { async latest() { return { ...cached, value: { items, page: 1, hasMore: false, stale: false } }; },
+      async hot() { return { ...cached, value: items }; },
+      async nodeTopics() { return { ...cached, value: { items, page: 1, hasMore: false, stale: false } }; } },
+  } as never);
+  for (const path of ['/latest', '/hot', '/node/topics?node=python']) {
+    const url = new URL(`/api/v2ex${path}`, 'https://host.test');
+    const response = await routes.get(url.pathname)!.fetch(new Request(url));
+    const text = await response.text();
+    const body = JSON.parse(text) as { ok: boolean; data: { value: { items: typeof items; hasMore: boolean } | typeof items; truncated: boolean; omittedItems: number } };
+    assert.equal(response.status, 200, path);
+    assert.equal(body.ok, true, path);
+    const visible = Array.isArray(body.data.value) ? body.data.value : body.data.value.items;
+    assert.ok(visible.length > 0 && visible.length < items.length, path);
+    assert.equal(body.data.omittedItems, items.length - visible.length, path);
+    assert.equal(body.data.truncated, true, path);
+    assert.ok(Buffer.byteLength(text) <= 256 * 1024, path);
+    if (!Array.isArray(body.data.value)) assert.equal(body.data.value.hasMore, true, path);
   }
 });
 
