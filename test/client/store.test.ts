@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import { V2exClientStore } from '../../src/client/store.js';
 import type { V2exClientRemote } from '../../src/client/http.js';
 import type { AccountStatus, Cached, TopicPage, TopicThread, ReplyItem, TopicListItem } from '../../src/contract.js';
-import { V2exClientError } from '../../src/client/http.js';
+import { createV2exHttpClient, V2exClientError } from '../../src/client/http.js';
 
 const account = (authenticated: boolean): AccountStatus => ({ authenticated, writable: false, username: authenticated ? 'reader' : null, tokenScope: null, expiresAt: null });
 const topic: TopicListItem = { id: 7, title: 'TypeScript', node: { name: 'dev', title: '开发' }, author: { username: 'alice' }, replyCount: 2, createdAt: '2026-11-06T00:00:00.000Z', lastReplyAt: null, url: 'https://www.v2ex.com/t/7' };
@@ -109,6 +109,44 @@ test('failed token replacement keeps the prior authenticated session and topics'
   assert.equal(store.getSnapshot().topics?.value.items[0]?.title, 'TypeScript');
   assert.equal(store.getSnapshot().error, 'token_invalid');
   assert.equal(JSON.stringify(store.getSnapshot()).includes('invalid-replacement'), false);
+  store.dispose();
+});
+
+test('unauthenticated login success envelope cannot demote an existing ready session', async () => {
+  const client = createV2exHttpClient(async (_input, init) => new Response(JSON.stringify({ ok: true, data:
+    init?.method === 'POST' ? account(false) : account(true),
+  }), { headers: { 'content-type': 'application/json' } }));
+  const store = new V2exClientStore(client);
+  await store.loadSession();
+  assert.equal(store.getSnapshot().phase, 'ready');
+  await store.login('replacement-secret');
+  assert.equal(store.getSnapshot().phase, 'ready');
+  assert.equal(store.getSnapshot().account?.username, 'reader');
+  assert.equal(store.getSnapshot().error, 'invalid_response');
+  assert.equal(store.getSnapshot().loading, false);
+  store.dispose();
+});
+
+test('unauthenticated login success envelope leaves an initial guest with an error', async () => {
+  const client = createV2exHttpClient(async () => new Response(JSON.stringify({ ok: true, data: account(false) }),
+    { headers: { 'content-type': 'application/json' } }));
+  const store = new V2exClientStore(client);
+  await store.loadSession();
+  assert.equal(store.getSnapshot().phase, 'guest');
+  await store.login('first-secret');
+  assert.equal(store.getSnapshot().phase, 'guest');
+  assert.equal(store.getSnapshot().error, 'invalid_response');
+  assert.equal(store.getSnapshot().loading, false);
+  store.dispose();
+});
+
+test('store rejects an anonymous login result from a non-HTTP remote', async () => {
+  const store = new V2exClientStore(remote({ login: async () => account(false) }));
+  await store.loadSession();
+  await store.login('replacement-secret');
+  assert.equal(store.getSnapshot().phase, 'ready');
+  assert.equal(store.getSnapshot().account?.username, 'reader');
+  assert.equal(store.getSnapshot().error, 'invalid_response');
   store.dispose();
 });
 

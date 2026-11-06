@@ -72,3 +72,11 @@ test('successful login cannot echo the submitted token into account state', asyn
   await assert.rejects(client.login(secret), (error: unknown) =>
     error instanceof V2exClientError && error.code === 'invalid_response' && !error.message.includes(secret));
 });
+
+test('login rejects an unauthenticated account inside a successful envelope', async () => {
+  const client = createV2exHttpClient(async () => new Response(JSON.stringify({ ok: true, data: {
+    authenticated: false, writable: false, username: null, tokenScope: null, expiresAt: null,
+  } }), { headers: { 'content-type': 'application/json' } }));
+  await assert.rejects(client.login('test-secret'), (error: unknown) =>
+    error instanceof V2exClientError && error.code === 'invalid_response');
+});

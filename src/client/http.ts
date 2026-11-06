@@ -81,6 +81,7 @@ export function createV2exHttpClient(fetcher: typeof fetch = globalThis.fetch): 
     session: signal => request('/session', account, { signal }),
     login: async (token, signal) => {
       const status = await request('/session', account, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token }), signal });
+      if (!status.authenticated) throw new V2exClientError('invalid_response');
       if ([status.username, status.tokenScope, status.expiresAt].some(value => value?.includes(token))) throw new V2exClientError('invalid_response');
       return status;
     },

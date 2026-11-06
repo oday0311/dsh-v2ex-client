@@ -71,7 +71,7 @@ export class V2exClientStore {
     const request = this.start('session');
     const previouslyReady = this.state.phase === 'ready';
     this.set({ loading: true, error: null });
-    try { const status = await this.remote.login(token, request.signal); if (request.current()) this.sessionStatus(status); }
+    try { const status = await this.remote.login(token, request.signal); if (!status.authenticated) throw new V2exClientError('invalid_response'); if (request.current()) this.sessionStatus(status); }
     catch (error) { if (request.current()) this.set({ phase: previouslyReady ? 'ready' : 'guest', error: this.code(error) }); }
     finally { if (request.current()) this.set({ loading: false }); }
   }
