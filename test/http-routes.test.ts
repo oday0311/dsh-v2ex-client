@@ -4,6 +4,7 @@ import { registerV2exHttpRoutes } from '../src/http-routes.js';
 import { V2exError } from '../src/errors.js';
 import { composePlugin } from '../src/plugin.js';
 import { Config } from '../src/index.js';
+import { Context } from '@deepseek-ai/cordis';
 
 const TOKEN = '00000000-0000-4000-8000-000000000000';
 const PATHS = ['/session', '/latest', '/hot', '/node', '/node/topics', '/topic', '/replies', '/health'];
@@ -27,10 +28,11 @@ function fixture() {
     async hot() { calls.push('hot'); return { value: [], stale: false, source: 'network', fetchedAt: 'now' }; },
     async node(input: { node: string }) { calls.push(`node:${input.node}`); return { value: { name: input.node }, stale: false, source: 'network', fetchedAt: 'now' }; },
     async nodeTopics(input: { node: string; page: number }) { calls.push(`nodeTopics:${input.node}:${input.page}`); return { value: { items: [] }, stale: false, source: 'network', fetchedAt: 'now' }; },
-    async topic(input: { topic: string; replyPages: number }) { calls.push(`topic:${input.topic}:${input.replyPages}`); return { value: { topic: { id: Number(input.topic) } }, stale: false, source: 'network', fetchedAt: 'now' }; },
+    async topic(input: { topic: string; replyPages: number }) { calls.push(`topic:${input.topic}:${input.replyPages}`); return { value: { topic: { id: Number(input.topic) }, content: '', replies: [], replyPage: input.replyPages, hasMoreReplies: false }, stale: false, source: 'network', fetchedAt: 'now' }; },
     async replies(input: { topic: string; page: number }) { calls.push(`replies:${input.topic}:${input.page}`); return { value: [], stale: false, source: 'network', fetchedAt: 'now' }; },
   };
-  const dispose = registerV2exHttpRoutes(connection, { auth, content } as never);
+  const registration = registerV2exHttpRoutes(connection, { auth, credential: { async resolve() { return undefined; } }, content } as never);
+  const dispose = async () => (await registration)();
   const fetch = (path: string, init?: RequestInit) => {
     const url = new URL(path, 'https://host.test');
     const route = routes.get(url.pathname);
@@ -48,7 +50,7 @@ test('registers each exact path once with buffered request handling', async () =
   const wrong = await f.routes.get('/api/v2ex/topic')!.fetch(new Request('https://host.test/api/v2ex/topic/extra'));
   assert.equal(wrong.status, 404);
   assert.equal(wrong.headers.get('cache-control'), 'no-store');
-  f.dispose(); f.dispose();
+  await f.dispose(); await f.dispose();
   assert.equal(f.routes.size, 0);
   assert.deepEqual(f.removed.sort(), PATHS.map(path => `/api/v2ex${path}`).sort());
 });
@@ -74,6 +76,21 @@ test('logout accepts only a bounded personal-data choice', async () => {
   const invalid = await f.fetch('/api/v2ex/session', { method: 'DELETE', body: '{' });
   assert.equal(invalid.status, 400);
   assert.deepEqual(f.calls, ['logout:true', 'status']);
+});
+
+test('invalid DELETE body is rejected before credential or auth I/O', async () => {
+  const calls: string[] = [];
+  let session: { fetch(request: Request): Promise<Response> } | undefined;
+  registerV2exHttpRoutes({ fetch: { register(route) {
+    if (route.path === '/api/v2ex/session') session = route;
+    return () => {};
+  } } }, { credential: { async resolve() { calls.push('credential'); return undefined; } },
+    auth: { async status() { calls.push('status'); return {} as never; },
+      async login() { calls.push('login'); return {} as never; }, async logout() { calls.push('logout'); } },
+    content: {} } as never);
+  const response = await session!.fetch(new Request('https://host.test/api/v2ex/session', { method: 'DELETE', body: '{' }));
+  assert.equal(response.status, 400);
+  assert.deepEqual(calls, []);
 });
 
 test('all paths dispatch methods with Allow and no-store', async () => {
@@ -110,7 +127,7 @@ test('unexpected login account data cannot reflect the submitted token', async (
   registerV2exHttpRoutes({ fetch: { register(route) {
     if (route.path === '/api/v2ex/session') session = route;
     return () => {};
-  } } }, { auth: {
+  } } }, { credential: { async resolve() { return undefined; } }, auth: {
     async login() { return { authenticated: true, writable: true, username: TOKEN, tokenScope: null, expiresAt: null }; },
     async status() { throw new Error('unused'); }, async logout() { throw new Error('unused'); },
   }, content: {} } as never);
@@ -119,6 +136,166 @@ test('unexpected login account data cannot reflect the submitted token', async (
   }));
   assert.equal(response.status, 502);
   assert.doesNotMatch(await response.text(), /00000000/);
+});
+
+test('GET and DELETE session use the same bounded status and stored-secret boundary', async () => {
+  let session: { fetch(request: Request): Promise<Response> } | undefined;
+  const stored = 'private-stored-secret-that-is-not-uuid';
+  registerV2exHttpRoutes({ fetch: { register(route) {
+    if (route.path === '/api/v2ex/session') session = route;
+    return () => {};
+  } } }, { credential: { async resolve() { return stored; } }, auth: {
+    async status() { return { authenticated: true, writable: true, username: stored, tokenScope: 'everything', expiresAt: null }; },
+    async login() { throw new Error('unused'); }, async logout() {},
+  }, content: {} } as never);
+  for (const method of ['GET', 'DELETE']) {
+    const response = await session!.fetch(new Request('https://host.test/api/v2ex/session', { method }));
+    assert.equal(response.status, 502);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.doesNotMatch(await response.text(), /private-stored-secret/);
+  }
+});
+
+test('session rejects oversized or extra account fields on all methods', async () => {
+  let session: { fetch(request: Request): Promise<Response> } | undefined;
+  registerV2exHttpRoutes({ fetch: { register(route) {
+    if (route.path === '/api/v2ex/session') session = route;
+    return () => {};
+  } } }, { credential: { async resolve() { return undefined; } }, auth: {
+    async status() { return { authenticated: true, writable: true, username: 'x'.repeat(1000), tokenScope: null, expiresAt: null }; },
+    async login() { return { authenticated: true, writable: true, username: 'alice', tokenScope: null, expiresAt: null, token: TOKEN }; },
+    async logout() {},
+  }, content: {} } as never);
+  for (const [method, body] of [['GET', undefined], ['POST', JSON.stringify({ token: TOKEN })], ['DELETE', undefined]] as const) {
+    const response = await session!.fetch(new Request('https://host.test/api/v2ex/session', { method, body }));
+    assert.equal(response.status, 502);
+    assert.doesNotMatch(await response.text(), /00000000|x{100}/);
+  }
+});
+
+test('all browsing responses stay within a valid 256 KiB JSON envelope', async () => {
+  const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  const noisy = '\u0000\\\n😀'.repeat(45_000);
+  const cached = { value: { content: noisy, replies: Array.from({ length: 2 }, () => ({ content: noisy })) },
+    stale: false, source: 'network', fetchedAt: 'now' };
+  registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } }, {
+    credential: { async resolve() { return undefined; } }, auth: {} as never,
+    content: Object.fromEntries(['latest', 'hot', 'node', 'nodeTopics', 'topic', 'replies'].map(name => [name, async () => cached])),
+  } as never);
+  for (const path of ['/latest', '/hot', '/node?node=python', '/node/topics?node=python', '/topic?topic=1&replyPages=10', '/replies?topic=1']) {
+    const url = new URL(`/api/v2ex${path}`, 'https://host.test');
+    const response = await routes.get(url.pathname)!.fetch(new Request(url));
+    const text = await response.text();
+    assert.ok(Buffer.byteLength(text) <= 256 * 1024, path);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    assert.doesNotThrow(() => JSON.parse(text), path);
+  }
+});
+
+test('large topic and reply content remains usable with explicit truncation metadata', async () => {
+  const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  const noisy = '\u0000\\😀'.repeat(20_000);
+  const replies = Array.from({ length: 60 }, (_, id) => ({ id, author: { username: 'alice' }, content: noisy, createdAt: '2026-11-06T00:00:00Z' }));
+  const base = { stale: false, source: 'network', fetchedAt: '2026-11-06T00:00:00Z' };
+  registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } }, {
+    credential: { async resolve() { return undefined; } }, auth: {} as never,
+    content: { async topic() { return { ...base, value: { topic: { id: 1, title: 'A' }, content: noisy,
+      replies, replyPage: 10, hasMoreReplies: false, stale: false } }; },
+    async replies() { return { ...base, value: replies }; } },
+  } as never);
+  for (const path of ['/topic?topic=1&replyPages=10', '/replies?topic=1']) {
+    const url = new URL(`/api/v2ex${path}`, 'https://host.test');
+    const response = await routes.get(url.pathname)!.fetch(new Request(url));
+    const body = await response.json() as { ok: boolean; data: { truncated: boolean; omittedReplies: number; value: { content?: string; replies?: unknown[] } | unknown[] } };
+    assert.equal(response.status, 200);
+    assert.equal(body.ok, true);
+    assert.equal(body.data.truncated, true);
+    assert.ok(body.data.omittedReplies > 0);
+    assert.ok(Buffer.byteLength(JSON.stringify(body)) <= 256 * 1024);
+    if (path.startsWith('/topic')) {
+      assert.equal((body.data.value as { replies: unknown[] }).replies.length, 20);
+      assert.match((body.data.value as { content: string }).content, /^\u0000/);
+    } else assert.equal((body.data.value as unknown[]).length, 40);
+  }
+});
+
+test('real Cordis Context registers routes through get and rejects absent transport', async () => {
+  const create = (withConnection: boolean) => {
+    const ctx = new Context(); let routes = 0; let closed = 0;
+    ctx.provide('credentials', {});
+    ctx.provide('storageDomain', { async open() { return { async close() { closed++; } }; } });
+    ctx.provide('tools', { register() { return () => {}; } });
+    if (withConnection) ctx.provide('connection', { fetch: { register() { routes++; return () => { routes--; }; } } });
+    return { ctx, routes: () => routes, closed: () => closed };
+  };
+  const present = create(true);
+  const plugin = await composePlugin(present.ctx, Config({}));
+  assert.equal(present.routes(), 8);
+  await plugin.dispose();
+  assert.equal(present.routes(), 0);
+  assert.equal(present.closed(), 1);
+  await present.ctx.fiber.dispose();
+  const absent = create(false);
+  await assert.rejects(composePlugin(absent.ctx, Config({})), { code: 'incompatible_runtime' });
+  assert.equal(absent.closed(), 0);
+  await absent.ctx.fiber.dispose();
+});
+
+test('async route cleanup completes before domain close and disposal is idempotent', async () => {
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const events: string[] = [];
+  const host = {
+    credentials: {}, storageDomain: { async open() { return { async close() { events.push('close'); } }; } },
+    tools: { register() { return () => { events.push('tool'); }; } },
+    get(name: string) { assert.equal(name, 'connection'); return { fetch: { register() {
+      return async () => { events.push('route-start'); await gate; events.push('route-end'); };
+    } } }; },
+  };
+  const plugin = await composePlugin(host as never, Config({}));
+  const first = plugin.dispose();
+  const second = plugin.dispose();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(events.includes('close'), false);
+  release();
+  await Promise.all([first, second]);
+  assert.equal(events.at(-1), 'close');
+  assert.equal(events.filter(value => value === 'close').length, 1);
+});
+
+test('composition rollback awaits partial route cleanup before tools and storage', async () => {
+  const events: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  let registrations = 0;
+  const host = {
+    credentials: {}, storageDomain: { async open() { return { async close() { events.push('close'); } }; } },
+    tools: { register() { return () => { events.push('tool'); }; } },
+    get() { return { fetch: { register() {
+      if (++registrations === 3) throw new Error('private carrier detail');
+      return async () => { events.push('route-start'); await gate; events.push('route-end'); };
+    } } }; },
+  };
+  let settled = false;
+  const loading = composePlugin(host as never, Config({})).catch(error => { settled = true; throw error; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.equal(events.includes('close'), false);
+  release();
+  await assert.rejects(loading, { code: 'incompatible_runtime' });
+  assert.equal(events.at(-1), 'close');
+  assert.equal(events.filter(value => value === 'tool').length, 4);
+});
+
+test('connection lookup failures are bounded before opening storage', async () => {
+  let opened = false;
+  const host = {
+    credentials: {}, storageDomain: { async open() { opened = true; } }, tools: { register() { return () => {}; } },
+    get() { throw new Error(`private carrier detail ${TOKEN}`); },
+  };
+  await assert.rejects(composePlugin(host as never, Config({})), (error: unknown) =>
+    error instanceof V2exError && error.code === 'incompatible_runtime' && !error.message.includes(TOKEN));
+  assert.equal(opened, false);
 });
 
 test('browsing routes validate query before invoking services', async () => {
@@ -155,7 +332,7 @@ test('service errors use bounded public messages and stable statuses', async () 
     route.fetch = original;
     const auth = { status: async () => { throw error; }, login: async () => { throw error; }, logout: async () => { throw error; } };
     const local = { fetch: { register: (r: typeof route) => r.path === '/api/v2ex/session' ? (route.fetch = r.fetch, () => {}) : () => {} } };
-    registerV2exHttpRoutes(local, { auth, content: {} } as never);
+    registerV2exHttpRoutes(local, { auth, credential: { async resolve() { return undefined; } }, content: {} } as never);
     const response = await route.fetch(new Request('https://host.test/api/v2ex/session'));
     assert.equal(response.status, status);
     const text = await response.text();
@@ -164,32 +341,48 @@ test('service errors use bounded public messages and stable statuses', async () 
   }
 });
 
-test('registration rolls back when the carrier throws', () => {
-  const f = fixture(); f.dispose();
+test('registration rolls back when the carrier throws', async () => {
+  const f = fixture(); await f.dispose();
   const registered: string[] = []; const removed: string[] = [];
   const connection = { fetch: { register(route: { path: string }) {
     if (registered.length === 3) throw new Error('registration failure');
     registered.push(route.path); return () => removed.push(route.path);
   } } };
-  assert.throws(() => registerV2exHttpRoutes(connection as never, {} as never));
+  await assert.rejects(registerV2exHttpRoutes(connection as never, {} as never), { code: 'incompatible_runtime' });
   assert.deepEqual(removed, registered.slice().reverse());
 });
 
-test('composition uses connection injection and releases routes with tools and domain', async () => {
-  const f = fixture(); f.dispose();
+test('partial route registration awaits asynchronous rollback before rejecting', async () => {
+  const events: string[] = [];
+  let release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const connection = { fetch: { register(route: { path: string }) {
+    if (route.path.endsWith('/hot')) throw new Error('private carrier detail');
+    return async () => { events.push(`start:${route.path}`); await gate; events.push(`end:${route.path}`); };
+  } } };
+  let settled = false;
+  const registration = registerV2exHttpRoutes(connection as never, {} as never).catch(error => {
+    settled = true; throw error;
+  });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(settled, false);
+  assert.deepEqual(events, ['start:/api/v2ex/latest']);
+  release();
+  await assert.rejects(registration, { code: 'incompatible_runtime' });
+  assert.deepEqual(events, ['start:/api/v2ex/latest', 'end:/api/v2ex/latest', 'start:/api/v2ex/session', 'end:/api/v2ex/session']);
+});
+
+test('composition uses the connection service and releases routes with tools and domain', async () => {
+  const f = fixture(); await f.dispose();
   const closed: string[] = [];
   const host = {
     credentials: {}, storageDomain: { async open() { return { async close() { closed.push('domain'); } }; } },
     tools: { register() { return () => closed.push('tool'); } },
-    inject(_deps: string[], callback: (ctx: { get(name: string): unknown }) => void | (() => void)) {
-      const release = callback({ get: () => f.connection });
-      return { dispose: async () => { release?.(); closed.push('fiber'); } };
-    },
+    get(name: string) { assert.equal(name, 'connection'); return f.connection; },
   };
   const plugin = await composePlugin(host as never, Config({}));
   assert.equal(f.routes.size, PATHS.length);
-  plugin.dispose(); plugin.dispose();
-  await new Promise(resolve => setImmediate(resolve));
+  await plugin.dispose(); await plugin.dispose();
   assert.equal(f.routes.size, 0);
   assert.equal(closed.filter(value => value === 'domain').length, 1);
 });
@@ -214,6 +407,7 @@ test('composed logout can clear personal profile and recommendations', async () 
     connection: { fetch: { register(route: { path: string; fetch(request: Request): Promise<Response> }) {
       routes.set(route.path, route); return () => { routes.delete(route.path); };
     } } },
+    get(name: string) { assert.equal(name, 'connection'); return this.connection; },
   };
   const plugin = await composePlugin(host as never, Config({}));
   const response = await routes.get('/api/v2ex/session')!.fetch(new Request('https://host.test/api/v2ex/session', {
@@ -222,5 +416,5 @@ test('composed logout can clear personal profile and recommendations', async () 
   assert.equal(response.status, 200);
   assert.equal(global.profile, null);
   assert.equal(recommendations.size, 0);
-  plugin.dispose();
+  await plugin.dispose();
 });

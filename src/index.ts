@@ -20,7 +20,7 @@ export function Config(value: Partial<Config> = {}): Config {
 }
 
 interface HostContext {
-  effect(callback: () => Promise<() => void>, label: string): () => void;
+  effect(callback: () => Promise<() => Promise<void> | void>, label: string): () => void;
   logger(name: string): { warn(message: string): void };
 }
 

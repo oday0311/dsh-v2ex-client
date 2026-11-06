@@ -10,19 +10,22 @@ import { registerV2exHttpRoutes, type FetchConnection } from './http-routes.js';
 import type { Domain } from '@deepseek-ai/dsh-storage-domain';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
 
-export async function composePlugin(ctx: unknown, config: Config): Promise<{ dispose(): void }> {
+export async function composePlugin(ctx: unknown, config: Config): Promise<{ dispose(): Promise<void> }> {
   const host = ctx as {
     credentials?: CredentialProvider;
     storageDomain?: { open(spec: typeof v2exDomainSpec): Promise<Domain<typeof v2exDomainSpec>> };
     tools?: { register(tool: ToolDefinition): () => void };
-    connection?: FetchConnection;
-    inject?: (deps: string[], callback: (context: { get(name: string): unknown }) => void | (() => void)) => { dispose(): void | Promise<void> };
+    get?: (name: string) => unknown;
   };
   if (!host.credentials || !host.storageDomain || !host.tools) {
     throw new V2exError('incompatible_runtime');
   }
+  let connection: FetchConnection | undefined;
+  try { connection = host.get?.('connection') as FetchConnection | undefined; }
+  catch { throw new V2exError('incompatible_runtime'); }
+  if (!connection?.fetch?.register) throw new V2exError('incompatible_runtime');
   const domain = await host.storageDomain.open(v2exDomainSpec);
-  const disposers: Array<() => void> = [];
+  const disposers: Array<() => void | Promise<void>> = [];
   try {
     const api = new V2exApi({ fetch: globalThis.fetch, timeoutMs: config.requestTimeoutMs,
       responseLimitBytes: config.responseLimitBytes });
@@ -37,25 +40,19 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     const service = new ContentService(api, vault,
       new ContentCache(store), new RequestBudget());
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
-    if (host.connection) disposers.push(registerV2exHttpRoutes(host.connection, { auth, content: service }));
-    else if (host.inject) {
-      const fiber = host.inject(['connection'], context => {
-        const connection = context.get('connection') as FetchConnection | undefined;
-        if (!connection) return;
-        return registerV2exHttpRoutes(connection, { auth, content: service });
-      });
-      disposers.push(() => { void fiber.dispose(); });
-    }
+    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service }));
   } catch (error) {
-    for (const dispose of disposers.reverse()) dispose();
+    for (const dispose of disposers.reverse()) { try { await dispose(); } catch { /* Preserve startup error. */ } }
     await domain.close();
     throw error;
   }
-  let disposed = false;
+  let disposing: Promise<void> | undefined;
   return { dispose() {
-    if (disposed) return;
-    disposed = true;
-    for (const dispose of disposers.reverse()) dispose();
-    void domain.close().catch(() => {});
+    return disposing ??= (async () => {
+      let failed = false;
+      for (const dispose of disposers.reverse()) { try { await dispose(); } catch { failed = true; } }
+      try { await domain.close(); } catch { failed = true; }
+      if (failed) throw new V2exError('incompatible_runtime');
+    })();
   } };
 }

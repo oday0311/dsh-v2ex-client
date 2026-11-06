@@ -46,12 +46,12 @@ test('plugin composition registers and unregisters only the four browsing tools'
     credentials: {},
     storageDomain: { async open() { return { async close() { closed = true; } }; } },
     tools: { register(tool: { name: string }) { names.push(tool.name); return () => { removed.push(tool.name); }; } },
+    get(name: string) { assert.equal(name, 'connection'); return { fetch: { register() { return () => {}; } } }; },
   };
   const plugin = await composePlugin(host as never, Config({}));
   assert.deepEqual(names.sort(), ['v2ex_hot', 'v2ex_latest', 'v2ex_node_topics', 'v2ex_topic']);
-  plugin.dispose();
-  plugin.dispose();
-  await new Promise((resolve) => setImmediate(resolve));
+  await plugin.dispose();
+  await plugin.dispose();
   assert.deepEqual(removed.sort(), names);
   assert.equal(closed, true);
 });
