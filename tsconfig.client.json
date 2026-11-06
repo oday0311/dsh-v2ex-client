@@ -1,9 +1,12 @@
 {
   "extends": "./tsconfig.json",
   "compilerOptions": {
-    "rootDir": "src/client",
-    "types": []
+    "rootDir": "src",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "types": ["react", "react-dom"]
   },
-  "include": ["src/client/**/*.ts"],
+  "include": ["src/client/**/*.ts", "src/client/**/*.tsx"],
   "exclude": []
 }

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFile, mkdir, rm } from 'node:fs/promises';
+import { readFile, mkdir, rm, stat } from 'node:fs/promises';
 import { build } from 'esbuild';
 
 const pkg = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
@@ -27,4 +27,10 @@ await build({
 for (const project of ['tsconfig.json', 'tsconfig.client.json']) {
   execFileSync(process.execPath, ['node_modules/typescript/bin/tsc', '-p', project,
     '--declaration', '--emitDeclarationOnly', '--outDir', 'lib/types'], { stdio: 'inherit' });
+}
+for (const path of [pkg.exports['.'].default, pkg.exports['.'].types,
+  pkg.exports['./client'].default, pkg.exports['./client'].types]) {
+  if (!path.startsWith('./lib/') || !(await stat(new URL(path, import.meta.url))).isFile()) {
+    throw new Error(`Package export is missing from the build: ${path}`);
+  }
 }
