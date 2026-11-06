@@ -199,3 +199,81 @@ test('oversized provenance is rejected before regex scanning', async () => {
     assert.equal(scannedOversized, false);
   } finally { RegExp.prototype.test = original; }
 });
+
+test('provenance wrappers inspect every bounded string leaf', async () => {
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return [
+      { type: 'user/message', source: { name: 'llm.message' }, content: [{ type: 'text', text: 'private llm' }] },
+      { type: 'user/message', role: { name: 'assistant' }, content: [{ type: 'text', text: 'private role' }] },
+      { type: 'user/message', author: [{ label: 'tool.call' }], content: [{ type: 'text', text: 'private tool' }] },
+      { type: 'user/message', source: { name: 'user', detail: ['human'] }, content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+});
+
+test('hostile sorting metadata is rejected before conversion or accessor invocation', async () => {
+  let conversions = 0;
+  let getterCalls = 0;
+  const maliciousId = { toString() { conversions++; return 'x'; } };
+  const getterEvent = { type: 'user/message', content: [{ type: 'text', text: 'private getter' }],
+    get timestamp() { getterCalls++; return 9; } };
+  const events = [
+    { type: 'user/message', id: maliciousId, content: [{ type: 'text', text: 'private id' }] },
+    { type: 'user/message', id: 'x'.repeat(20_000), content: [{ type: 'text', text: 'private oversized id' }] },
+    { type: 'user/message', timestamp: { toString() { conversions++; return '2026-01-01'; } },
+      content: [{ type: 'text', text: 'private time' }] },
+    getterEvent,
+    { type: 'user/message', id: 'safe', timestamp: 10, content: [{ type: 'text', text: 'safe user text' }] },
+  ];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return events; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+  assert.equal(conversions, 0);
+  assert.equal(getterCalls, 0);
+});
+
+test('session metadata accessors and custom IDs are never invoked', async () => {
+  let conversions = 0;
+  let getterCalls = 0;
+  const sessions = [
+    { id: { toString() { conversions++; return 'hostile'; } }, updatedAt: 10 },
+    { id: 'accessor', get updatedAt() { getterCalls++; return 10; } },
+    { id: 'safe', updatedAt: 1 },
+  ];
+  const filtered: string[] = [];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return sessions; },
+    async filterEvents(id: string) { filtered.push(id); return [
+      { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+  assert.deepEqual(filtered, ['safe']);
+  assert.equal(conversions, 0);
+  assert.equal(getterCalls, 0);
+});
+
+test('hostile provenance subtrees fail bounded plain-data validation', async () => {
+  let getterCalls = 0;
+  const cycle: Record<string, unknown> = { name: 'user' };
+  cycle.loop = cycle;
+  const getter = { get name() { getterCalls++; return 'user'; } };
+  const deep = { next: { next: { next: { next: { next: { next: { name: 'user' } } } } } } };
+  const events = [
+    { type: 'user/message', source: cycle, content: [{ type: 'text', text: 'private cycle' }] },
+    { type: 'user/message', source: getter, content: [{ type: 'text', text: 'private getter' }] },
+    { type: 'user/message', source: deep, content: [{ type: 'text', text: 'private depth' }] },
+    { type: 'user/message', source: Array(257).fill('user'), content: [{ type: 'text', text: 'private count' }] },
+    { type: 'user/message', source: { ['x'.repeat(257)]: 'user' }, content: [{ type: 'text', text: 'private key' }] },
+    { type: 'user/message', source: { name: 'x'.repeat(257) }, content: [{ type: 'text', text: 'private leaf' }] },
+    { type: 'user/message', source: { name: 'user', confidence: 1 }, content: [{ type: 'text', text: 'private nontext' }] },
+    { type: 'user/message', source: ['user', , 'human'], content: [{ type: 'text', text: 'private sparse' }] },
+    { type: 'user/message', source: {}, content: [{ type: 'text', text: 'private empty source' }] },
+    { type: 'user/message', source: [], content: [{ type: 'text', text: 'private empty array' }] },
+    { type: 'user/message', content: [Object.defineProperty({ type: 'text', text: 'private hidden metadata' },
+      'metadata', { value: { note: 'extra' }, enumerable: false })] },
+    { type: 'user/message', source: { name: 'user' }, content: [{ type: 'text', text: 'safe user text' }] },
+  ];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return events; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+  assert.equal(getterCalls, 0);
+});
