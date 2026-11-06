@@ -3,6 +3,7 @@ import test from 'node:test';
 import { ContentCache, RequestBudget } from '../src/cache.js';
 import { ContentService } from '../src/content-service.js';
 import { V2exError } from '../src/errors.js';
+import { createBrowsingTools } from '../src/tools.js';
 import { FakeContentStore, FakeCredentialVault } from './helpers/fakes.js';
 import { NODE_OK, REPLIES_OK, TOPIC } from './fixtures/v2ex.js';
 
@@ -90,6 +91,83 @@ test('aborting one deduplicated waiter does not cancel the other', async () => {
   finish([TOPIC]);
   assert.equal((await two).value.items[0]?.id, 123);
   assert.deepEqual(f.calls, ['pending']);
+});
+
+test('final abort detaches its flight so a new caller starts a fresh request', async () => {
+  const f = fixture();
+  const finishes: Array<(value: typeof TOPIC[]) => void> = [];
+  f.api.latest = async () => {
+    f.calls.push('latest');
+    return new Promise((resolve) => { finishes.push(resolve); });
+  };
+  const firstSignal = new AbortController();
+  const first = f.service.latest({ page: 1 }, firstSignal.signal);
+  for (let i = 0; i < 10 && finishes.length < 1; i++) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(finishes.length, 1);
+  firstSignal.abort();
+  await assert.rejects(first, { code: 'timeout' });
+  const second = f.service.latest({ page: 1 });
+  void second.catch(() => {});
+  try {
+    for (let i = 0; i < 10 && finishes.length < 2; i++) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finishes.length, 2);
+    finishes[0]!([{ ...TOPIC, title: 'old result' }]);
+    await new Promise((resolve) => setImmediate(resolve));
+    const third = f.service.latest({ page: 1 });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(finishes.length, 2);
+    finishes[1]!([{ ...TOPIC, title: 'new result' }]);
+    assert.equal((await second).value.items[0]?.title, 'new result');
+    assert.equal((await third).value.items[0]?.title, 'new result');
+    assert.equal((await f.service.latest({ page: 1 })).value.items[0]?.title, 'new result');
+  } finally {
+    for (const finish of finishes) finish([TOPIC]);
+  }
+  assert.deepEqual(f.calls, ['latest', 'latest']);
+});
+
+test('credential and cache backend failures become stable bounded tool errors', async () => {
+  const f = fixture();
+  const privateDetail = 'private diagnostic marker';
+  f.vault.resolve = async () => { throw new Error(privateDetail); };
+  const tool = createBrowsingTools(f.service).find((entry) => entry.name === 'v2ex_hot')!;
+  for (const action of [() => f.service.hot(), () => tool.execute({}, { signal: new AbortController().signal } as never)]) {
+    await assert.rejects(action(), (error: unknown) => {
+      assert.ok(error instanceof V2exError);
+      assert.equal(error.code, 'incompatible_runtime');
+      assert.doesNotMatch(error.message, /private diagnostic/);
+      return true;
+    });
+  }
+  f.vault.resolve = async () => 'fixture-token';
+  f.store.getCache = async () => { throw new Error(privateDetail); };
+  for (const action of [() => f.service.hot(), () => tool.execute({}, { signal: new AbortController().signal } as never)]) {
+    await assert.rejects(action(), (error: unknown) => {
+      assert.ok(error instanceof V2exError);
+      assert.equal(error.code, 'incompatible_runtime');
+      assert.doesNotMatch(error.message, /private diagnostic/);
+      return true;
+    });
+  }
+  assert.deepEqual(f.calls, []);
+});
+
+test('existing public errors remain intact and cache write errors are bounded', async () => {
+  const f = fixture();
+  f.vault.resolve = async () => { throw new V2exError('token_expired'); };
+  await assert.rejects(f.service.hot(), { code: 'token_expired' });
+  f.vault.resolve = async () => 'fixture-token';
+  f.store.getCache = async () => { throw new V2exError('offline'); };
+  await assert.rejects(f.service.hot(), { code: 'offline' });
+
+  const write = fixture();
+  write.store.putCache = async () => { throw new Error('private diagnostic marker'); };
+  await assert.rejects(write.service.hot(), (error: unknown) => {
+    assert.ok(error instanceof V2exError);
+    assert.equal(error.code, 'incompatible_runtime');
+    assert.doesNotMatch(error.message, /private diagnostic/);
+    return true;
+  });
 });
 
 test('no more than four distinct interactive requests run upstream concurrently', async () => {

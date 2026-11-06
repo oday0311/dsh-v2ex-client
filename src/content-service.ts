@@ -24,7 +24,11 @@ function reply(value: V2exReply): ReplyItem {
     content: (value.content ?? '').slice(0, 100_000), createdAt: new Date(value.created * 1000).toISOString() };
 }
 
-interface Flight { promise: Promise<Cached<unknown>>; controller: AbortController; waiters: number }
+interface Flight { key: string; promise: Promise<Cached<unknown>>; controller: AbortController; waiters: number }
+
+function stableError(error: unknown, code: 'incompatible_runtime' | 'upstream'): V2exError {
+  return error instanceof V2exError ? error : new V2exError(code);
+}
 
 export class ContentService {
   private readonly flights = new Map<string, Flight>();
@@ -64,7 +68,12 @@ export class ContentService {
 
   private async load<T>(key: string, ttl: number, fetcher: (token: string, signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<Cached<T>> {
     if (signal?.aborted) throw new V2exError('timeout');
-    const token = await this.vault.resolve();
+    let token: string | undefined;
+    try { token = await this.vault.resolve(); }
+    catch (error) {
+      if (signal?.aborted) throw new V2exError('timeout');
+      throw stableError(error, 'incompatible_runtime');
+    }
     if (typeof token !== 'string' || !token || token.length > 4096 || /[\r\n]/.test(token)) {
       throw new V2exError('not_authenticated');
     }
@@ -73,22 +82,30 @@ export class ContentService {
     if (!flight) {
       const controller = new AbortController();
       const promise = Promise.resolve().then(async () => {
-        const cached = await this.cache.read<T>(key);
+        let cached: Cached<T> | undefined;
+        try { cached = await this.cache.read<T>(key); }
+        catch (error) {
+          if (controller.signal.aborted) throw new V2exError('timeout');
+          throw stableError(error, 'incompatible_runtime');
+        }
         if (cached && !cached.stale) return cached;
         try {
-          return await this.cache.refresh(key, async () => {
-            return this.withSlot(controller.signal, async () => {
-              if (!this.budget.reserve('interactive')) throw new V2exError('budget_exhausted');
-              try { return await fetcher(token, controller.signal); }
-              finally { this.budget.update(this.api.rateLimit); }
-            });
-          }, ttl);
+          const value = await this.withSlot(controller.signal, async () => {
+            if (!this.budget.reserve('interactive')) throw new V2exError('budget_exhausted');
+            try { return await fetcher(token, controller.signal); }
+            finally { this.budget.update(this.api.rateLimit); }
+          });
+          if (controller.signal.aborted) throw new V2exError('timeout');
+          try { return await this.cache.writeSuccess(key, value, ttl); }
+          catch (error) { throw stableError(error, 'incompatible_runtime'); }
         } catch (error) {
-          if (controller.signal.aborted || !cached) throw error;
-          return { ...cached, stale: true, refreshError: toPublicError(error) };
+          if (controller.signal.aborted) throw new V2exError('timeout');
+          const safe = stableError(error, 'upstream');
+          if (!cached) throw safe;
+          return { ...cached, stale: true, refreshError: toPublicError(safe) };
         }
       });
-      flight = { promise, controller, waiters: 0 };
+      flight = { key, promise, controller, waiters: 0 };
       this.flights.set(key, flight);
       void promise.finally(() => { if (this.flights.get(key) === flight) this.flights.delete(key); }).catch(() => {});
     }
@@ -104,7 +121,10 @@ export class ContentService {
         settled = true;
         signal?.removeEventListener('abort', onAbort);
         flight.waiters--;
-        if (flight.waiters === 0 && signal?.aborted) flight.controller.abort();
+        if (flight.waiters === 0 && signal?.aborted) {
+          if (this.flights.get(flight.key) === flight) this.flights.delete(flight.key);
+          flight.controller.abort();
+        }
         return true;
       };
       const onAbort = () => { if (finish()) reject(new V2exError('timeout')); };

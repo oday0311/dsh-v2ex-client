@@ -4,6 +4,7 @@ import { V2exError } from './errors.js';
 import { assertNodeName, assertTopicId } from './validation.js';
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
+const RUNTIME_ENVELOPE_HEADROOM_BYTES = 256;
 const encoder = new TextEncoder();
 
 export interface ContentReader {
@@ -24,7 +25,12 @@ function text(value: string, limit: number): { value: string; truncated: boolean
   return { value: value.slice(0, limit), truncated: true };
 }
 
-function bytes(value: unknown): number { return encoder.encode(JSON.stringify(value)).byteLength; }
+function renderedText(value: unknown): string { return JSON.stringify(value); }
+
+function bytes(value: unknown): number {
+  const content = [{ type: 'text', text: renderedText(value) }];
+  return encoder.encode(JSON.stringify({ content })).byteLength + RUNTIME_ENVELOPE_HEADROOM_BYTES;
+}
 
 function metadata<T>(cached: Cached<T>) {
   return { fetchedAt: text(cached.fetchedAt, 64).value, stale: cached.stale,
@@ -94,7 +100,7 @@ function topicResult(cached: Cached<TopicThread>) {
 }
 
 const output = { schema: { type: 'json' } as const,
-  render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }] };
+  render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: renderedText(value) }] };
 
 export function createBrowsingTools(reader: ContentReader): ToolDefinition[] {
   return [

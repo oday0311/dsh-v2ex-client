@@ -83,6 +83,30 @@ test('topic output stays bounded when a reader returns an extreme metadata field
   assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 64 * 1024);
 });
 
+test('every tool bounds serialized model content with control characters and Unicode', async () => {
+  const noisy = '\u0000\n\\\u2028😀'.repeat(10_000);
+  const noisyItem = { ...item, title: noisy, node: { name: noisy, title: noisy },
+    author: { username: noisy }, createdAt: noisy, lastReplyAt: noisy, url: noisy };
+  const cached = { fetchedAt: '2026-11-06T00:00:00Z', stale: false, source: 'network' as const };
+  const reader = {
+    async latest() { return { ...cached, value: { items: Array(30).fill(noisyItem), page: 1, hasMore: true, stale: false } }; },
+    async hot() { return { ...cached, value: Array(30).fill(noisyItem) }; },
+    async nodeTopics() { return { ...cached, value: { items: Array(30).fill(noisyItem), page: 1, hasMore: true, stale: false } }; },
+    async topic() { return { ...cached, value: { topic: noisyItem, content: noisy,
+      replies: Array.from({ length: 30 }, (_, id) => ({ id: id + 1,
+        author: { username: noisy }, content: noisy, createdAt: noisy })),
+      replyPage: 1, hasMoreReplies: true, stale: false } }; },
+  };
+  for (const tool of createBrowsingTools(reader as never)) {
+    const args = tool.name === 'v2ex_node_topics' ? { node: 'python' } :
+      tool.name === 'v2ex_topic' ? { topic: '123' } : {};
+    const result = await tool.execute(args, { signal: new AbortController().signal } as never);
+    const content = tool.output.render(args, result);
+    assert.ok(Buffer.byteLength(JSON.stringify({ role: 'tool', name: tool.name, content })) <= 64 * 1024, tool.name);
+    assert.equal((result as { truncated: boolean }).truncated, true);
+  }
+});
+
 test('invalid node and topic identifiers are rejected before reader calls', async () => {
   const f = fixture();
   await assert.rejects(f.run('v2ex_node_topics', { node: '../bad', page: 1 }), (error: unknown) =>
