@@ -18,7 +18,7 @@ function memoryDomain() {
   const domain = {
     global: { get: () => structuredClone(global), set: async (next: typeof global) => {
       if (failGlobalSet) { failGlobalSet = false; throw new Error('global set failed'); }
-      global = structuredClone(next);
+      global = structuredClone(v2exDomainSpec.global.schema.parse(next));
     } },
     table: (name: TableName) => ({
       get: (key: string) => structuredClone(tables[name].get(key)),
@@ -376,4 +376,33 @@ test('clearing a pre-marker snapshot persists the migration barrier before legac
   const reloaded = new DomainContentStore(memory.domain);
   assert.equal(await reloaded.getRecommendation(key), undefined);
   assert.deepEqual(await reloaded.listRecommendations(scope), []);
+});
+
+test('legacy-only clear persists its barrier before a failed table deletion and reload stays closed', async () => {
+  const memory = memoryDomain(); const scope = 'c'.repeat(64) + ':'; const key = `${scope}1`;
+  const store = new DomainContentStore(memory.domain); await store.putRecommendation(key, recommendation);
+  memory.failNextDelete('recommendations', key);
+  await assert.rejects(store.clearRecommendations(scope), /medium delete failed/);
+  assert.equal(memory.readGlobal().migratedRecommendationScopes?.[scope], true);
+  const reloaded = new DomainContentStore(memory.domain);
+  assert.equal(await reloaded.getRecommendation(key), undefined);
+  assert.deepEqual(await reloaded.listRecommendations(scope), []);
+  await assert.rejects(reloaded.setRecommendationFeedback(key, 'not_interested'), { code: 'not_found' });
+  await reloaded.markRead(key);
+  const hidden = memory.tables.recommendations.get(key) as Recommendation;
+  assert.equal(hidden.feedback, null);
+  assert.equal(hidden.read, false);
+});
+
+test('migration barrier capacity failure happens before legacy table cleanup', async () => {
+  const memory = memoryDomain(); const store = new DomainContentStore(memory.domain);
+  const current = structuredClone(memory.readGlobal());
+  current.migratedRecommendationScopes = Object.fromEntries(Array.from({ length: 20 }, (_, index) =>
+    [`${index.toString(16).padStart(64, '0')}:`, true as const]));
+  await memory.domain.global.set(current);
+  const scope = 'f'.repeat(64) + ':'; const key = `${scope}1`;
+  await store.putRecommendation(key, recommendation);
+  await assert.rejects(store.clearRecommendations(scope));
+  assert.notEqual(memory.tables.recommendations.get(key), undefined);
+  assert.deepEqual(await new DomainContentStore(memory.domain).getRecommendation(key), recommendation);
 });

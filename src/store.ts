@@ -411,11 +411,10 @@ export class DomainContentStore implements ContentStore {
   async clearRecommendations(scope: string): Promise<void> {
     const key = assertAccountScope(scope);
     await this.updateGlobal((current) => {
-      const migrated = current.recommendationSnapshots?.[key] !== undefined || current.migratedRecommendationScopes?.[key] === true;
       const snapshots = { ...(current.recommendationSnapshots ?? {}) }; delete snapshots[key];
       const batches = { ...(current.recommendationBatches ?? {}) }; delete batches[key];
       return { ...current, recommendationSnapshots: snapshots, recommendationBatches: batches,
-        migratedRecommendationScopes: migrated ? { ...(current.migratedRecommendationScopes ?? {}), [key]: true } : current.migratedRecommendationScopes };
+        migratedRecommendationScopes: { ...(current.migratedRecommendationScopes ?? {}), [key]: true } };
     });
     await this.serialize('recommendations', async () => {
       const table = this.domain.table('recommendations');
