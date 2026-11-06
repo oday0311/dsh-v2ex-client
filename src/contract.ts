@@ -117,7 +117,8 @@ export interface RecommendationList {
   stale: boolean;
   source: 'generated' | 'stored';
 }
-export interface RecommendationBatch { generatedAt: string; topicIds: number[] }
+export interface RecommendationBatch { generatedAt: string; topicIds: number[]; generation?: number }
+export interface RecommendationSnapshot { batch: RecommendationBatch; items: Recommendation[] }
 
 export interface CacheRecord<T = unknown> {
   value: T;
@@ -152,6 +153,9 @@ export interface ContentStore {
   deleteRecommendation(key: string): Promise<void>;
   getRecommendationBatch(scope: string): Promise<RecommendationBatch | null>;
   putRecommendationBatch(scope: string, batch: RecommendationBatch): Promise<void>;
+  getRecommendationSnapshot(scope: string): Promise<RecommendationSnapshot | null>;
+  replaceRecommendationBatch(scope: string, batch: RecommendationBatch, items: Recommendation[]): Promise<RecommendationSnapshot>;
+  discardRecommendationBatch(scope: string, generation: number): Promise<void>;
   clearRecommendations(scope: string): Promise<void>;
   clearLegacyRecommendations(): Promise<void>;
   getSummary?(key: string): Promise<TopicAiSummary | undefined>;

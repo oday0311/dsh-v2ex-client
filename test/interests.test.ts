@@ -2,6 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { InterestService } from '../src/interests.js';
 import { FakeContentStore } from './helpers/fakes.js';
+import { accountScope } from '../src/account-scope.js';
+import { V2exError } from '../src/errors.js';
+import type { IdentityLease, IdentityLeaseProvider } from '../src/credentials.js';
+
+function testIdentity(resolve: () => Promise<string>): IdentityLeaseProvider {
+  return { async lease() { const account = await resolve(); const scope = accountScope(account);
+    return { account, scope, credentialFingerprint: scope, generation: 0 }; },
+  async assertLease(lease) { if ((await this.lease()).scope !== lease.scope) throw new V2exError('not_authenticated'); } };
+}
 
 test('authorization precedes every history read and manual edits do not read', async () => {
   const store = new FakeContentStore();
@@ -208,7 +217,7 @@ test('interest state is durably isolated across verified accounts and legacy glo
   let account = 'alice';
   const history = { async readEligibleUserText() { return 'unused'; } };
   const model = { async completeJson() { return { labels: [], preferredNodes: [], exclusions: [] }; } };
-  const make = () => new InterestService(store, history, model as never, () => new Date('2026-11-07T00:00:00.000Z'), async () => account);
+  const make = () => new InterestService(store, history, model as never, () => new Date('2026-11-07T00:00:00.000Z'), testIdentity(async () => account));
   const first = make();
   assert.deepEqual((await first.get()).labels, []);
   await first.authorize();
@@ -239,7 +248,7 @@ test('account switch during relearn prevents the old account result from committ
   const started = new Promise<void>(resolve => { entered = resolve; });
   const service = new InterestService(store, { async readEligibleUserText() { return 'Alice'; } },
     { async completeJson() { entered(); await gate; return { labels: [{ name: 'Alice learned', weight: 1 }], preferredNodes: [], exclusions: [] }; } } as never,
-    () => new Date('2026-11-07T00:00:00.000Z'), async () => account);
+    () => new Date('2026-11-07T00:00:00.000Z'), testIdentity(async () => account));
   await service.authorize();
   const learning = service.relearn();
   await started;
@@ -249,4 +258,27 @@ test('account switch during relearn prevents the old account result from committ
   assert.deepEqual((await service.get()).labels, []);
   account = 'alice';
   assert.deepEqual((await service.get()).labels, []);
+});
+
+test('delayed interest get rejects an A to B to A lease change instead of returning Alice data', async () => {
+  const store = new FakeContentStore(); const state = { account: 'alice', fingerprint: 'alice-one', generation: 1 };
+  const identity: IdentityLeaseProvider = {
+    async lease(): Promise<IdentityLease> { return { account: state.account, scope: accountScope(state.account),
+      credentialFingerprint: state.fingerprint, generation: state.generation }; },
+    async assertLease(lease) { if (lease.scope !== accountScope(state.account) || lease.credentialFingerprint !== state.fingerprint ||
+      lease.generation !== state.generation) throw new V2exError('not_authenticated'); },
+  };
+  store.accountProfiles.set(accountScope('alice'), { profile: { authorized: true, learningPaused: false,
+    labels: [{ name: 'Alice private', weight: 1 }], preferredNodes: [], exclusions: [], feedback: [],
+    updatedAt: '2026-11-07T00:00:00.000Z', source: 'manual' },
+    edits: { labels: true, preferredNodes: false, exclusions: false } });
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; }); const started = new Promise<void>(resolve => { entered = resolve; });
+  store.beforeProfileRead = async () => { entered(); await gate; };
+  const service = new InterestService(store, { async readEligibleUserText() { return ''; } },
+    { async completeJson() { return {}; } } as never, undefined, identity);
+  const reading = service.get(); await started;
+  Object.assign(state, { account: 'bob', fingerprint: 'bob', generation: 2 });
+  Object.assign(state, { account: 'alice', fingerprint: 'alice-two', generation: 3 }); release();
+  await assert.rejects(reading, { code: 'not_authenticated' });
 });

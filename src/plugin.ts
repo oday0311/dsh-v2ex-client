@@ -48,10 +48,11 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       get agentDefaultModel() { return optional('agentDefaultModel'); },
     } as never);
     let auth!: AuthService;
+    const identity = { lease: () => auth.lease(), assertLease: (lease: import('./credentials.js').IdentityLease) => auth.assertLease(lease) };
     const interests = new InterestService(store, new DshHistoryReader(() => {
       try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }
       catch { return undefined; }
-    }), model, undefined, () => auth.account());
+    }), model, undefined, identity);
     let recommendations!: RecommendationService;
     auth = new AuthService(api, vault, async (account) => {
       await (account ? Promise.all([interests.clear(account), recommendations.clear(account)]) :
@@ -60,7 +61,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     const service = new ContentService(api, vault,
       new ContentCache(store), new RequestBudget());
     const intelligence = new IntelligenceService(model, store);
-    recommendations = new RecommendationService(store, intelligence, () => auth.account(), undefined, interests);
+    recommendations = new RecommendationService(store, intelligence, identity, undefined, interests);
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));

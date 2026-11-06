@@ -83,6 +83,36 @@ test('logout revalidates an externally replaced credential before choosing the c
   assert.deepEqual(cleaned, ['bob']);
 });
 
+test('identity leases are invalidated by external A to B to A credential replacement', async () => {
+  const vault = new FakeCredentialVault();
+  const api = { async readToken() { return { scope: 'everything' }; },
+    async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+  const auth = new AuthService(api as never, vault);
+  await auth.login('ALICE_FAKE_VALUE');
+  const firstAlice = await auth.lease();
+  vault.value = 'BOB_FAKE_VALUE';
+  const bob = await auth.lease();
+  await assert.rejects(auth.assertLease(firstAlice), { code: 'not_authenticated' });
+  vault.value = 'ALICE_FAKE_VALUE';
+  const secondAlice = await auth.lease();
+  assert.equal(firstAlice.scope, secondAlice.scope);
+  assert.notEqual(firstAlice.generation, secondAlice.generation);
+  assert.notEqual(firstAlice.credentialFingerprint, bob.credentialFingerprint);
+  await assert.rejects(auth.assertLease(firstAlice), { code: 'not_authenticated' });
+  await auth.assertLease(secondAlice);
+});
+
+test('login rejects when the credential changes between validation and identity publication', async () => {
+  const vault = new FakeCredentialVault();
+  vault.set = async () => { vault.value = 'BOB_FAKE_VALUE'; };
+  const api = { async readToken() { return { scope: 'everything' }; },
+    async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+  const auth = new AuthService(api as never, vault);
+  await assert.rejects(auth.login('ALICE_FAKE_VALUE'), { code: 'not_authenticated' });
+  assert.equal(vault.value, 'BOB_FAKE_VALUE');
+  assert.equal(await auth.account(), 'bob');
+});
+
 test('DSH vault uses the plugin-owned reference for resolve, write, clear, and describe', async () => {
   const values = new Map<string, string>();
   const refs: string[] = [];

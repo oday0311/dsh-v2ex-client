@@ -14,8 +14,12 @@ function memoryDomain() {
   let failedPut: [TableName, string] | null = null;
   let failedDelete: [TableName, string] | null = null;
   let heldPut: { name: TableName; key: string; started: () => void; release: Promise<void> } | null = null;
+  let failGlobalSet = false;
   const domain = {
-    global: { get: () => structuredClone(global), set: async (next: typeof global) => { global = structuredClone(next); } },
+    global: { get: () => structuredClone(global), set: async (next: typeof global) => {
+      if (failGlobalSet) { failGlobalSet = false; throw new Error('global set failed'); }
+      global = structuredClone(next);
+    } },
     table: (name: TableName) => ({
       get: (key: string) => structuredClone(tables[name].get(key)),
       entries: () => tables[name].entries(),
@@ -47,6 +51,7 @@ function memoryDomain() {
     }),
   } as unknown as Domain<typeof v2exDomainSpec>;
   return { domain, tables, readGlobal: () => global,
+    failNextGlobalSet: () => { failGlobalSet = true; },
     failNextPut: (name: TableName, key: string) => { failedPut = [name, key]; },
     failNextDelete: (name: TableName, key: string) => { failedDelete = [name, key]; },
     holdNextPut: (name: TableName, key: string) => {
@@ -324,4 +329,24 @@ test('account-scoped interests and recommendation batches survive reload without
   await reloaded.clearProfile(bob);
   assert.equal(await reloaded.getProfile(bob), null);
   assert.equal((await reloaded.getProfile(alice))?.labels[0]?.name, 'Alice');
+});
+
+test('recommendation snapshot replacement is atomic, preserves actions, and survives reload', async () => {
+  const memory = memoryDomain(); const scope = 'a'.repeat(64) + ':';
+  const first = new DomainContentStore(memory.domain);
+  await first.replaceRecommendationBatch(scope, { generatedAt: '2026-11-06T00:00:00Z', topicIds: [1], generation: 1 },
+    [{ ...recommendation, read: true, feedback: 'interested' }]);
+  memory.failNextGlobalSet();
+  await assert.rejects(first.replaceRecommendationBatch(scope, { generatedAt: '2026-11-07T00:00:00Z', topicIds: [2], generation: 2 },
+    [{ ...recommendation, topic: { ...topic, id: 2 }, reason: 'new', generatedAt: '2026-11-07T00:00:00Z' }]));
+  const afterFailure = await new DomainContentStore(memory.domain).getRecommendationSnapshot(scope);
+  assert.deepEqual(afterFailure?.batch.topicIds, [1]);
+  assert.deepEqual(afterFailure?.items.map(item => [item.topic.id, item.read, item.feedback]), [[1, true, 'interested']]);
+  const replaced = await first.replaceRecommendationBatch(scope,
+    { generatedAt: '2026-11-07T00:00:00Z', topicIds: [1], generation: 3 },
+    [{ ...recommendation, reason: 'updated', generatedAt: '2026-11-07T00:00:00Z' }]);
+  assert.deepEqual(replaced.items.map(item => [item.reason, item.read, item.feedback]), [['updated', true, 'interested']]);
+  await first.replaceRecommendationBatch(scope, { generatedAt: '2026-11-07T01:00:00Z', topicIds: [], generation: 4 }, []);
+  const empty = await new DomainContentStore(memory.domain).getRecommendationSnapshot(scope);
+  assert.deepEqual(empty, { batch: { generatedAt: '2026-11-07T01:00:00Z', topicIds: [], generation: 4 }, items: [] });
 });

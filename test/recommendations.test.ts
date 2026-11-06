@@ -5,6 +5,7 @@ import { V2exError } from '../src/errors.js';
 import { FakeContentStore } from './helpers/fakes.js';
 import type { InterestProfile, TopicListItem } from '../src/contract.js';
 import { accountScope } from '../src/account-scope.js';
+import type { IdentityLease, IdentityLeaseProvider } from '../src/credentials.js';
 
 const at = '2026-11-07T00:00:00.000Z';
 const topic = (id: number, title: string, node = 'dev', updated = at): TopicListItem => ({
@@ -27,6 +28,25 @@ class RecordingModel {
   }
 }
 
+class MutableIdentity implements IdentityLeaseProvider {
+  generation = 1;
+  account = 'alice';
+  fingerprint = 'alice-credential';
+  async lease(): Promise<IdentityLease> { return { account: this.account, scope: accountScope(this.account),
+    credentialFingerprint: this.fingerprint, generation: this.generation }; }
+  async assertLease(lease: IdentityLease): Promise<void> {
+    if (lease.account !== this.account || lease.scope !== accountScope(this.account) ||
+      lease.credentialFingerprint !== this.fingerprint || lease.generation !== this.generation) throw new V2exError('not_authenticated');
+  }
+  switch(account: string, fingerprint: string) { this.account = account; this.fingerprint = fingerprint; this.generation++; }
+}
+
+function testIdentity(resolve: () => Promise<string> = async () => 'alice'): IdentityLeaseProvider {
+  return { async lease() { const account = await resolve(); const scope = accountScope(account);
+    return { account, scope, credentialFingerprint: scope, generation: 0 }; },
+  async assertLease(lease) { if ((await this.lease()).scope !== lease.scope) throw new V2exError('not_authenticated'); } };
+}
+
 function service(options: { store?: FakeContentStore; interest?: InterestProfile | null; model?: RecordingModel; account?: string } = {}) {
   const store = options.store ?? new FakeContentStore();
   const interest = options.interest === undefined ? profile() : options.interest;
@@ -34,7 +54,7 @@ function service(options: { store?: FakeContentStore; interest?: InterestProfile
     edits: { labels: false, preferredNodes: false, exclusions: false } });
   const model = options.model ?? new RecordingModel({ items: [] });
   return { store, model, recommender: new RecommendationService(store, model as never,
-    async () => options.account ?? 'alice', () => new Date(at)) };
+    testIdentity(async () => options.account ?? 'alice'), () => new Date(at)) };
 }
 
 test('local exclusions and negative feedback remove candidates before the single model call', async () => {
@@ -100,7 +120,7 @@ test('concurrent refresh cannot overwrite a later read or not-interested action'
   const model = { async rankRecommendationCandidates() {
     await gate; return { items: [{ topicId: 1, score: 0.9, reason: 'ranked', matchedInterests: ['TypeScript'] }] };
   } };
-  const recommender = new RecommendationService(store, model as never, async () => 'alice', () => new Date(at));
+  const recommender = new RecommendationService(store, model as never, testIdentity(), () => new Date(at));
   await store.putRecommendation('2bd806c97f0e00af1a1fc3328fa763a9269723c8db8fac4f93af71db186d6e90:1', {
     topic: topic(1, 'old'), score: 0.1, reason: 'old', matchedInterests: [], generatedAt: at,
     read: false, feedback: null,
@@ -129,7 +149,7 @@ test('recommendations are account-scoped while manual interests work without his
     model: new RecordingModel({ items: [{ topicId: 1, score: 0.5, reason: 'manual', matchedInterests: [] }] }) }).recommender;
   assert.deepEqual((await manual.refreshCandidates([topic(1, 'TypeScript')])).items.map(item => item.topic.id), [1]);
   const unauthenticated = new RecommendationService(shared, new RecordingModel({ items: [] }) as never,
-    async () => { throw new V2exError('not_authenticated'); });
+    testIdentity(async () => { throw new V2exError('not_authenticated'); }));
   await assert.rejects(unauthenticated.list(), { code: 'not_authenticated' });
 });
 
@@ -159,7 +179,7 @@ test('a slower older refresh cannot overwrite a newer ranking', async () => {
     if (++call === 1) { entered(); await gate; return { items: [{ topicId: 1, score: 0.1, reason: 'old', matchedInterests: [] }] }; }
     return { items: [{ topicId: 1, score: 0.9, reason: 'new', matchedInterests: [] }] };
   } };
-  const recommender = new RecommendationService(store, model as never, async () => 'alice', () => new Date(at));
+  const recommender = new RecommendationService(store, model as never, testIdentity(), () => new Date(at));
   const older = recommender.refreshCandidates([topic(1, 'TypeScript')]);
   await started;
   await recommender.refreshCandidates([topic(1, 'TypeScript')]);
@@ -196,7 +216,7 @@ test('list reapplies current exclusions and uses durable batch freshness rather 
     generatedAt: '2026-11-07T00:00:00.000Z', read: false, feedback: null });
   await store.putRecommendationBatch(scope, { generatedAt: '2026-11-07T00:00:00.000Z', topicIds: [1, 2] });
   const recommender = new RecommendationService(store, new RecordingModel({ items: [] }) as never,
-    async () => 'alice', () => new Date('2026-11-07T00:10:00.000Z'));
+    testIdentity(), () => new Date('2026-11-07T00:10:00.000Z'));
   const listed = await recommender.list();
   assert.deepEqual(listed.items.map(value => value.topic.id), [2]);
   assert.equal(listed.generatedAt, '2026-11-07T00:00:00.000Z');
@@ -210,13 +230,13 @@ test('an empty successful refresh prunes the account batch and remains honestly 
   await store.putRecommendation(`${scope}1`, { topic: topic(1, 'old'), score: 1, reason: 'old', matchedInterests: [],
     generatedAt: '2026-11-01T00:00:00.000Z', read: true, feedback: 'interested' });
   const first = new RecommendationService(store, new RecordingModel({ items: [] }) as never,
-    async () => 'alice', () => new Date(at));
+    testIdentity(), () => new Date(at));
   const refreshed = await first.refreshCandidates([topic(2, 'TypeScript')]);
   assert.deepEqual(refreshed.items, []);
   assert.equal(refreshed.generatedAt, at);
   assert.equal(refreshed.source, 'generated');
   const reloaded = new RecommendationService(store, new RecordingModel({ items: [] }) as never,
-    async () => 'alice', () => new Date('2026-11-07T00:10:00.000Z'));
+    testIdentity(), () => new Date('2026-11-07T00:10:00.000Z'));
   const listed = await reloaded.list();
   assert.deepEqual(listed.items, []);
   assert.equal(listed.generatedAt, at);
@@ -233,7 +253,7 @@ test('clear invalidates a non-cooperative in-flight refresh before deleting acco
   const intelligence = { async rankRecommendationCandidates() {
     entered(); await held; return { items: [{ topicId: 1, score: 1, reason: 'late', matchedInterests: [] }] };
   } };
-  const recommender = new RecommendationService(store, intelligence as never, async () => 'alice', () => new Date(at));
+  const recommender = new RecommendationService(store, intelligence as never, testIdentity(), () => new Date(at));
   const refresh = recommender.refreshCandidates([topic(1, 'TypeScript')]);
   await started;
   const clearing = recommender.clear('alice');
@@ -251,9 +271,53 @@ test('account replacement during refresh prevents any result from committing to 
   const held = new Promise<void>(resolve => { release = resolve; });
   const recommender = new RecommendationService(store, { async rankRecommendationCandidates() {
     entered(); await held; return { items: [{ topicId: 1, score: 1, reason: 'late', matchedInterests: [] }] };
-  } } as never, async () => account, () => new Date(at));
+  } } as never, testIdentity(async () => account), () => new Date(at));
   const refresh = recommender.refreshCandidates([topic(1, 'TypeScript')]);
   await started; account = 'bob'; release();
   await assert.rejects(refresh, { code: 'timeout' });
   assert.equal(store.recommendations.size, 0);
+});
+
+test('delayed list rejects when an identity lease changes, including A to B to A', async () => {
+  const store = new FakeContentStore(); const identity = new MutableIdentity(); const scope = accountScope('alice');
+  store.accountProfiles.set(scope, { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  await store.replaceRecommendationBatch(scope, { generatedAt: at, topicIds: [1] }, [{ topic: topic(1, 'Alice private'),
+    score: 1, reason: 'private', matchedInterests: [], generatedAt: at, read: false, feedback: null }]);
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  store.beforeRecommendationSnapshot = async () => { entered(); await gate; };
+  const recommender = new RecommendationService(store, new RecordingModel({ items: [] }) as never, identity, () => new Date(at));
+  const listing = recommender.list(); await started;
+  identity.switch('bob', 'bob-credential'); identity.switch('alice', 'new-alice-credential'); release();
+  await assert.rejects(listing, { code: 'not_authenticated' });
+});
+
+test('atomic publish failure leaves the prior recommendation batch wholly visible', async () => {
+  const store = new FakeContentStore(); const identity = new MutableIdentity(); const scope = accountScope('alice');
+  store.accountProfiles.set(scope, { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  await store.replaceRecommendationBatch(scope, { generatedAt: '2026-11-06T00:00:00.000Z', topicIds: [1] },
+    [{ topic: topic(1, 'old'), score: 1, reason: 'old', matchedInterests: [], generatedAt: '2026-11-06T00:00:00.000Z', read: true, feedback: 'interested' }]);
+  store.failNextRecommendationPublish = true;
+  const recommender = new RecommendationService(store,
+    new RecordingModel({ items: [{ topicId: 2, score: 1, reason: 'new', matchedInterests: [] }] }) as never, identity, () => new Date(at));
+  await assert.rejects(recommender.refreshCandidates([topic(2, 'TypeScript')]), { code: 'ai_unavailable' });
+  const snapshot = await store.getRecommendationSnapshot(scope);
+  assert.deepEqual(snapshot?.batch.topicIds, [1]);
+  assert.deepEqual(snapshot?.items.map(item => [item.topic.id, item.read, item.feedback]), [[1, true, 'interested']]);
+});
+
+test('clear invalidates before a delayed atomic publish and late refresh cannot report success', async () => {
+  const store = new FakeContentStore(); const identity = new MutableIdentity(); const scope = accountScope('alice');
+  store.accountProfiles.set(scope, { profile: profile(), edits: { labels: false, preferredNodes: false, exclusions: false } });
+  let release!: () => void; let entered!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const started = new Promise<void>(resolve => { entered = resolve; });
+  store.beforeRecommendationPublish = async () => { entered(); await gate; };
+  const recommender = new RecommendationService(store,
+    new RecordingModel({ items: [{ topicId: 1, score: 1, reason: 'new', matchedInterests: [] }] }) as never, identity, () => new Date(at));
+  const refresh = recommender.refreshCandidates([topic(1, 'TypeScript')]); await started;
+  const clearing = recommender.clear('alice'); release();
+  await assert.rejects(refresh, { code: 'timeout' }); await clearing;
+  assert.equal(await store.getRecommendationSnapshot(scope), null);
 });

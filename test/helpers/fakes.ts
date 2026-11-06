@@ -1,5 +1,5 @@
 import type { CredentialVault } from '../../src/credentials.js';
-import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, TopicAiSummary } from '../../src/contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from '../../src/contract.js';
 
 export class FakeCredentialVault implements CredentialVault {
   value: string | undefined;
@@ -38,6 +38,11 @@ export class FakeContentStore implements ContentStore {
   readonly recommendationBatches = new Map<string, RecommendationBatch>();
   readonly accountProfiles = new Map<string, { profile: InterestProfile; edits: InterestEditFlags }>();
   readonly summaries = new Map<string, TopicAiSummary>();
+  beforeRecommendationSnapshot?: () => Promise<void>;
+  beforeRecommendationPublish?: () => Promise<void>;
+  beforeProfileRead?: () => Promise<void>;
+  failNextRecommendationPublish = false;
+  private recommendationOperation: Promise<void> = Promise.resolve();
   settings: PluginSettings = {
     refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
     aiCandidateBudget: 10, notificationThreshold: 0.7, quietHours: null,
@@ -50,7 +55,7 @@ export class FakeContentStore implements ContentStore {
   async deleteCache(key: string) { this.cache.delete(key); }
   async getSettings() { return this.settings; }
   async putSettings(value: PluginSettings) { this.settings = value; }
-  async getProfile(scope?: string) { return scope ? this.accountProfiles.get(scope)?.profile ?? null : this.profile; }
+  async getProfile(scope?: string) { await this.beforeProfileRead?.(); return scope ? this.accountProfiles.get(scope)?.profile ?? null : this.profile; }
   async putProfile(value: InterestProfile, scope?: string) {
     if (scope) this.accountProfiles.set(scope, { profile: value, edits: this.accountProfiles.get(scope)?.edits ?? { labels: false, preferredNodes: false, exclusions: false } });
     else this.profile = value;
@@ -82,9 +87,40 @@ export class FakeContentStore implements ContentStore {
   async deleteRecommendation(key: string) { this.recommendations.delete(key); }
   async getRecommendationBatch(scope: string) { return this.recommendationBatches.get(scope) ?? null; }
   async putRecommendationBatch(scope: string, batch: RecommendationBatch) { this.recommendationBatches.set(scope, batch); }
+  async getRecommendationSnapshot(scope: string): Promise<RecommendationSnapshot | null> {
+    await this.beforeRecommendationSnapshot?.();
+    const batch = this.recommendationBatches.get(scope);
+    if (!batch) return null;
+    return { batch: structuredClone(batch), items: structuredClone([...this.recommendations.entries()]
+      .filter(([key]) => key.startsWith(scope) && batch.topicIds.includes(Number(key.slice(scope.length))))
+      .map(([, value]) => value)) };
+  }
+  async replaceRecommendationBatch(scope: string, batch: RecommendationBatch, items: Recommendation[]): Promise<RecommendationSnapshot> {
+    let result!: RecommendationSnapshot;
+    const operation = this.recommendationOperation.then(async () => {
+      await this.beforeRecommendationPublish?.();
+      if (this.failNextRecommendationPublish) { this.failNextRecommendationPublish = false; throw new Error('publish failed'); }
+      const previous = new Map([...this.recommendations.entries()].filter(([key]) => key.startsWith(scope)));
+      const next = items.map(item => { const old = previous.get(`${scope}${item.topic.id}`); return old ?
+        { ...item, read: old.read || item.read, feedback: old.feedback ?? item.feedback } : item; });
+      for (const key of previous.keys()) this.recommendations.delete(key);
+      for (const item of next) this.recommendations.set(`${scope}${item.topic.id}`, structuredClone(item));
+      this.recommendationBatches.set(scope, structuredClone(batch));
+      result = { batch: structuredClone(batch), items: structuredClone(next) };
+    });
+    this.recommendationOperation = operation.then(() => {}, () => {});
+    await operation; return result;
+  }
+  async discardRecommendationBatch(scope: string, generation: number) {
+    const batch = this.recommendationBatches.get(scope);
+    if (batch?.generation === generation) await this.clearRecommendations(scope);
+  }
   async clearRecommendations(scope: string) {
-    for (const key of this.recommendations.keys()) if (key.startsWith(scope)) this.recommendations.delete(key);
-    this.recommendationBatches.delete(scope);
+    const operation = this.recommendationOperation.then(() => {
+      for (const key of this.recommendations.keys()) if (key.startsWith(scope)) this.recommendations.delete(key);
+      this.recommendationBatches.delete(scope);
+    });
+    this.recommendationOperation = operation.then(() => {}, () => {}); await operation;
   }
   async clearLegacyRecommendations() {
     for (const key of this.recommendations.keys()) if (/^[1-9]\d*$/.test(key)) this.recommendations.delete(key);

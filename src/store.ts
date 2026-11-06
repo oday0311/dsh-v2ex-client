@@ -1,6 +1,6 @@
 import { defineDomain, domainTable, type Domain, type KvTable } from '@deepseek-ai/dsh-storage-domain';
 import { z } from 'zod';
-import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, TopicAiSummary } from './contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from './contract.js';
 import { V2exError } from './errors.js';
 import { assertPage, assertTopicId } from './validation.js';
 
@@ -77,11 +77,16 @@ const LegacyRecommendationSchema = z.strictObject({
   topic: TopicListItemSchema, score: z.number().finite().min(0).max(1), reason: z.string().min(1).max(1000),
   read: z.boolean(), createdAt: timestamp,
 }).transform((old): Recommendation => ({ ...old, matchedInterests: [], generatedAt: old.createdAt, feedback: null }));
-const RecommendationBatchSchema = z.strictObject({ generatedAt: timestamp, topicIds: z.array(topicId).max(500) });
+const RecommendationBatchSchema = z.strictObject({ generatedAt: timestamp, topicIds: z.array(topicId).max(500),
+  generation: z.number().int().nonnegative().optional() });
+const RecommendationSnapshotSchema = z.strictObject({ batch: RecommendationBatchSchema,
+  items: z.array(RecommendationSchema).max(500) });
 const AccountInterestStateSchema = z.strictObject({ profile: InterestProfileSchema, edits: InterestEditFlagsSchema });
 const AccountProfilesSchema = z.record(accountScope, AccountInterestStateSchema)
   .refine(value => Object.keys(value).length <= 20);
 const RecommendationBatchesSchema = z.record(accountScope, RecommendationBatchSchema)
+  .refine(value => Object.keys(value).length <= 20);
+const RecommendationSnapshotsSchema = z.record(accountScope, RecommendationSnapshotSchema)
   .refine(value => Object.keys(value).length <= 20);
 
 export const defaultSettings: PluginSettings = {
@@ -94,9 +99,9 @@ export const v2exDomainSpec = defineDomain({
   global: {
     schema: z.strictObject({ settings: PluginSettingsSchema, profile: z.union([InterestProfileSchema, LegacyProfileSchema]).nullable(),
       profileEdits: InterestEditFlagsSchema.optional(), accountProfiles: AccountProfilesSchema.optional(),
-      recommendationBatches: RecommendationBatchesSchema.optional() }),
+      recommendationBatches: RecommendationBatchesSchema.optional(), recommendationSnapshots: RecommendationSnapshotsSchema.optional() }),
     initial: { settings: defaultSettings, profile: null as InterestProfile | null, profileEdits: noInterestEdits,
-      accountProfiles: {}, recommendationBatches: {} },
+      accountProfiles: {}, recommendationBatches: {}, recommendationSnapshots: {} },
   },
   tables: {
     cache: domainTable<string, CacheRecord>(CacheRecordSchema),
@@ -131,6 +136,12 @@ interface GlobalState {
   profileEdits?: InterestEditFlags;
   accountProfiles?: Record<string, { profile: InterestProfile; edits: InterestEditFlags }>;
   recommendationBatches?: Record<string, RecommendationBatch>;
+  recommendationSnapshots?: Record<string, RecommendationSnapshot>;
+}
+
+function scopedRecommendationKey(key: string): { scope: string; topicId: number } | null {
+  const match = /^([0-9a-f]{64}:)([1-9]\d*)$/.exec(key);
+  return match ? { scope: match[1]!, topicId: Number(match[2]) } : null;
 }
 
 export class DomainContentStore implements ContentStore {
@@ -263,7 +274,15 @@ export class DomainContentStore implements ContentStore {
     await this.updateGlobal((current) => ({ ...current, profile: null, profileEdits: { ...noInterestEdits } }));
   }
 
-  async getRecommendation(key: string): Promise<Recommendation | undefined> { return this.domain.table('recommendations').get(key); }
+  async getRecommendation(key: string): Promise<Recommendation | undefined> {
+    const scoped = scopedRecommendationKey(key);
+    if (scoped) {
+      const item = (this.domain.global.get() as GlobalState).recommendationSnapshots?.[scoped.scope]?.items
+        .find(value => value.topic.id === scoped.topicId);
+      if (item) return structuredClone(item);
+    }
+    return this.domain.table('recommendations').get(key);
+  }
   async putRecommendation(key: string, recommendation: Recommendation): Promise<void> {
     const match = /^(?:[0-9a-f]{64}:)?([1-9]\d*)$/.exec(key);
     if (!match || Number(match[1]) !== recommendation.topic.id) throw new V2exError('invalid_request');
@@ -286,6 +305,19 @@ export class DomainContentStore implements ContentStore {
     });
   }
   async markRead(key: string): Promise<void> {
+    const scoped = scopedRecommendationKey(key);
+    if (scoped) {
+      let found = false;
+      await this.updateGlobal((current) => {
+        const snapshot = current.recommendationSnapshots?.[scoped.scope];
+        if (!snapshot || !snapshot.items.some(item => item.topic.id === scoped.topicId)) return current;
+        found = true;
+        return { ...current, recommendationSnapshots: { ...(current.recommendationSnapshots ?? {}),
+          [scoped.scope]: { ...snapshot, items: snapshot.items.map(item => item.topic.id === scoped.topicId ?
+            { ...item, read: true } : item) } } };
+      });
+      if (found) return;
+    }
     const table = this.domain.table('recommendations');
     await this.serialize('recommendations', async () => {
       const value = table.get(key);
@@ -294,6 +326,19 @@ export class DomainContentStore implements ContentStore {
   }
   async setRecommendationFeedback(key: string, feedback: Recommendation['feedback']): Promise<void> {
     if (feedback !== null && feedback !== 'interested' && feedback !== 'not_interested') throw new V2exError('invalid_request');
+    const scoped = scopedRecommendationKey(key);
+    if (scoped) {
+      let found = false;
+      await this.updateGlobal((current) => {
+        const snapshot = current.recommendationSnapshots?.[scoped.scope];
+        if (!snapshot || !snapshot.items.some(item => item.topic.id === scoped.topicId)) return current;
+        found = true;
+        return { ...current, recommendationSnapshots: { ...(current.recommendationSnapshots ?? {}),
+          [scoped.scope]: { ...snapshot, items: snapshot.items.map(item => item.topic.id === scoped.topicId ?
+            { ...item, feedback } : item) } } };
+      });
+      if (found) return;
+    }
     const table = this.domain.table('recommendations');
     await this.serialize('recommendations', async () => {
       const value = table.get(key);
@@ -305,22 +350,64 @@ export class DomainContentStore implements ContentStore {
     await this.serialize('recommendations', () => this.domain.table('recommendations').delete(key));
   }
   async getRecommendationBatch(scope: string): Promise<RecommendationBatch | null> {
-    return structuredClone((this.domain.global.get() as GlobalState).recommendationBatches?.[assertAccountScope(scope)] ?? null);
+    const key = assertAccountScope(scope); const current = this.domain.global.get() as GlobalState;
+    return structuredClone(current.recommendationSnapshots?.[key]?.batch ?? current.recommendationBatches?.[key] ?? null);
   }
   async putRecommendationBatch(scope: string, batch: RecommendationBatch): Promise<void> {
     const key = assertAccountScope(scope); const parsed = parseWrite(RecommendationBatchSchema, batch);
     await this.updateGlobal((current) => ({ ...current,
       recommendationBatches: { ...(current.recommendationBatches ?? {}), [key]: parsed } }));
   }
+  async getRecommendationSnapshot(scope: string): Promise<RecommendationSnapshot | null> {
+    const key = assertAccountScope(scope); const current = this.domain.global.get() as GlobalState;
+    const snapshot = current.recommendationSnapshots?.[key];
+    if (snapshot) return structuredClone(snapshot);
+    const batch = current.recommendationBatches?.[key];
+    if (!batch) return null;
+    const ids = new Set(batch.topicIds);
+    const items = [...this.domain.table('recommendations').entries()]
+      .filter(([entryKey, value]) => entryKey.startsWith(key) && ids.has(value.topic.id)).map(([, value]) => value);
+    return { batch: structuredClone(batch), items: structuredClone(items) };
+  }
+  async replaceRecommendationBatch(scope: string, batch: RecommendationBatch, items: Recommendation[]): Promise<RecommendationSnapshot> {
+    const key = assertAccountScope(scope); const parsedBatch = parseWrite(RecommendationBatchSchema, batch);
+    const parsedItems = items.map(item => parseWrite(RecommendationSchema, item));
+    const ids = parsedItems.map(item => item.topic.id);
+    if (new Set(ids).size !== ids.length || parsedBatch.topicIds.length !== ids.length ||
+      parsedBatch.topicIds.some((id, index) => id !== ids[index])) throw new V2exError('invalid_request');
+    const legacy = new Map([...this.domain.table('recommendations').entries()]
+      .filter(([entryKey]) => entryKey.startsWith(key)).map(([, item]) => [item.topic.id, item]));
+    let published!: RecommendationSnapshot;
+    await this.updateGlobal((current) => {
+      const previous = new Map((current.recommendationSnapshots?.[key]?.items ?? [...legacy.values()])
+        .map(item => [item.topic.id, item]));
+      const next = parsedItems.map(item => { const old = previous.get(item.topic.id); return old ?
+        { ...item, read: old.read || item.read, feedback: old.feedback ?? item.feedback } : item; });
+      published = parseWrite(RecommendationSnapshotSchema, { batch: parsedBatch, items: next });
+      return { ...current, recommendationSnapshots: { ...(current.recommendationSnapshots ?? {}), [key]: published },
+        recommendationBatches: { ...(current.recommendationBatches ?? {}), [key]: parsedBatch } };
+    });
+    return structuredClone(published);
+  }
+  async discardRecommendationBatch(scope: string, generation: number): Promise<void> {
+    const key = assertAccountScope(scope);
+    await this.updateGlobal((current) => {
+      if (current.recommendationSnapshots?.[key]?.batch.generation !== generation) return current;
+      const snapshots = { ...(current.recommendationSnapshots ?? {}) }; delete snapshots[key];
+      const batches = { ...(current.recommendationBatches ?? {}) }; delete batches[key];
+      return { ...current, recommendationSnapshots: snapshots, recommendationBatches: batches };
+    });
+  }
   async clearRecommendations(scope: string): Promise<void> {
     const key = assertAccountScope(scope);
+    await this.updateGlobal((current) => {
+      const snapshots = { ...(current.recommendationSnapshots ?? {}) }; delete snapshots[key];
+      const batches = { ...(current.recommendationBatches ?? {}) }; delete batches[key];
+      return { ...current, recommendationSnapshots: snapshots, recommendationBatches: batches };
+    });
     await this.serialize('recommendations', async () => {
       const table = this.domain.table('recommendations');
       for (const [entryKey] of table.entries()) if (entryKey.startsWith(key)) await table.delete(entryKey);
-    });
-    await this.updateGlobal((current) => {
-      const batches = { ...(current.recommendationBatches ?? {}) }; delete batches[key];
-      return { ...current, recommendationBatches: batches };
     });
   }
   async clearLegacyRecommendations(): Promise<void> {
@@ -331,6 +418,10 @@ export class DomainContentStore implements ContentStore {
   }
   async listRecommendations(scope?: string): Promise<Recommendation[]> {
     if (scope !== undefined && !/^[0-9a-f]{64}:$/.test(scope)) throw new V2exError('invalid_request');
+    if (scope !== undefined) {
+      const snapshot = (this.domain.global.get() as GlobalState).recommendationSnapshots?.[scope];
+      if (snapshot) return structuredClone(snapshot.items);
+    }
     return [...this.domain.table('recommendations').entries()]
       .filter(([key]) => scope === undefined || key.startsWith(scope)).map(([, value]) => value);
   }
