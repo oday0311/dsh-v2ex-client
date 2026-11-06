@@ -4,6 +4,7 @@ import { V2exError } from './errors.js';
 import { assertNodeName, assertTopicId } from './validation.js';
 import type { IntelligenceService, SummaryMode } from './intelligence.js';
 import type { InterestService } from './interests.js';
+import type { RecommendationService } from './recommendations.js';
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const RUNTIME_ENVELOPE_HEADROOM_BYTES = 256;
@@ -182,5 +183,30 @@ export function createInterestTool(service: Pick<InterestService, 'perform'>): T
       catch (error) { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); }
       if (bytes(result) > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
       return JSON.parse(JSON.stringify(result));
+    } });
+}
+
+export function createRecommendationTool(reader: Pick<ContentReader, 'latest'>,
+  service: Pick<RecommendationService, 'refreshCandidates'>): ToolDefinition {
+  return defineTool({ name: 'v2ex_find_interesting', description: 'Find interesting recent V2EX topics from the authorized interest profile.',
+    parameters: {}, output,
+    async execute(args, exec) {
+      if (!args || typeof args !== 'object' || Array.isArray(args) || Object.keys(args).length !== 0) {
+        throw new V2exError('invalid_request');
+      }
+      const latest = await reader.latest({ page: 1 }, exec.signal);
+      const source = await service.refreshCandidates(latest.value.items, exec.signal);
+      const result = { consideredTopicIds: source.consideredTopicIds.slice(0, 100),
+        generatedAt: source.generatedAt, stale: source.stale || latest.stale,
+        source: source.source, items: source.items.slice(0, 30).map(item => ({
+          topic: listItem(item.topic), score: item.score, reason: text(item.reason, 500).value,
+          matchedInterests: item.matchedInterests.slice(0, 20).map(value => text(value, 80).value),
+          generatedAt: text(item.generatedAt, 64).value, read: item.read, feedback: item.feedback,
+        })), truncated: source.items.length > 30 };
+      while (bytes(result) > MAX_OUTPUT_BYTES && result.items.length) {
+        result.items.pop(); result.truncated = true;
+      }
+      if (bytes(result) > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
+      return result;
     } });
 }

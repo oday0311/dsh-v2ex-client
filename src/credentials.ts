@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import type { AccountStatus, CredentialVault } from './contract.js';
 import { V2exError } from './errors.js';
 import type { V2exApi } from './v2ex-api.js';
@@ -25,6 +26,8 @@ export class DshCredentialVault implements CredentialVault {
 }
 
 export class AuthService {
+  private verifiedUsername: string | null = null;
+  private verifiedCredentialDigest: string | null = null;
   constructor(
     private readonly api: V2exApi,
     private readonly vault: CredentialVault,
@@ -34,8 +37,15 @@ export class AuthService {
   async status(): Promise<AccountStatus> {
     const token = await this.vault.resolve();
     const { writable } = await this.vault.describe();
-    if (!token) return { authenticated: false, writable, username: null, tokenScope: null, expiresAt: null };
-    return this.validate(token, writable);
+    if (!token) {
+      this.verifiedUsername = null;
+      this.verifiedCredentialDigest = null;
+      return { authenticated: false, writable, username: null, tokenScope: null, expiresAt: null };
+    }
+    const status = await this.validate(token, writable);
+    this.verifiedUsername = status.username;
+    this.verifiedCredentialDigest = createHash('sha256').update(token).digest('hex');
+    return status;
   }
 
   async login(candidate: string): Promise<AccountStatus> {
@@ -45,11 +55,29 @@ export class AuthService {
     const { writable } = await this.vault.describe();
     const status = await this.validate(candidate, writable);
     await this.vault.set(candidate);
+    this.verifiedUsername = status.username;
+    this.verifiedCredentialDigest = createHash('sha256').update(candidate).digest('hex');
     return status;
+  }
+
+  async account(): Promise<string> {
+    const token = await this.vault.resolve();
+    if (!token) {
+      this.verifiedUsername = null;
+      this.verifiedCredentialDigest = null;
+      throw new V2exError('not_authenticated');
+    }
+    const digest = createHash('sha256').update(token).digest('hex');
+    if (this.verifiedUsername && this.verifiedCredentialDigest === digest) return this.verifiedUsername;
+    const status = await this.status();
+    if (!status.authenticated || !status.username) throw new V2exError('not_authenticated');
+    return status.username;
   }
 
   async logout(clearPersonalData: boolean): Promise<void> {
     await this.vault.clear();
+    this.verifiedUsername = null;
+    this.verifiedCredentialDigest = null;
     if (clearPersonalData) await this.clearPersonalData();
   }
 

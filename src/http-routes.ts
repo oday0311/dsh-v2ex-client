@@ -5,6 +5,7 @@ import { V2exError, toPublicError } from './errors.js';
 import { assertNodeName, assertPage, assertTopicId } from './validation.js';
 import type { IntelligenceService, SummaryMode } from './intelligence.js';
 import type { InterestService } from './interests.js';
+import type { RecommendationService } from './recommendations.js';
 
 const PREFIX = '/api/v2ex';
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -14,7 +15,7 @@ const MAX_EMBEDDED_REPLY_PAGES = 3;
 const ROUTED_METHODS = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD', 'OPTIONS'];
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
-export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'>; interests?: Pick<InterestService, 'perform'> }
+export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'>; interests?: Pick<InterestService, 'perform'>; recommendations?: Pick<RecommendationService, 'list' | 'feedback' | 'markRead'> }
 export interface V2exFetchRoute { path: string; methods: string[]; requestBody: 'buffered'; fetch(request: Request): Promise<Response> }
 export interface FetchConnection { fetch?: { register(route: V2exFetchRoute): unknown } }
 
@@ -65,6 +66,17 @@ function boundedHot(result: Cached<TopicListItem[]>): Cached<TopicListItem[]> & 
   const value = result.value.slice(0, PAGE_SIZE);
   const omittedItems = result.value.length - value.length;
   return { ...result, value, truncated: omittedItems > 0, omittedItems };
+}
+
+function boundedRecommendationList(result: Awaited<ReturnType<RecommendationService['list']>>) {
+  const all = result.items;
+  const items = all.slice(0, 100);
+  const bounded = { ...result, items, truncated: items.length < all.length, omittedItems: all.length - items.length };
+  while (Buffer.byteLength(JSON.stringify({ ok: true, data: bounded })) > MAX_RESPONSE_BYTES && bounded.items.length) {
+    bounded.items.pop(); bounded.truncated = true; bounded.omittedItems++;
+  }
+  if (!bounded.items.length && all.length) throw new V2exError('invalid_response');
+  return bounded;
 }
 
 function boundedReplies(result: Cached<ReplyItem[]>): Cached<ReplyItem[]> & { truncated: boolean; omittedReplies: number } {
@@ -176,6 +188,20 @@ async function summaryBody(request: Request): Promise<{ topic: string; mode: Sum
   return { topic, mode: input.mode, replyPages: replyPages as number };
 }
 
+async function recommendationMutation(request: Request, feedback: boolean): Promise<{ topicId: number; value?: 'interested' | 'not_interested' }> {
+  const body = await readBody(request);
+  if (!body || typeof body !== 'object' || Array.isArray(body)) throw new V2exError('invalid_request');
+  const keys = Object.keys(body);
+  const expected = feedback ? ['topicId', 'value'] : ['topicId'];
+  if (keys.length !== expected.length || !expected.every(key => keys.includes(key))) throw new V2exError('invalid_request');
+  const topicId = Reflect.get(body, 'topicId');
+  if (!Number.isSafeInteger(topicId) || topicId < 1) throw new V2exError('invalid_request');
+  if (!feedback) return { topicId };
+  const value = Reflect.get(body, 'value');
+  if (value !== 'interested' && value !== 'not_interested') throw new V2exError('invalid_request');
+  return { topicId, value };
+}
+
 class BodyTooLarge extends Error {}
 
 function route(path: string, methods: string[], services: V2exRouteServices): V2exFetchRoute {
@@ -240,6 +266,25 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
         }
         return json({ ok: true, data: await services.interests.perform(action, payload, request.signal) });
       }
+      if (path === '/recommendations') {
+        params(query, []);
+        if (!services.recommendations) throw new V2exError('ai_unavailable');
+        return json({ ok: true, data: boundedRecommendationList(await services.recommendations.list()) });
+      }
+      if (path === '/recommendations/feedback') {
+        params(query, []);
+        if (!services.recommendations) throw new V2exError('ai_unavailable');
+        const input = await recommendationMutation(request, true);
+        await services.recommendations.feedback(input as { topicId: number; value: 'interested' | 'not_interested' });
+        return json({ ok: true, data: { updated: true } });
+      }
+      if (path === '/recommendations/read') {
+        params(query, []);
+        if (!services.recommendations) throw new V2exError('ai_unavailable');
+        const input = await recommendationMutation(request, false);
+        await services.recommendations.markRead(input.topicId);
+        return json({ ok: true, data: { updated: true } });
+      }
       if (path === '/latest') {
         const input = params(query, ['page']);
         return json({ ok: true, data: boundedTopicPage(await services.content.latest({ page: page(input.get('page')) }, request.signal)) });
@@ -293,6 +338,9 @@ export async function registerV2exHttpRoutes(connection: FetchConnection, servic
       ['/node', ['GET']], ['/node/topics', ['GET']], ['/topic', ['GET']],
       ['/topic/summary', ['POST']],
       ['/interests', ['GET', 'PUT', 'POST', 'DELETE']],
+      ['/recommendations', ['GET']],
+      ['/recommendations/feedback', ['POST']],
+      ['/recommendations/read', ['POST']],
       ['/replies', ['GET']], ['/health', ['GET']],
     ] as const) {
       const release = connection.fetch.register(route(path, [...methods], services));

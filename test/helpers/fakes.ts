@@ -56,12 +56,22 @@ export class FakeContentStore implements ContentStore {
   }
   async clearProfile() { this.profile = null; this.profileEdits = { labels: false, preferredNodes: false, exclusions: false }; }
   async getRecommendation(key: string) { return this.recommendations.get(key); }
-  async putRecommendation(key: string, value: Recommendation) { this.recommendations.set(key, value); }
+  async putRecommendation(key: string, value: Recommendation) {
+    const previous = this.recommendations.get(key);
+    this.recommendations.set(key, previous ? { ...value, read: previous.read || value.read,
+      feedback: previous.feedback ?? value.feedback } : value);
+  }
   async markRead(key: string) {
     const value = this.recommendations.get(key);
     if (value) this.recommendations.set(key, { ...value, read: true });
   }
+  async setRecommendationFeedback(key: string, feedback: Recommendation['feedback']) {
+    const value = this.recommendations.get(key);
+    if (!value) throw new Error('not found');
+    this.recommendations.set(key, { ...value, feedback });
+  }
   async getSummary(key: string) { return this.summaries.get(key); }
   async putSummary(key: string, value: TopicAiSummary) { this.summaries.set(key, value); }
-  async listRecommendations() { return [...this.recommendations.values()]; }
+  async listRecommendations(scope?: string) { return [...this.recommendations.entries()]
+    .filter(([key]) => scope === undefined || key.startsWith(scope)).map(([, value]) => value); }
 }

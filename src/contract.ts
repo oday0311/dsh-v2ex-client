@@ -105,8 +105,17 @@ export interface Recommendation {
   topic: TopicListItem;
   score: number;
   reason: string;
+  matchedInterests: string[];
+  generatedAt: string;
   read: boolean;
-  createdAt: string;
+  feedback: 'interested' | 'not_interested' | null;
+}
+
+export interface RecommendationList {
+  items: Recommendation[];
+  generatedAt: string | null;
+  stale: boolean;
+  source: 'generated' | 'stored';
 }
 
 export interface CacheRecord<T = unknown> {
@@ -138,7 +147,8 @@ export interface ContentStore {
   getRecommendation(key: string): Promise<Recommendation | undefined>;
   putRecommendation(key: string, recommendation: Recommendation): Promise<void>;
   markRead(key: string): Promise<void>;
+  setRecommendationFeedback(key: string, value: Recommendation['feedback']): Promise<void>;
   getSummary?(key: string): Promise<TopicAiSummary | undefined>;
   putSummary?(key: string, summary: TopicAiSummary): Promise<void>;
-  listRecommendations?(): Promise<Recommendation[]>;
+  listRecommendations?(scope?: string): Promise<Recommendation[]>;
 }

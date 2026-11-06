@@ -69,8 +69,13 @@ export const TopicAiSummarySchema = z.strictObject({
 
 export const RecommendationSchema = z.strictObject({
   topic: TopicListItemSchema, score: z.number().finite().min(0).max(1), reason: z.string().min(1).max(1000),
-  read: z.boolean(), createdAt: timestamp,
+  matchedInterests: z.array(z.string().trim().min(1).max(80)).max(20), generatedAt: timestamp,
+  read: z.boolean(), feedback: z.enum(['interested', 'not_interested']).nullable(),
 });
+const LegacyRecommendationSchema = z.strictObject({
+  topic: TopicListItemSchema, score: z.number().finite().min(0).max(1), reason: z.string().min(1).max(1000),
+  read: z.boolean(), createdAt: timestamp,
+}).transform((old): Recommendation => ({ ...old, matchedInterests: [], generatedAt: old.createdAt, feedback: null }));
 
 export const defaultSettings: PluginSettings = {
   refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
@@ -87,7 +92,7 @@ export const v2exDomainSpec = defineDomain({
   tables: {
     cache: domainTable<string, CacheRecord>(CacheRecordSchema),
     summaries: domainTable<string, TopicAiSummary>(TopicAiSummarySchema),
-    recommendations: domainTable<string, Recommendation>(RecommendationSchema),
+    recommendations: domainTable<string, Recommendation>(z.union([RecommendationSchema, LegacyRecommendationSchema])),
   },
 });
 
@@ -214,11 +219,25 @@ export class DomainContentStore implements ContentStore {
 
   async getRecommendation(key: string): Promise<Recommendation | undefined> { return this.domain.table('recommendations').get(key); }
   async putRecommendation(key: string, recommendation: Recommendation): Promise<void> {
-    if (!/^[1-9]\d*$/.test(key) || Number(key) !== recommendation.topic.id) throw new V2exError('invalid_request');
+    const match = /^(?:[0-9a-f]{64}:)?([1-9]\d*)$/.exec(key);
+    if (!match || Number(match[1]) !== recommendation.topic.id) throw new V2exError('invalid_request');
     const parsed = parseWrite(RecommendationSchema, recommendation);
     const table = this.domain.table('recommendations');
-    await this.boundedPut('recommendations', table, key, parsed, 500,
-      () => true, (entry) => Date.parse(entry.createdAt));
+    await this.serialize('recommendations', async () => {
+      const previous = table.get(key);
+      const value = previous ? { ...parsed, read: previous.read || parsed.read,
+        feedback: previous.feedback ?? parsed.feedback } : parsed;
+      const entries = [...table.entries()];
+      const victim = previous || entries.length < 500 ? undefined : entries
+        .filter(([entryKey]) => entryKey !== key)
+        .sort((a, b) => Date.parse(a[1].generatedAt) - Date.parse(b[1].generatedAt))[0];
+      if (victim) await table.delete(victim[0]);
+      try { await table.put(key, value); }
+      catch (error) {
+        if (victim) await table.put(victim[0], victim[1]);
+        throw error;
+      }
+    });
   }
   async markRead(key: string): Promise<void> {
     const table = this.domain.table('recommendations');
@@ -227,7 +246,20 @@ export class DomainContentStore implements ContentStore {
       if (value && !value.read) await table.put(key, { ...value, read: true });
     });
   }
-  async listRecommendations(): Promise<Recommendation[]> { return [...this.domain.table('recommendations').entries()].map(([, value]) => value); }
+  async setRecommendationFeedback(key: string, feedback: Recommendation['feedback']): Promise<void> {
+    if (feedback !== null && feedback !== 'interested' && feedback !== 'not_interested') throw new V2exError('invalid_request');
+    const table = this.domain.table('recommendations');
+    await this.serialize('recommendations', async () => {
+      const value = table.get(key);
+      if (!value) throw new V2exError('not_found');
+      await table.put(key, { ...value, feedback });
+    });
+  }
+  async listRecommendations(scope?: string): Promise<Recommendation[]> {
+    if (scope !== undefined && !/^[0-9a-f]{64}:$/.test(scope)) throw new V2exError('invalid_request');
+    return [...this.domain.table('recommendations').entries()]
+      .filter(([key]) => scope === undefined || key.startsWith(scope)).map(([, value]) => value);
+  }
   async getSummary(key: string): Promise<TopicAiSummary | undefined> { return this.domain.table('summaries').get(key); }
   async putSummary(key: string, summary: TopicAiSummary): Promise<void> {
     if (!/^[1-9]\d*(?::[0-9a-f]{64})?$/.test(key) || Number(key.split(':')[0]) !== summary.topicId) throw new V2exError('invalid_request');

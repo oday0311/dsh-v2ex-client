@@ -131,3 +131,18 @@ test('unsafe or invalid reply counts are rejected before model generation', asyn
   }
   assert.equal(calls, 0);
 });
+
+test('recommendation ranking uses one bounded tool-free structured model call', async () => {
+  const requests: Array<{ userData: string; tools: unknown[]; maxInputBytes: number }> = [];
+  const model = { route: () => 'p/m', async completeJson(request: typeof requests[number]) {
+    requests.push(request); return { items: [{ topicId: 7, score: 0.8, reason: 'Relevant', matchedInterests: ['TypeScript'] }] };
+  } };
+  const service = new IntelligenceService(model as never, new FakeContentStore());
+  const result = await service.rankRecommendationCandidates({ interests: [{ name: 'TypeScript', weight: 1 }],
+    preferredNodes: [{ name: 'dev', weight: 1 }], candidates: [{ id: 7, title: 'TypeScript', node: 'dev', replyCount: 1,
+      updatedAt: '2026-11-07T00:00:00.000Z' }] });
+  assert.deepEqual(result.items.map(item => item.topicId), [7]);
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0]!.tools, []);
+  assert.ok(Buffer.byteLength(requests[0]!.userData) <= requests[0]!.maxInputBytes);
+});

@@ -63,7 +63,8 @@ const topic: TopicListItem = {
   id: 1, title: 'One', node: { name: 'tech', title: 'Tech' }, author: { username: 'alice' },
   replyCount: 2, createdAt: '2026-11-06T00:00:00Z', lastReplyAt: null, url: 'https://www.v2ex.com/t/1',
 };
-const recommendation: Recommendation = { topic, score: 0.8, reason: 'Relevant', read: false, createdAt: '2026-11-06T00:00:00Z' };
+const recommendation: Recommendation = { topic, score: 0.8, reason: 'Relevant', matchedInterests: ['tech'],
+  generatedAt: '2026-11-06T00:00:00Z', read: false, feedback: null };
 
 test('versioned domain contains only content tables and an initialized settings/profile global', () => {
   assert.equal(v2exDomainSpec.version, 1);
@@ -276,7 +277,12 @@ test('recommendations persist read state and enforce the table cap', async () =>
   const store = new DomainContentStore(memory.domain);
   await store.putRecommendation('1', recommendation);
   await store.markRead('1');
-  assert.equal((await store.getRecommendation('1'))?.read, true);
+  await store.setRecommendationFeedback('1', 'interested');
+  await store.putRecommendation('1', { ...recommendation, reason: 'refreshed' });
+  assert.deepEqual({ read: (await store.getRecommendation('1'))?.read,
+    feedback: (await store.getRecommendation('1'))?.feedback,
+    reason: (await store.getRecommendation('1'))?.reason },
+  { read: true, feedback: 'interested', reason: 'refreshed' });
   for (let i = 2; i <= 501; i++) await store.putRecommendation(String(i), { ...recommendation, topic: { ...topic, id: i } });
   assert.equal(memory.tables.recommendations.size, 500);
   assert.equal(await store.getRecommendation('1'), undefined);

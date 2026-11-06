@@ -5,10 +5,11 @@ import { AuthService, DshCredentialVault, type CredentialProvider } from './cred
 import { v2exDomainSpec, DomainContentStore } from './store.js';
 import { ContentCache, RequestBudget } from './cache.js';
 import { ContentService } from './content-service.js';
-import { createBrowsingTools, createInterestTool, createSummaryTool } from './tools.js';
+import { createBrowsingTools, createInterestTool, createRecommendationTool, createSummaryTool } from './tools.js';
 import { DshModelGateway } from './model-gateway.js';
 import { IntelligenceService } from './intelligence.js';
 import { InterestService } from './interests.js';
+import { RecommendationService } from './recommendations.js';
 import { DshHistoryReader } from './history.js';
 import { registerV2exHttpRoutes, type FetchConnection } from './http-routes.js';
 import type { Domain } from '@deepseek-ai/dsh-storage-domain';
@@ -59,10 +60,12 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     const service = new ContentService(api, vault,
       new ContentCache(store), new RequestBudget());
     const intelligence = new IntelligenceService(model, store);
+    const recommendations = new RecommendationService(store, intelligence, () => auth.account(), undefined, interests);
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));
-    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence, interests }));
+    disposers.push(host.tools.register(createRecommendationTool(service, recommendations)));
+    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence, interests, recommendations }));
   } catch (error) {
     for (const dispose of disposers.reverse()) { try { await dispose(); } catch { /* Preserve startup error. */ } }
     await domain.close();

@@ -57,6 +57,21 @@ test('logout clears the credential and calls personal-data cleanup only when req
   assert.equal(cleared, 1);
 });
 
+test('verified account scope remains available offline in memory and clears on logout', async () => {
+  const vault = new FakeCredentialVault();
+  const { api, transport } = apiFrom({ '/api/v2/token': TOKEN_OK, '/api/v2/member': MEMBER_OK });
+  const auth = new AuthService(api, vault);
+  await auth.login(TOKEN);
+  const calls = transport.calls.length;
+  assert.equal(await auth.account(), 'alice');
+  assert.equal(transport.calls.length, calls);
+  vault.value = 'replacement-credential';
+  assert.equal(await auth.account(), 'alice');
+  assert.equal(transport.calls.length, calls + 2);
+  await auth.logout(false);
+  await assert.rejects(auth.account(), { code: 'not_authenticated' });
+});
+
 test('DSH vault uses the plugin-owned reference for resolve, write, clear, and describe', async () => {
   const values = new Map<string, string>();
   const refs: string[] = [];

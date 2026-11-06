@@ -7,7 +7,8 @@ import { Config } from '../src/index.js';
 import { Context } from '@deepseek-ai/cordis';
 
 const TOKEN = '00000000-0000-4000-8000-000000000000';
-const PATHS = ['/session', '/latest', '/hot', '/node', '/node/topics', '/topic', '/topic/summary', '/interests', '/replies', '/health'];
+const PATHS = ['/session', '/latest', '/hot', '/node', '/node/topics', '/topic', '/topic/summary', '/interests',
+  '/recommendations', '/recommendations/feedback', '/recommendations/read', '/replies', '/health'];
 
 function fixture() {
   const routes = new Map<string, { path: string; methods: string[]; requestBody: string; fetch(request: Request): Promise<Response> }>();
@@ -96,10 +97,11 @@ test('invalid DELETE body is rejected before credential or auth I/O', async () =
 test('all paths dispatch methods with Allow and no-store', async () => {
   const f = fixture();
   for (const path of PATHS) {
-    const method = path === '/session' ? 'PUT' : path === '/topic/summary' ? 'GET' : path === '/interests' ? 'PATCH' : 'POST';
+    const method = path === '/session' ? 'PUT' : path === '/topic/summary' ? 'GET' : path === '/interests' ? 'PATCH' :
+      path === '/recommendations' ? 'POST' : path.startsWith('/recommendations/') ? 'GET' : 'POST';
     const response = await f.fetch(`/api/v2ex${path}`, { method });
     assert.equal(response.status, 405, path);
-    assert.equal(response.headers.get('allow'), path === '/session' ? 'GET, POST, DELETE' : path === '/topic/summary' ? 'POST' : path === '/interests' ? 'GET, PUT, POST, DELETE' : 'GET');
+    assert.equal(response.headers.get('allow'), path === '/session' ? 'GET, POST, DELETE' : path === '/topic/summary' ? 'POST' : path === '/interests' ? 'GET, PUT, POST, DELETE' : path.startsWith('/recommendations/') ? 'POST' : 'GET');
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.equal((await response.json() as { ok: boolean }).ok, false);
   }
@@ -329,7 +331,7 @@ test('real Cordis Context registers routes through get and rejects absent transp
   };
   const present = create(true);
   const plugin = await composePlugin(present.ctx, Config({}));
-  assert.equal(present.routes(), 10);
+  assert.equal(present.routes(), 13);
   await plugin.dispose();
   assert.equal(present.routes(), 0);
   assert.equal(present.closed(), 1);
@@ -383,7 +385,7 @@ test('composition rollback awaits partial route cleanup before tools and storage
   release();
   await assert.rejects(loading, { code: 'incompatible_runtime' });
   assert.equal(events.at(-1), 'close');
-  assert.equal(events.filter(value => value === 'tool').length, 6);
+  assert.equal(events.filter(value => value === 'tool').length, 7);
 });
 
 test('connection lookup failures are bounded before opening storage', async () => {
