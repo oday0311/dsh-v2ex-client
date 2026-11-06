@@ -120,6 +120,15 @@ export interface RecommendationList {
 export interface RecommendationBatch { generatedAt: string; topicIds: number[]; generation?: number }
 export interface RecommendationSnapshot { batch: RecommendationBatch; items: Recommendation[] }
 
+export interface PendingReminderNotice {
+  noticeId: string;
+  topicId: number;
+  title: string;
+  node: string;
+  reason: string;
+  createdAt: string;
+}
+
 export interface CacheRecord<T = unknown> {
   value: T;
   fetchedAt: string;
@@ -141,7 +150,9 @@ export interface ContentStore {
   deleteCache(key: string): Promise<void>;
   getSettings(scope?: string): Promise<PluginSettings>;
   putSettings(settings: PluginSettings, scope?: string): Promise<void>;
-  claimNotificationTopicIds(scope: string, topicIds: number[]): Promise<number[]>;
+  enqueuePendingNotifications(scope: string, notices: PendingReminderNotice[]): Promise<PendingReminderNotice[]>;
+  getPendingNotifications(scope: string): Promise<PendingReminderNotice[]>;
+  markNotificationSent(scope: string, noticeId: string): Promise<void>;
   clearRefreshState(scope: string): Promise<void>;
   getProfile(scope?: string): Promise<InterestProfile | null>;
   putProfile(profile: InterestProfile, scope?: string): Promise<void>;

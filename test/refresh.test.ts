@@ -4,9 +4,11 @@ import { RequestBudget } from '../src/cache.js';
 import type { IdentityLease, IdentityLeaseProvider } from '../src/credentials.js';
 import { RefreshService, isQuietTime, type RefreshClock } from '../src/refresh.js';
 import { FakeContentStore } from './helpers/fakes.js';
-import type { Recommendation, TopicListItem } from '../src/contract.js';
+import type { PendingReminderNotice, Recommendation, TopicListItem } from '../src/contract.js';
 import { accountScope } from '../src/account-scope.js';
 import { V2exError } from '../src/errors.js';
+import { Context } from '@deepseek-ai/cordis';
+import { DshReminderSink } from '../src/reminders.js';
 
 const at = '2026-11-07T02:00:00.000Z';
 
@@ -76,10 +78,12 @@ function fixture(options: { budget?: boolean; now?: Date; items?: Recommendation
         stale: false, source: 'generated' as const };
     },
   };
-  const notices: Recommendation[][] = [];
-  const reminders = { async notify(items: readonly Recommendation[]) { notices.push([...items]); } };
+  const notices: PendingReminderNotice[][] = [];
+  const reminders = { deliver: true, async notify(items: readonly PendingReminderNotice[]) {
+    notices.push([...items]); return this.deliver ? items.map(item => item.noticeId) : [];
+  } };
   const service = new RefreshService({ store, content, recommendations: recommender, budget, identity, reminders, clock });
-  return { service, store, identity, clock, budget, contentCalls, recommender, notices,
+  return { service, store, identity, clock, budget, contentCalls, recommender, reminders, notices,
     get refreshCalls() { return refreshCalls; }, release: () => release?.() };
 }
 
@@ -119,8 +123,8 @@ test('only new unread recommendations above threshold are claimed and notified o
   const f = fixture({ items: [recommendation(1, 0.9), recommendation(2, 0.6), recommendation(3, 1, true)] });
   f.store.settings = { ...f.store.settings, notificationThreshold: 0.7 };
   await f.service.runNow('timer'); await f.service.runNow('timer');
-  assert.deepEqual(f.notices.map(batch => batch.map(item => item.topic.id)), [[1]]);
-  assert.deepEqual(await f.store.claimNotificationTopicIds(accountScope('alice'), [1]), []);
+  assert.deepEqual(f.notices.map(batch => batch.map(item => item.topicId)), [[1]]);
+  assert.deepEqual(await f.store.enqueuePendingNotifications(accountScope('alice'), [f.notices[0]![0]!]), []);
 });
 
 test('quiet hours still refresh recommendations but suppress notices', async () => {
@@ -140,11 +144,12 @@ test('account replacement before publication prevents stale notification', async
 
 test('clear and dispose abort active work, remove account refresh state, and are idempotent', async () => {
   const f = fixture(); f.recommender.hold = true;
-  await f.store.claimNotificationTopicIds(accountScope('alice'), [99]);
+  await f.store.enqueuePendingNotifications(accountScope('alice'), [{ noticeId: '00000000-0000-4000-8000-000000000099',
+    topicId: 99, title: 'Topic', node: 'tech', reason: 'Relevant', createdAt: at }]);
   const running = f.service.runNow('timer'); while (!f.refreshCalls) await Promise.resolve();
   await f.service.clear('alice');
   await assert.rejects(running, { code: 'timeout' });
-  assert.deepEqual(await f.store.claimNotificationTopicIds(accountScope('alice'), [99]), [99]);
+  assert.deepEqual(await f.store.getPendingNotifications(accountScope('alice')), []);
   await f.service.start();
   const first = f.service.dispose(); const second = f.service.dispose();
   assert.strictEqual(first, second); await first; assert.equal(f.clock.disposed, 1);
@@ -165,4 +170,57 @@ test('timer callbacks contain rejected refreshes without an unhandled promise', 
   assert.doesNotThrow(() => f.clock.task?.());
   await new Promise(resolve => setImmediate(resolve));
   await f.service.dispose();
+});
+
+test('undelivered notice survives service restart and successful retry marks it sent once', async () => {
+  const f = fixture(); f.reminders.deliver = false;
+  await f.service.runNow('timer');
+  assert.deepEqual((await f.store.getPendingNotifications(accountScope('alice'))).map(value => value.topicId), [1]);
+  const restartedNotices: PendingReminderNotice[][] = [];
+  const restarted = new RefreshService({ store: f.store, content: {} as never, recommendations: {} as never,
+    budget: f.budget, identity: f.identity, reminders: { async notify(items) {
+      restartedNotices.push([...items]); return items.map(item => item.noticeId);
+    } }, clock: f.clock });
+  await restarted.drainPending(); await restarted.drainPending();
+  assert.deepEqual(restartedNotices.map(batch => batch.map(value => value.topicId)), [[1]]);
+  assert.deepEqual(await f.store.getPendingNotifications(accountScope('alice')), []);
+});
+
+test('busy notice survives restart and drains from the official idle event', async () => {
+  const f = fixture(); f.reminders.deliver = false; await f.service.runNow('timer'); await f.service.dispose();
+  const ctx = new Context(); const sink = new DshReminderSink(); sink.bind(ctx as never);
+  const messages: unknown[] = []; const agent = { status: 'running', async followup(message: unknown) { messages.push(message); } };
+  const restarted = new RefreshService({ store: f.store, content: {} as never, recommendations: {} as never,
+    budget: f.budget, identity: f.identity, reminders: sink, clock: f.clock });
+  sink.onIdle(() => restarted.drainPending());
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'running' });
+  agent.status = 'idle';
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'idle' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(messages.length, 1); assert.deepEqual(await f.store.getPendingNotifications(accountScope('alice')), []);
+  await restarted.dispose(); await ctx.fiber.dispose();
+});
+
+test('delivery storage failure keeps stable-id pending notice retryable without duplicate followup', async () => {
+  const f = fixture(); let fail = true; const delivered = new Set<string>(); let userVisible = 0;
+  f.reminders.notify = async (items) => { for (const item of items) if (!delivered.has(item.noticeId)) {
+    delivered.add(item.noticeId); userVisible++;
+  } return items.map(item => item.noticeId); };
+  f.store.beforeNotificationSent = async () => { if (fail) { fail = false; throw new Error('storage failed'); } };
+  await assert.rejects(f.service.runNow('timer'), /storage failed/);
+  await f.service.drainPending();
+  assert.equal(userVisible, 1); assert.deepEqual(await f.store.getPendingNotifications(accountScope('alice')), []);
+});
+
+test('pending delivery stays account-scoped across switches and dispose leaves retryable state', async () => {
+  const f = fixture(); f.reminders.deliver = false; await f.service.runNow('timer');
+  f.identity.switch('bob'); await f.service.drainPending(); assert.equal(f.notices.length, 1);
+  f.identity.switch('alice');
+  let entered!: () => void; const started = new Promise<void>(resolve => { entered = resolve; });
+  f.reminders.notify = (items, signal) => new Promise(resolve => {
+    entered(); signal?.addEventListener('abort', () => resolve([]), { once: true });
+  });
+  const draining = f.service.drainPending(); await started; const disposing = f.service.dispose();
+  await Promise.all([draining.catch(() => {}), disposing]);
+  assert.deepEqual((await f.store.getPendingNotifications(accountScope('alice'))).map(value => value.topicId), [1]);
 });

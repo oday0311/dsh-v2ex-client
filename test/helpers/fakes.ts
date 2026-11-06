@@ -1,5 +1,5 @@
 import type { CredentialVault } from '../../src/credentials.js';
-import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from '../../src/contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PendingReminderNotice, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from '../../src/contract.js';
 
 export class FakeCredentialVault implements CredentialVault {
   value: string | undefined;
@@ -40,7 +40,8 @@ export class FakeContentStore implements ContentStore {
   readonly accountProfiles = new Map<string, { profile: InterestProfile; edits: InterestEditFlags }>();
   readonly summaries = new Map<string, TopicAiSummary>();
   readonly accountSettings = new Map<string, PluginSettings>();
-  readonly notificationStates = new Map<string, number[]>();
+  readonly notificationStates = new Map<string, { sent: Set<number>; pending: PendingReminderNotice[] }>();
+  beforeNotificationSent?: () => Promise<void>;
   beforeRecommendationSnapshot?: () => Promise<void>;
   beforeRecommendationPublish?: () => Promise<void>;
   beforeProfileRead?: () => Promise<void>;
@@ -61,11 +62,18 @@ export class FakeContentStore implements ContentStore {
   async deleteCache(key: string) { this.cache.delete(key); }
   async getSettings(scope?: string) { return scope ? this.accountSettings.get(scope) ?? this.settings : this.settings; }
   async putSettings(value: PluginSettings, scope?: string) { if (scope) this.accountSettings.set(scope, value); else this.settings = value; }
-  async claimNotificationTopicIds(scope: string, topicIds: number[]) {
-    const previous = this.notificationStates.get(scope) ?? []; const seen = new Set(previous);
-    const claimed = [...new Set(topicIds)].filter(id => !seen.has(id));
-    this.notificationStates.set(scope, [...previous, ...claimed].slice(-500)); return claimed;
+  async enqueuePendingNotifications(scope: string, notices: PendingReminderNotice[]) {
+    const state = this.notificationStates.get(scope) ?? { sent: new Set<number>(), pending: [] };
+    const topics = new Set(state.pending.map(value => value.topicId)); const accepted: PendingReminderNotice[] = [];
+    for (const notice of notices) if (state.pending.length < 20 && !state.sent.has(notice.topicId) && !topics.has(notice.topicId)) {
+      state.pending.push(structuredClone(notice)); accepted.push(structuredClone(notice)); topics.add(notice.topicId);
+    }
+    this.notificationStates.set(scope, state); return accepted;
   }
+  async getPendingNotifications(scope: string) { return structuredClone(this.notificationStates.get(scope)?.pending ?? []); }
+  async markNotificationSent(scope: string, noticeId: string) { await this.beforeNotificationSent?.();
+    const state = this.notificationStates.get(scope); const notice = state?.pending.find(value => value.noticeId === noticeId);
+    if (state && notice) { state.sent.add(notice.topicId); state.pending = state.pending.filter(value => value.noticeId !== noticeId); } }
   async clearRefreshState(scope: string) { this.accountSettings.delete(scope); this.notificationStates.delete(scope); }
   async getProfile(scope?: string) { await this.beforeProfileRead?.(); return scope ? this.accountProfiles.get(scope)?.profile ?? null : this.profile; }
   async putProfile(value: InterestProfile, scope?: string) {

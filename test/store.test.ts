@@ -166,24 +166,43 @@ test('refresh settings and notification claims are durable and isolated by accou
   await first.putSettings({ ...(await first.getSettings(alice)), refreshIntervalMinutes: 15,
     quietHours: { start: '22:00', end: '07:00', timeZone: 'Asia/Shanghai' } }, alice);
   assert.equal((await first.getSettings(bob)).refreshIntervalMinutes, 30);
-  assert.deepEqual(await Promise.all([
-    first.claimNotificationTopicIds(alice, [1, 2]), first.claimNotificationTopicIds(alice, [2, 3]),
-  ]), [[1, 2], [3]]);
+  const notice = (id: number) => ({ noticeId: `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`,
+    topicId: id, title: `Topic ${id}`, node: 'tech', reason: 'Relevant', createdAt: '2026-11-07T00:00:00.000Z' });
+  const [one, two] = await Promise.all([
+    first.enqueuePendingNotifications(alice, [notice(1), notice(2)]),
+    first.enqueuePendingNotifications(alice, [notice(2), notice(3)]),
+  ]);
+  assert.deepEqual([...one, ...two].map(value => value.topicId).sort(), [1, 2, 3]);
   const reloaded = new DomainContentStore(memory.domain);
   assert.equal((await reloaded.getSettings(alice)).refreshIntervalMinutes, 15);
-  assert.deepEqual(await reloaded.claimNotificationTopicIds(alice, [1, 2, 3, 4]), [4]);
-  assert.deepEqual(await reloaded.claimNotificationTopicIds(bob, [1]), [1]);
+  assert.deepEqual((await reloaded.getPendingNotifications(alice)).map(value => value.topicId).sort(), [1, 2, 3]);
+  await reloaded.markNotificationSent(alice, one[0]!.noticeId);
+  assert.deepEqual(await reloaded.enqueuePendingNotifications(alice, [notice(one[0]!.topicId)]), []);
+  assert.deepEqual((await reloaded.enqueuePendingNotifications(bob, [notice(1)])).map(value => value.topicId), [1]);
   await reloaded.clearRefreshState(alice);
   assert.equal((await reloaded.getSettings(alice)).refreshIntervalMinutes, 30);
-  assert.deepEqual(await reloaded.claimNotificationTopicIds(alice, [1]), [1]);
-  assert.deepEqual(await reloaded.claimNotificationTopicIds(bob, [1]), []);
+  assert.deepEqual((await reloaded.enqueuePendingNotifications(alice, [notice(1)])).map(value => value.topicId), [1]);
+  assert.deepEqual(await reloaded.enqueuePendingNotifications(bob, [notice(1)]), []);
 });
 
 test('failed durable notification claim is not reported as claimed', async () => {
   const memory = memoryDomain(); const store = new DomainContentStore(memory.domain); const scope = accountScope('alice');
+  const notice = { noticeId: '00000000-0000-4000-8000-000000000001', topicId: 1, title: 'Topic', node: 'tech',
+    reason: 'Relevant', createdAt: '2026-11-07T00:00:00.000Z' };
   memory.failNextGlobalSet();
-  await assert.rejects(store.claimNotificationTopicIds(scope, [1]), /global set failed/);
-  assert.deepEqual(await store.claimNotificationTopicIds(scope, [1]), [1]);
+  await assert.rejects(store.enqueuePendingNotifications(scope, [notice]), /global set failed/);
+  assert.deepEqual((await store.enqueuePendingNotifications(scope, [notice])).map(value => value.topicId), [1]);
+});
+
+test('pending reminder storage is bounded, deterministic, and rejects unsafe content', async () => {
+  const memory = memoryDomain(); const store = new DomainContentStore(memory.domain); const scope = accountScope('alice');
+  const notice = (id: number) => ({ noticeId: `00000000-0000-4000-8000-${String(id).padStart(12, '0')}`,
+    topicId: id, title: `Topic ${id}`, node: 'tech', reason: 'Relevant', createdAt: '2026-11-07T00:00:00.000Z' });
+  const accepted = await store.enqueuePendingNotifications(scope, Array.from({ length: 25 }, (_, index) => notice(index + 1)));
+  assert.deepEqual(accepted.map(value => value.topicId), Array.from({ length: 20 }, (_, index) => index + 1));
+  assert.deepEqual((await store.getPendingNotifications(scope)).map(value => value.topicId), accepted.map(value => value.topicId));
+  await assert.rejects(store.enqueuePendingNotifications(scope, [{ ...notice(30), title: 'token=\u0000FAKE_LONG_VALUE_12345678' }]),
+    { code: 'invalid_request' });
 });
 
 test('legacy profile is read as unauthorized structured data without changing domain version', async () => {

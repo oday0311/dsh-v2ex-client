@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { DshReminderSink } from '../src/reminders.js';
+import { Context } from '@deepseek-ai/cordis';
+import { DshReminderSink, createReminderNotice } from '../src/reminders.js';
 import type { Recommendation } from '../src/contract.js';
 
 const item: Recommendation = {
@@ -11,47 +12,78 @@ const item: Recommendation = {
   generatedAt: '2026-11-07T00:00:00.000Z', read: false, feedback: null,
 };
 
-function agent(input: { root?: boolean; status?: string } = {}) {
-  const messages: unknown[] = [];
+function agent(input: { root?: boolean; status?: string; fail?: number } = {}) {
+  const messages: unknown[] = []; const ids = new Set<string>(); let failures = input.fail ?? 0;
   return { root: input.root ?? true, status: input.status ?? 'idle', messages,
-    createUserMessage(value: unknown) { return { kind: 'user', value }; },
-    async followup(value: unknown) { messages.push(value); } };
+    async followup(value: unknown) {
+      if (failures-- > 0) throw new Error('private provider failure');
+      const id = (value as { id?: unknown }).id;
+      if (typeof id === 'string' && !ids.has(id)) { ids.add(id); messages.push(value); }
+    } };
 }
 
-test('missing agent retains sidebar-only unread state without throwing', async () => {
-  const sink = new DshReminderSink();
-  await sink.notify([item]);
+function emit(ctx: Context, name: 'agent/status' | 'agent/disposed', payload: unknown) {
+  (ctx.emit as (name: string, payload: unknown) => void)(name, payload);
+}
+
+test('bind consumes official DSH payload.agent status events rather than the Cordis this carrier', async () => {
+  const ctx = new Context(); const sink = new DshReminderSink(); let wakes = 0;
+  const removeWake = sink.onIdle(async () => { wakes++; }); const dispose = sink.bind(ctx as never);
+  const target = agent({ status: 'running' });
+  emit(ctx, 'agent/status', { agent: target, status: 'running' });
+  target.status = 'idle'; emit(ctx, 'agent/status', { agent: target, status: 'idle' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(wakes, 1);
+  removeWake(); dispose(); dispose();
+  emit(ctx, 'agent/status', { agent: target, status: 'idle' });
+  emit(ctx, 'agent/disposed', { agent: target });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(wakes, 1); await ctx.fiber.dispose();
 });
 
-test('latest root agent entering running receives one bounded notice after becoming idle', async () => {
-  const sink = new DshReminderSink(); const first = agent(); const latest = agent({ status: 'running' });
-  sink.observe(first, 'running'); sink.observe(latest, 'running'); latest.status = 'idle';
-  await sink.notify([item]);
-  assert.equal(first.messages.length, 0); assert.equal(latest.messages.length, 1);
-  const serialized = JSON.stringify(latest.messages[0]);
-  assert.match(serialized, /A useful topic/); assert.match(serialized, /typescript/);
-  assert.match(serialized, /Matches your TypeScript interests/);
-  assert.match(serialized, /"kind":"plugin"/); assert.match(serialized, /"plugin":"v2ex"/);
-  assert.match(serialized, /"form":"notice"/);
-  assert.doesNotMatch(serialized, /author|matchedInterests|generatedAt/);
-});
-
-test('children, busy agents, and malformed structural agents are ignored safely', async () => {
-  const sink = new DshReminderSink(); const child = agent({ root: false }); const busy = agent({ status: 'running' });
-  sink.observe(child, 'running'); await sink.notify([item]); assert.equal(child.messages.length, 0);
-  sink.observe(busy, 'running'); await sink.notify([item]); assert.equal(busy.messages.length, 0);
-  busy.status = 'idle'; sink.observe(busy, 'idle'); await new Promise(resolve => setImmediate(resolve));
-  assert.equal(busy.messages.length, 1);
-  sink.observe({ root: true, status: 'idle', createUserMessage: 'bad', followup: () => {} }, 'running');
-  await sink.notify([item]);
-});
-
-test('notice content is bounded and contains no provider errors or credential-shaped text', async () => {
-  const sink = new DshReminderSink(); const target = agent(); sink.observe(target, 'running');
-  const unsafe = { ...item, topic: { ...item.topic, title: `token=FAKE_LONG_VALUE_12345678 ${'x'.repeat(2000)}` },
-    reason: `private provider error ${'y'.repeat(4000)}` };
-  await sink.notify([unsafe]);
+test('latest top-level Agent receives a stable-id notice and failed followup stays retryable', async () => {
+  const ctx = new Context(); const sink = new DshReminderSink(); const target = agent({ fail: 1 });
+  sink.bind(ctx as never); emit(ctx, 'agent/status', { agent: target, status: 'running' }); target.status = 'idle';
+  const notice = createReminderNotice(item);
+  assert.deepEqual(await sink.notify([notice]), []);
+  assert.deepEqual(await sink.notify([notice]), [notice.noticeId]);
+  assert.equal(target.messages.length, 1);
   const serialized = JSON.stringify(target.messages[0]);
-  assert.ok(Buffer.byteLength(serialized) < 5000);
-  assert.doesNotMatch(serialized, /FAKE_LONG_VALUE|private provider error/);
+  assert.match(serialized, /A useful topic/); assert.match(serialized, /"kind":"plugin"/);
+  assert.equal((target.messages[0] as { id: string }).id, notice.noticeId);
+  await ctx.fiber.dispose();
+});
+
+test('children and disposed or stale Agents are never followed up', async () => {
+  const ctx = new Context(); const sink = new DshReminderSink(); sink.bind(ctx as never);
+  const child = agent({ root: false }); const stale = agent();
+  emit(ctx, 'agent/status', { agent: child, status: 'running' });
+  assert.deepEqual(await sink.notify([createReminderNotice(item)]), []);
+  emit(ctx, 'agent/status', { agent: stale, status: 'running' });
+  emit(ctx, 'agent/disposed', { agent: stale });
+  assert.deepEqual(await sink.notify([createReminderNotice(item)]), []);
+  assert.equal(stale.messages.length, 0); await ctx.fiber.dispose();
+});
+
+test('sanitization normalizes controls before scanning the exact outbound notice', async () => {
+  const unsafe = { ...item, topic: { ...item.topic, title: `token=\u0000FAKE_LONG_VALUE_12345678 ${'x'.repeat(2000)}` },
+    reason: `private\u0000provider\u0000error ${'y'.repeat(4000)}` };
+  const notice = createReminderNotice(unsafe);
+  const serializedNotice = JSON.stringify(notice);
+  assert.doesNotMatch(serializedNotice, /FAKE_LONG_VALUE|private.*provider.*error/i);
+  assert.doesNotMatch(serializedNotice, /[\u0000-\u001f\u007f]/);
+  const ctx = new Context(); const sink = new DshReminderSink(); const target = agent(); sink.bind(ctx as never);
+  emit(ctx, 'agent/status', { agent: target, status: 'running' });
+  assert.deepEqual(await sink.notify([notice]), [notice.noticeId]);
+  const outbound = JSON.stringify(target.messages[0]);
+  assert.ok(Buffer.byteLength(outbound) < 5000);
+  assert.doesNotMatch(outbound, /FAKE_LONG_VALUE|private.*provider.*error/i);
+  await ctx.fiber.dispose();
+});
+
+test('sanitization detects credential labels split across normalized outbound fields', () => {
+  const split = createReminderNotice({ ...item, topic: { ...item.topic, title: 'token=' },
+    reason: 'FAKE_LONG_VALUE_12345678' });
+  assert.equal(split.title, 'V2EX topic'); assert.equal(split.reason, 'Relevant to your V2EX interests');
+  assert.doesNotMatch(JSON.stringify(split), /FAKE_LONG_VALUE/);
 });

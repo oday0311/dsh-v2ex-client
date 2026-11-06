@@ -1,6 +1,6 @@
 import { defineDomain, domainTable, type Domain, type KvTable } from '@deepseek-ai/dsh-storage-domain';
 import { z } from 'zod';
-import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from './contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PendingReminderNotice, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from './contract.js';
 import { V2exError } from './errors.js';
 import { assertPage, assertTopicId } from './validation.js';
 
@@ -20,6 +20,14 @@ function encodeNotificationIds(ids: readonly number[]): string {
   const bits = Buffer.alloc(NOTIFICATION_BYTES);
   for (const id of ids) for (const position of notificationPositions(id)) bits[position >> 3] |= 1 << (position & 7);
   return bits.toString('base64');
+}
+
+function notificationSeen(bitmap: Buffer, id: number): boolean {
+  return notificationPositions(id).every(position => (bitmap[position >> 3]! & (1 << (position & 7))) !== 0);
+}
+
+function markNotification(bitmap: Buffer, id: number): void {
+  for (const position of notificationPositions(id)) bitmap[position >> 3] |= 1 << (position & 7);
 }
 
 export const PluginSettingsSchema = z.strictObject({
@@ -114,8 +122,30 @@ const NotificationBitmapSchema = z.string().refine(value => {
   try { const decoded = Buffer.from(value, 'base64'); return decoded.length === NOTIFICATION_BYTES && decoded.toString('base64') === value; }
   catch { return false; }
 });
-const NotificationStatesSchema = z.record(accountScope,
-  z.union([NotificationBitmapSchema, z.array(topicId).max(500).transform(encodeNotificationIds)]))
+function isNormalizedReminderText(value: string): boolean {
+  if (/[\u0000-\u001f\u007f]/.test(value) || value !== value.normalize('NFKC')) return false;
+  for (let index = 0; index < value.length; index++) {
+    const unit = value.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(++index); if (!(next >= 0xdc00 && next <= 0xdfff)) return false;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) return false;
+  }
+  return true;
+}
+const reminderSafeText = z.string().min(1).refine(isNormalizedReminderText);
+const PendingReminderNoticeSchema = z.strictObject({
+  noticeId: z.uuid(), topicId, title: reminderSafeText.max(200), node: reminderSafeText.max(64),
+  reason: reminderSafeText.max(500), createdAt: timestamp,
+}).refine(value => !/(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32,}|(?:bearer|token)[^A-Za-z0-9]{0,8}[A-Za-z0-9_-]{8,})/i
+  .test(`${value.title}\n${value.node}\n${value.reason}`) &&
+  !/(?:provider|model|api|private)[^A-Za-z0-9]{0,8}(?:error|failure|exception)/i.test(`${value.title}\n${value.node}\n${value.reason}`));
+const NotificationStateSchema = z.strictObject({ sent: NotificationBitmapSchema,
+  pending: z.array(PendingReminderNoticeSchema).max(20) });
+const NotificationStatesSchema = z.record(accountScope, z.union([
+  NotificationStateSchema,
+  NotificationBitmapSchema.transform(sent => ({ sent, pending: [] as PendingReminderNotice[] })),
+  z.array(topicId).max(500).transform(ids => ({ sent: encodeNotificationIds(ids), pending: [] as PendingReminderNotice[] })),
+]))
   .refine(value => Object.keys(value).length <= 20);
 
 export const defaultSettings: PluginSettings = {
@@ -171,7 +201,7 @@ interface GlobalState {
   recommendationSnapshots?: Record<string, RecommendationSnapshot>;
   migratedRecommendationScopes?: Record<string, true>;
   accountSettings?: Record<string, PluginSettings>;
-  notificationStates?: Record<string, string>;
+  notificationStates?: Record<string, { sent: string; pending: PendingReminderNotice[] }>;
 }
 
 function scopedRecommendationKey(key: string): { scope: string; topicId: number } | null {
@@ -259,23 +289,38 @@ export class DomainContentStore implements ContentStore {
     const key = assertAccountScope(scope);
     await this.updateGlobal((current) => ({ ...current, accountSettings: { ...(current.accountSettings ?? {}), [key]: parsed } }));
   }
-  async claimNotificationTopicIds(scope: string, topicIds: number[]): Promise<number[]> {
+  async enqueuePendingNotifications(scope: string, notices: PendingReminderNotice[]): Promise<PendingReminderNotice[]> {
     const key = assertAccountScope(scope);
-    if (!Array.isArray(topicIds) || topicIds.length > 100 || topicIds.some(id => !topicId.safeParse(id).success)) {
-      throw new V2exError('invalid_request');
-    }
-    const unique = [...new Set(topicIds)]; let claimed: number[] = [];
+    if (!Array.isArray(notices) || notices.length > 100) throw new V2exError('invalid_request');
+    const parsed = notices.map(value => parseWrite(PendingReminderNoticeSchema, value));
+    let accepted: PendingReminderNotice[] = [];
     await this.updateGlobal((current) => {
-      const bits = current.notificationStates?.[key] ? Buffer.from(current.notificationStates[key], 'base64') : Buffer.alloc(NOTIFICATION_BYTES);
-      claimed = unique.filter(id => {
-        const positions = notificationPositions(id);
-        if (positions.every(position => (bits[position >> 3]! & (1 << (position & 7))) !== 0)) return false;
-        for (const position of positions) bits[position >> 3] |= 1 << (position & 7);
-        return true;
-      });
-      return { ...current, notificationStates: { ...(current.notificationStates ?? {}), [key]: bits.toString('base64') } };
+      const state = current.notificationStates?.[key] ?? { sent: Buffer.alloc(NOTIFICATION_BYTES).toString('base64'), pending: [] };
+      const sent = Buffer.from(state.sent, 'base64'); const pending = [...state.pending];
+      const topics = new Set(pending.map(value => value.topicId)); const ids = new Set(pending.map(value => value.noticeId));
+      accepted = [];
+      for (const notice of parsed) {
+        if (pending.length >= 20 || topics.has(notice.topicId) || ids.has(notice.noticeId) || notificationSeen(sent, notice.topicId)) continue;
+        pending.push(notice); accepted.push(notice); topics.add(notice.topicId); ids.add(notice.noticeId);
+      }
+      return { ...current, notificationStates: { ...(current.notificationStates ?? {}), [key]: { sent: state.sent, pending } } };
     });
-    return claimed;
+    return structuredClone(accepted);
+  }
+  async getPendingNotifications(scope: string): Promise<PendingReminderNotice[]> {
+    const state = (this.domain.global.get() as GlobalState).notificationStates?.[assertAccountScope(scope)];
+    return structuredClone(state?.pending ?? []);
+  }
+  async markNotificationSent(scope: string, noticeId: string): Promise<void> {
+    const key = assertAccountScope(scope);
+    if (!z.uuid().safeParse(noticeId).success) throw new V2exError('invalid_request');
+    await this.updateGlobal((current) => {
+      const state = current.notificationStates?.[key]; if (!state) return current;
+      const notice = state.pending.find(value => value.noticeId === noticeId); if (!notice) return current;
+      const sent = Buffer.from(state.sent, 'base64'); markNotification(sent, notice.topicId);
+      return { ...current, notificationStates: { ...(current.notificationStates ?? {}),
+        [key]: { sent: sent.toString('base64'), pending: state.pending.filter(value => value.noticeId !== noticeId) } } };
+    });
   }
   async clearRefreshState(scope: string): Promise<void> {
     const key = assertAccountScope(scope);

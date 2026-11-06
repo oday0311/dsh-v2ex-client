@@ -27,7 +27,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     llm?: unknown;
     agentDefaultModel?: unknown;
     sessionQuery?: unknown;
-    on?: (name: string, listener: (this: unknown, payload: unknown) => void) => (() => unknown) | unknown;
+    on?: (name: string, listener: (payload: unknown) => void) => (() => unknown) | unknown;
   };
   if (!host.credentials || !host.storageDomain || !host.tools) {
     throw new V2exError('incompatible_runtime');
@@ -73,6 +73,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     disposers.push(reminders.bind(host));
     refresh = new RefreshService({ store, content: service, recommendations, budget, identity, reminders });
     await refresh.start(); disposers.push(() => refresh.dispose());
+    disposers.push(reminders.onIdle(() => refresh.drainPending()));
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));

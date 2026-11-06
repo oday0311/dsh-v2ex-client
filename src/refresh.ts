@@ -1,10 +1,11 @@
-import type { ContentStore, InterestProfile, PluginSettings, Recommendation, TopicListItem, TopicPage } from './contract.js';
+import type { ContentStore, InterestProfile, PendingReminderNotice, PluginSettings, TopicListItem, TopicPage } from './contract.js';
 import type { ContentService } from './content-service.js';
 import type { IdentityLease, IdentityLeaseProvider } from './credentials.js';
 import type { RecommendationRefresh, RecommendationService } from './recommendations.js';
 import type { RequestBudget } from './cache.js';
 import { V2exError } from './errors.js';
 import { accountScope } from './account-scope.js';
+import { createReminderNotice } from './reminders.js';
 
 const MAX_NODES = 20;
 const MAX_NODE_PAGES = 2;
@@ -16,10 +17,11 @@ export interface RefreshClock {
 }
 
 export interface ReminderSink {
-  notify(items: readonly Recommendation[]): Promise<void>;
+  notify(items: readonly PendingReminderNotice[], signal?: AbortSignal): Promise<string[]>;
 }
 
-type RefreshStore = Pick<ContentStore, 'getSettings' | 'getProfile' | 'claimNotificationTopicIds' | 'clearRefreshState'>;
+type RefreshStore = Pick<ContentStore, 'getSettings' | 'getProfile' | 'enqueuePendingNotifications' |
+  'getPendingNotifications' | 'markNotificationSent' | 'clearRefreshState'>;
 type RefreshContent = Pick<ContentService, 'latest' | 'nodeTopics'>;
 type RefreshRecommendations = Pick<RecommendationService, 'refreshCandidates'>;
 
@@ -76,6 +78,7 @@ function nodeNames(settings: PluginSettings, profile: InterestProfile | null): s
 export class RefreshService {
   private readonly clock: RefreshClock;
   private active?: { promise: Promise<void>; controller: AbortController };
+  private delivery?: { promise: Promise<void>; controller: AbortController };
   private stopTimer?: () => void;
   private timerMinutes?: number;
   private disposing?: Promise<void>;
@@ -148,18 +151,42 @@ export class RefreshService {
       this.options.recommendations.refreshCandidates([...candidates.values()], signal, lease), signal);
     if (signal.aborted || !ranked.items.length || (settings.quietHours && isQuietTime(this.clock.now(), settings.quietHours))) return;
     const eligible = ranked.items.filter(item => !item.read && item.feedback !== 'not_interested' && item.score >= settings.notificationThreshold)
-      .slice(0, 100);
+      .slice(0, 20).map(createReminderNotice);
     if (!eligible.length) return;
     await this.options.identity.withMutation(async current => {
       if (signal.aborted) throw new V2exError('timeout');
-      const claimed = new Set(await this.options.store.claimNotificationTopicIds(current.scope, eligible.map(item => item.topic.id)));
-      const notices = eligible.filter(item => claimed.has(item.topic.id));
-      if (notices.length) await abortAware(() => this.options.reminders.notify(notices), signal);
+      await this.options.store.enqueuePendingNotifications(current.scope, eligible);
     }, lease);
+    await this.drainPending(lease);
+  }
+
+  drainPending(expectedLease?: IdentityLease): Promise<void> {
+    if (this.disposed) return Promise.reject(new V2exError('timeout'));
+    if (this.delivery) return this.delivery.promise;
+    const controller = new AbortController();
+    const delivery = { controller, promise: Promise.resolve() as Promise<void> };
+    delivery.promise = this.deliverPending(controller.signal, expectedLease)
+      .finally(() => { if (this.delivery === delivery) this.delivery = undefined; });
+    this.delivery = delivery;
+    return delivery.promise;
+  }
+
+  private async deliverPending(signal: AbortSignal, expectedLease?: IdentityLease): Promise<void> {
+    await this.options.identity.withMutation(async lease => {
+      if (signal.aborted) throw new V2exError('timeout');
+      const pending = await this.options.store.getPendingNotifications(lease.scope);
+      if (!pending.length) return;
+      const delivered = new Set(await abortAware(() => this.options.reminders.notify(pending, signal), signal));
+      for (const notice of pending) {
+        if (signal.aborted) throw new V2exError('timeout');
+        if (delivered.has(notice.noticeId)) await this.options.store.markNotificationSent(lease.scope, notice.noticeId);
+      }
+    }, expectedLease);
   }
 
   clear(account: string): Promise<void> {
     this.active?.controller.abort();
+    this.delivery?.controller.abort();
     return this.options.store.clearRefreshState(accountScope(account));
   }
 
@@ -168,7 +195,9 @@ export class RefreshService {
       this.disposed = true; this.stopTimer?.(); this.stopTimer = undefined;
       this.timerMinutes = undefined;
       this.active?.controller.abort();
+      this.delivery?.controller.abort();
       try { await this.active?.promise; } catch { /* Cancellation is expected. */ }
+      try { await this.delivery?.promise; } catch { /* Cancellation is expected. */ }
     })();
   }
 }
