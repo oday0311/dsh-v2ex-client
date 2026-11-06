@@ -41,6 +41,10 @@ export const TopicAiSummarySchema = z.strictObject({
   topicId, summary: z.string().min(1).max(5000), viewpoints: z.array(z.string().max(1000)).max(30),
   notableReplies: z.array(topicId).max(100), generatedAt: timestamp,
   coveredReplyPages: z.array(z.number().int().positive().max(1000)).max(100), completeDiscussion: z.boolean(),
+  coverage: z.strictObject({ loadedReplyPages: z.number().int().nonnegative().max(1000),
+    totalReplyPages: z.number().int().nonnegative().max(1000), complete: z.boolean() }).optional(),
+  mode: z.enum(['quick', 'viewpoints', 'full']).optional(), modelRoute: z.string().min(1).max(500).optional(),
+  topicUpdatedAt: timestamp.optional(),
 });
 
 export const RecommendationSchema = z.strictObject({
@@ -181,7 +185,7 @@ export class DomainContentStore implements ContentStore {
   async listRecommendations(): Promise<Recommendation[]> { return [...this.domain.table('recommendations').entries()].map(([, value]) => value); }
   async getSummary(key: string): Promise<TopicAiSummary | undefined> { return this.domain.table('summaries').get(key); }
   async putSummary(key: string, summary: TopicAiSummary): Promise<void> {
-    if (!/^[1-9]\d*$/.test(key) || Number(key) !== summary.topicId) throw new V2exError('invalid_request');
+    if (!/^[1-9]\d*(?::[0-9a-f]{64})?$/.test(key) || Number(key.split(':')[0]) !== summary.topicId) throw new V2exError('invalid_request');
     const parsed = parseWrite(TopicAiSummarySchema, summary);
     const table = this.domain.table('summaries');
     await this.boundedPut('summaries', table, key, parsed, 300,

@@ -81,6 +81,10 @@ export interface TopicAiSummary {
   generatedAt: string;
   coveredReplyPages: number[];
   completeDiscussion: boolean;
+  coverage?: { loadedReplyPages: number; totalReplyPages: number; complete: boolean };
+  mode?: 'quick' | 'viewpoints' | 'full';
+  modelRoute?: string;
+  topicUpdatedAt?: string;
 }
 
 export interface InterestProfile {

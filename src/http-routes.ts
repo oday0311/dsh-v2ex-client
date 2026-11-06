@@ -3,6 +3,7 @@ import type { ContentService } from './content-service.js';
 import type { AccountStatus, ApiResult, Cached, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
 import { V2exError, toPublicError } from './errors.js';
 import { assertNodeName, assertPage, assertTopicId } from './validation.js';
+import type { IntelligenceService, SummaryMode } from './intelligence.js';
 
 const PREFIX = '/api/v2ex';
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -12,7 +13,7 @@ const MAX_EMBEDDED_REPLY_PAGES = 3;
 const ROUTED_METHODS = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD', 'OPTIONS'];
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
-export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'> }
+export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'> }
 export interface V2exFetchRoute { path: string; methods: string[]; requestBody: 'buffered'; fetch(request: Request): Promise<Response> }
 export interface FetchConnection { fetch?: { register(route: V2exFetchRoute): unknown } }
 
@@ -160,6 +161,20 @@ async function logoutOption(request: Request): Promise<boolean> {
   return Reflect.get(value, 'clearPersonalData') as boolean;
 }
 
+async function summaryBody(request: Request): Promise<{ topic: string; mode: SummaryMode; replyPages: number }> {
+  const value = await readBody(request);
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+    Object.keys(value).some(key => !['topic', 'mode', 'replyPages'].includes(key)) ||
+    Object.keys(value).length < 2) throw new V2exError('invalid_request');
+  const input = value as Record<string, unknown>;
+  if (typeof input.topic !== 'string') throw new V2exError('invalid_request');
+  const topic = String(assertTopicId(input.topic));
+  if (input.mode !== 'quick' && input.mode !== 'viewpoints' && input.mode !== 'full') throw new V2exError('invalid_request');
+  const replyPages = input.replyPages === undefined ? 1 : input.replyPages;
+  if (!Number.isSafeInteger(replyPages) || (replyPages as number) < 1 || (replyPages as number) > 3) throw new V2exError('invalid_request');
+  return { topic, mode: input.mode, replyPages: replyPages as number };
+}
+
 class BodyTooLarge extends Error {}
 
 function route(path: string, methods: string[], services: V2exRouteServices): V2exFetchRoute {
@@ -181,6 +196,13 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
         const prior = await services.credential.resolve();
         if (request.method === 'DELETE') await services.auth.logout(clearPersonalData);
         return json({ ok: true, data: accountStatus(await services.auth.status(), [prior]) });
+      }
+      if (path === '/topic/summary') {
+        params(query, []);
+        const input = await summaryBody(request);
+        const thread = await services.content.topic({ topic: input.topic, replyPages: input.replyPages }, request.signal);
+        if (!services.intelligence) throw new V2exError('ai_unavailable');
+        return json({ ok: true, data: await services.intelligence.summarizeTopic({ topic: thread.value, mode: input.mode }, request.signal) });
       }
       if (path === '/latest') {
         const input = params(query, ['page']);
@@ -233,6 +255,7 @@ export async function registerV2exHttpRoutes(connection: FetchConnection, servic
     for (const [path, methods] of [
       ['/session', ['GET', 'POST', 'DELETE']], ['/latest', ['GET']], ['/hot', ['GET']],
       ['/node', ['GET']], ['/node/topics', ['GET']], ['/topic', ['GET']],
+      ['/topic/summary', ['POST']],
       ['/replies', ['GET']], ['/health', ['GET']],
     ] as const) {
       const release = connection.fetch.register(route(path, [...methods], services));

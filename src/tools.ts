@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
 import type { Cached, TopicListItem, TopicPage, TopicThread } from './contract.js';
 import { V2exError } from './errors.js';
 import { assertNodeName, assertTopicId } from './validation.js';
+import type { IntelligenceService, SummaryMode } from './intelligence.js';
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const RUNTIME_ENVELOPE_HEADROOM_BYTES = 256;
@@ -130,4 +131,41 @@ export function createBrowsingTools(reader: ContentReader): ToolDefinition[] {
         return topicResult(await reader.topic({ topic, replyPages }, exec.signal));
       } }),
   ];
+}
+
+export function createSummaryTool(reader: Pick<ContentReader, 'topic'>,
+  intelligence: Pick<IntelligenceService, 'summarizeTopic'>): ToolDefinition {
+  return defineTool({ name: 'v2ex_summarize_topic', description: 'Summarize a V2EX topic with reply-page provenance.',
+    parameters: { topic: { type: 'string', required: true }, mode: { type: 'string', required: true },
+      replyPages: { type: 'integer' } }, output,
+    async execute(args, exec) {
+      const topic = String(assertTopicId(args.topic));
+      if (args.mode !== 'quick' && args.mode !== 'viewpoints' && args.mode !== 'full') throw new V2exError('invalid_request');
+      const replyPages = clamp(args.replyPages, 1, 3);
+      const cached = await reader.topic({ topic, replyPages }, exec.signal);
+      const source = await intelligence.summarizeTopic({ topic: cached.value, mode: args.mode as SummaryMode }, exec.signal);
+      const result = {
+        topicId: source.topicId, summary: text(source.summary, 5000).value,
+        viewpoints: source.viewpoints.slice(0, 30).map(value => text(value, 1000).value),
+        notableReplies: source.notableReplies.slice(0, 100),
+        generatedAt: text(source.generatedAt, 64).value,
+        coveredReplyPages: source.coveredReplyPages.slice(0, 10),
+        completeDiscussion: source.completeDiscussion,
+        ...(source.coverage ? { coverage: source.coverage } : {}),
+        ...(source.mode ? { mode: source.mode } : {}),
+        ...(source.modelRoute ? { modelRoute: text(source.modelRoute, 500).value } : {}),
+        ...(source.topicUpdatedAt ? { topicUpdatedAt: text(source.topicUpdatedAt, 64).value } : {}),
+        truncated: false,
+      };
+      result.truncated = result.summary !== source.summary || result.viewpoints.length < source.viewpoints.length;
+      while (bytes(result) > MAX_OUTPUT_BYTES && result.viewpoints.length) {
+        result.viewpoints.pop(); result.truncated = true;
+      }
+      while (bytes(result) > MAX_OUTPUT_BYTES && result.summary.length) {
+        result.summary = result.summary.slice(0, Math.floor(result.summary.length / 2));
+        result.truncated = true;
+      }
+      if (bytes(result) > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
+      return result;
+    } });
 }
