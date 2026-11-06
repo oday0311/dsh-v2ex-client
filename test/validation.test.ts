@@ -8,10 +8,16 @@ test('request path inputs reject traversal and malformed identifiers', () => {
     assert.throws(() => assertNodeName(value), (error: unknown) =>
       error instanceof V2exError && error.code === 'invalid_request');
   }
-  for (const value of [0, -1, 1.5, '1', Number.MAX_SAFE_INTEGER + 1]) {
+  for (const value of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1,
+    '', '0', '00123', '+123', '-123', '1.5', '123/../../token', '9007199254740992']) {
     assert.throws(() => assertTopicId(value), (error: unknown) =>
       error instanceof V2exError && error.code === 'invalid_request');
   }
+});
+
+test('topic IDs accept canonical decimal strings up to the safe-integer limit', () => {
+  assert.equal(assertTopicId('123'), 123);
+  assert.equal(assertTopicId('9007199254740991'), Number.MAX_SAFE_INTEGER);
 });
 
 test('pagination inputs enforce positive bounded integers', () => {

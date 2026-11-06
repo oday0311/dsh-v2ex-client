@@ -8,6 +8,10 @@ function positiveInteger(value: unknown, max: number): number {
 }
 
 export function assertTopicId(value: unknown): number {
+  if (typeof value === 'string') {
+    if (!/^[1-9][0-9]*$/.test(value)) throw new V2exError('invalid_request');
+    return positiveInteger(Number(value), Number.MAX_SAFE_INTEGER);
+  }
   return positiveInteger(value, Number.MAX_SAFE_INTEGER);
 }
 

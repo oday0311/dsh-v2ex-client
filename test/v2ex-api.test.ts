@@ -48,6 +48,28 @@ test('path validation rejects traversal and malformed pagination before fetch', 
   assert.equal(transport.calls.length, 0);
 });
 
+test('topic and replies accept decimal string IDs and request canonical official paths', async () => {
+  const transport = recordingFetch((url) => jsonResponse(
+    url.pathname.endsWith('/replies') ? REPLIES_OK : TOPIC_OK,
+  ));
+  const api = new V2exApi(options(transport.fetch));
+  assert.equal((await api.topic('123', TOKEN)).id, 123);
+  assert.equal((await api.replies('123', 2, TOKEN))[0]?.id, 12);
+  assert.deepEqual(transport.calls.map(({ url }) => new URL(url).pathname + new URL(url).search), [
+    '/api/v2/topics/123', '/api/v2/topics/123/replies?p=2',
+  ]);
+});
+
+test('topic and replies reject malformed string IDs before any request', async () => {
+  const transport = recordingFetch(jsonResponse(TOPIC_OK));
+  const api = new V2exApi(options(transport.fetch));
+  for (const id of ['+123', '-123', '1.5', '123/../../token', '9007199254740992']) {
+    await assert.rejects(api.topic(id, TOKEN), errorCode('invalid_request'));
+    await assert.rejects(api.replies(id, 2, TOKEN), errorCode('invalid_request'));
+  }
+  assert.equal(transport.calls.length, 0);
+});
+
 test('malformed JSON and malformed API envelopes fail without returning raw data', async () => {
   for (const response of [new Response('{secret payload'), jsonResponse({ result: { surprise: 'secret payload' } })]) {
     const api = new V2exApi(options(recordingFetch(response).fetch));
