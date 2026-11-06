@@ -1,5 +1,7 @@
 export type { PublicError, V2exErrorCode } from './errors.js';
 
+export type ApiResult<T> = { ok: true; data: T } | { ok: false; error: import('./errors.js').PublicError };
+
 export interface AccountStatus {
   authenticated: boolean;
   writable: boolean;
