@@ -98,3 +98,88 @@ test('expired token returns to login and hides previous content', async () => {
   assert.equal(store.getSnapshot().error, 'token_expired');
   store.dispose();
 });
+
+test('failed token replacement keeps the prior authenticated session and topics', async () => {
+  const store = new V2exClientStore(remote({ login: async () => { throw new V2exClientError('token_invalid'); } }));
+  await store.loadSession();
+  await store.loadLatest();
+  await store.login('invalid-replacement');
+  assert.equal(store.getSnapshot().phase, 'ready');
+  assert.equal(store.getSnapshot().account?.username, 'reader');
+  assert.equal(store.getSnapshot().topics?.value.items[0]?.title, 'TypeScript');
+  assert.equal(store.getSnapshot().error, 'token_invalid');
+  assert.equal(JSON.stringify(store.getSnapshot()).includes('invalid-replacement'), false);
+  store.dispose();
+});
+
+test('view navigation clears detail and reply work across latest, hot, and node', async () => {
+  let replySignal: AbortSignal | undefined;
+  let finishReplies!: (value: Cached<ReplyItem[]>) => void;
+  const store = new V2exClientStore(remote({ replies: (_id, _page, signal) => {
+    replySignal = signal;
+    return new Promise(resolve => { finishReplies = resolve; });
+  } }));
+  await store.loadSession();
+  await store.loadLatest();
+  await store.openTopic('7');
+  const pending = store.loadMoreReplies();
+  store.selectView('hot');
+  assert.equal(replySignal?.aborted, true);
+  assert.equal(store.getSnapshot().repliesLoading, false);
+  assert.equal(store.getSnapshot().detailLoading, false);
+  assert.equal(store.getSnapshot().thread, null);
+  finishReplies(cached([reply]));
+  await pending;
+  assert.equal(store.getSnapshot().thread, null);
+  store.selectView('node');
+  assert.equal(store.getSnapshot().view, 'node');
+  store.selectView('latest');
+  assert.equal(store.getSnapshot().view, 'latest');
+  store.dispose();
+});
+
+test('new node clears previous node and detail before request, including failed replacement', async () => {
+  let finish!: (value: Cached<TopicPage>) => void;
+  let oldSignal: AbortSignal | undefined;
+  const store = new V2exClientStore(remote({
+    node: async name => cached({ name, title: name, topicCount: 1, url: `https://www.v2ex.com/go/${name}` }),
+    nodeTopics: (name, _page, signal) => name === 'second'
+      ? new Promise((_resolve, reject) => { oldSignal = signal; reject(new V2exClientError('offline')); })
+      : name === 'third' ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(page()),
+  }));
+  await store.loadSession();
+  await store.loadNode('first');
+  await store.openTopic('7');
+  const replacement = store.loadNode('third');
+  assert.equal(store.getSnapshot().nodeInfo, null);
+  assert.equal(store.getSnapshot().topics, null);
+  assert.equal(store.getSnapshot().thread, null);
+  assert.equal(store.getSnapshot().detailLoading, false);
+  finish(page([]));
+  await replacement;
+  await store.loadNode('second');
+  assert.equal(oldSignal?.aborted, false);
+  assert.equal(store.getSnapshot().nodeName, 'second');
+  assert.equal(store.getSnapshot().topics, null);
+  assert.equal(store.getSnapshot().nodeInfo, null);
+  assert.equal(store.getSnapshot().error, 'offline');
+  store.dispose();
+});
+
+test('a late topic result cannot reopen detail after switching views or nodes', async () => {
+  let finishTopic!: (value: Cached<TopicThread>) => void;
+  let topicSignal: AbortSignal | undefined;
+  const store = new V2exClientStore(remote({ topic: (_id, signal) => {
+    topicSignal = signal;
+    return new Promise(resolve => { finishTopic = resolve; });
+  } }));
+  await store.loadSession();
+  const pending = store.openTopic('7');
+  await store.loadNode('dev');
+  assert.equal(topicSignal?.aborted, true);
+  assert.equal(store.getSnapshot().detailLoading, false);
+  finishTopic(cached({ topic, content: 'old', replies: [], replyPage: 0, hasMoreReplies: false, stale: false }));
+  await pending;
+  assert.equal(store.getSnapshot().thread, null);
+  store.dispose();
+});

@@ -12,15 +12,16 @@ if (pkg.name !== manifest.name || pkg.version !== manifest.version ||
 
 await rm(new URL('./lib/', import.meta.url), { recursive: true, force: true });
 await mkdir(new URL('./lib/', import.meta.url), { recursive: true });
-const external = ['@deepseek-ai/*', ...Object.keys(pkg.peerDependencies), ...Object.keys(pkg.dependencies)];
+const hostExternal = ['@deepseek-ai/*', ...Object.keys(pkg.peerDependencies), ...Object.keys(pkg.dependencies)];
 await build({
   entryPoints: { index: 'src/index.ts', plugin: 'src/plugin.ts' },
   outdir: 'lib', bundle: true, splitting: true, format: 'esm', platform: 'node',
-  target: 'node22', external, sourcemap: true,
+  target: 'node22', external: hostExternal, sourcemap: true,
 });
 await build({
   entryPoints: ['src/client/index.ts'], outfile: 'lib/client.js', bundle: true,
-  format: 'cjs', platform: 'browser', target: 'es2022', external, sourcemap: true,
+  format: 'cjs', platform: 'browser', target: 'es2022',
+  external: ['@deepseek-ai/*', 'react', 'react/jsx-runtime', 'react-dom', 'react-dom/client'], sourcemap: true,
   banner: { js: `window.__ModuleLoader__.load({ id: '${pkg.name}', factory: (require) => { var module = { exports: {} }; var exports = module.exports;` },
   footer: { js: 'return module.exports; } });' },
 });

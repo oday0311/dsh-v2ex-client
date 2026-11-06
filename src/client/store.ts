@@ -69,9 +69,10 @@ export class V2exClientStore {
   async login(token: string): Promise<void> {
     if (this.disposed) return;
     const request = this.start('session');
+    const previouslyReady = this.state.phase === 'ready';
     this.set({ loading: true, error: null });
     try { const status = await this.remote.login(token, request.signal); if (request.current()) this.sessionStatus(status); }
-    catch (error) { if (request.current()) this.set({ phase: 'guest', error: this.code(error) }); }
+    catch (error) { if (request.current()) this.set({ phase: previouslyReady ? 'ready' : 'guest', error: this.code(error) }); }
     finally { if (request.current()) this.set({ loading: false }); }
   }
   async logout(clearPersonalData = false): Promise<void> {
@@ -85,7 +86,9 @@ export class V2exClientStore {
   selectView(view: BrowseView): void {
     if (this.disposed || this.state.phase !== 'ready') return;
     this.stop('list', 'detail', 'replies');
-    this.set({ view, topics: null, thread: null, nodeInfo: null, error: null, detailError: null, loading: false });
+    this.selectedTopicId = null;
+    this.set({ view, topics: null, thread: null, nodeInfo: null, error: null, detailError: null, repliesError: null,
+      loading: false, detailLoading: false, repliesLoading: false });
     if (view === 'latest') void this.loadLatest();
     if (view === 'hot') void this.loadHot();
   }
@@ -106,7 +109,14 @@ export class V2exClientStore {
   async loadNode(node: string, page = 1): Promise<void> {
     if (this.disposed || this.state.phase !== 'ready') return;
     const name = node.trim(); if (!/^[a-z0-9_-]{1,64}$/i.test(name)) { this.set({ error: 'invalid_request' }); return; }
-    this.set({ view: 'node', nodeName: name, error: null, thread: null });
+    const changed = this.state.view !== 'node' || this.state.nodeName !== name;
+    if (changed) {
+      this.stop('detail', 'replies');
+      this.selectedTopicId = null;
+    }
+    this.set({ view: 'node', nodeName: name, error: null,
+      ...(changed ? { nodeInfo: null, topics: null, thread: null, detailLoading: false,
+        repliesLoading: false, detailError: null, repliesError: null } : {}) });
     const request = this.start('list'); this.set({ loading: true });
     try {
       const [nodeInfo, topics] = await Promise.all([this.remote.node(name, request.signal), this.remote.nodeTopics(name, page, request.signal)]);
@@ -118,11 +128,11 @@ export class V2exClientStore {
     if (!/^[1-9][0-9]*$/.test(topicId)) { this.set({ detailError: 'invalid_request' }); return; }
     this.selectedTopicId = topicId;
     this.stop('replies'); const request = this.start('detail');
-    this.set({ thread: null, detailLoading: true, detailError: null, repliesError: null });
+    this.set({ thread: null, detailLoading: true, repliesLoading: false, detailError: null, repliesError: null });
     try { const thread = await this.remote.topic(topicId, request.signal); if (request.current()) this.set({ thread, detailLoading: false }); }
     catch (error) { if (request.current()) this.fail(error, { detailLoading: false, detailError: this.code(error) }); }
   }
-  closeTopic(): void { this.stop('detail', 'replies'); this.set({ thread: null, detailError: null, repliesError: null, detailLoading: false, repliesLoading: false }); }
+  closeTopic(): void { this.stop('detail', 'replies'); this.selectedTopicId = null; this.set({ thread: null, detailError: null, repliesError: null, detailLoading: false, repliesLoading: false }); }
   async loadMoreReplies(): Promise<void> {
     const thread = this.state.thread;
     if (this.disposed || this.state.phase !== 'ready' || !thread || !thread.value.hasMoreReplies) return;

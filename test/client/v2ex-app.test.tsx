@@ -33,7 +33,7 @@ test('unauthenticated state exposes only token login', async () => {
   await store.loadSession();
   render(<V2exApp store={store} />);
   assert.ok(screen.getByLabelText('V2EX Personal Access Token'));
-  assert.equal(screen.queryByRole('tab', { name: '最新' }), null);
+  assert.equal(screen.queryByRole('button', { name: '最新' }), null);
   assert.equal(screen.queryByRole('button', { name: '退出登录' }), null);
   store.dispose();
 });
@@ -50,7 +50,7 @@ test('login submission clears the input and unlocks browsing', async () => {
   await act(async () => { fireEvent.submit(input.closest('form')!); });
   assert.equal(submitted, 'example-token');
   assert.equal(input.value, '');
-  assert.ok(await screen.findByRole('tab', { name: '最新' }));
+  assert.ok(await screen.findByRole('button', { name: '最新' }));
   assert.equal(JSON.stringify(store.getSnapshot()).includes('example-token'), false);
   store.dispose();
 });
@@ -59,7 +59,7 @@ test('authenticated browsing opens a topic and loads replies', async () => {
   const store = new V2exClientStore(remote(true));
   await store.loadSession();
   render(<V2exApp store={store} />);
-  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: '最新' })); });
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '最新' })); });
   await act(async () => { fireEvent.click(await screen.findByRole('button', { name: /TypeScript/ })); });
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '加载更多回复' })); });
   assert.ok(screen.getAllByText('第 1 页回复').length >= 1);
@@ -73,9 +73,9 @@ test('hot and node views remain usable without AI controls', async () => {
   const store = new V2exClientStore(remote(true));
   await store.loadSession();
   render(<V2exApp store={store} />);
-  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: '热门' })); });
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '热门' })); });
   assert.ok(screen.getByRole('button', { name: /TypeScript/ }));
-  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: '节点' })); });
+  await act(async () => { fireEvent.click(screen.getByRole('button', { name: '节点' })); });
   fireEvent.change(screen.getByLabelText('节点名称'), { target: { value: 'dev' } });
   await act(async () => { fireEvent.submit(screen.getByLabelText('节点名称').closest('form')!); });
   assert.ok(screen.getByText('开发', { selector: 'h2' }));
@@ -101,6 +101,7 @@ test('stale cached content stays visible with its refresh failure', async () => 
 test('sidebar registration uses v2ex panel id and disposes pending work', async () => {
   const registrations: Array<{ entry: Record<string, unknown>; component: React.ComponentType }> = [];
   const cleanups: Array<() => void> = [];
+  const localeSnapshot = { active: 'zh' };
   const originalFetch = globalThis.fetch;
   let signal: AbortSignal | null = null;
   globalThis.fetch = async (_input, init) => {
@@ -109,7 +110,7 @@ test('sidebar registration uses v2ex panel id and disposes pending work', async 
   };
   const ctx = {
     effect: (factory: () => unknown) => { const value = factory(); if (typeof value === 'function') cleanups.push(value as () => void); },
-    locale: { register: () => () => {}, bind: () => () => 'V2EX' },
+    locale: { register: () => () => {}, bind: () => () => 'V2EX', getSnapshot: () => localeSnapshot, subscribe: () => () => {} },
     slots: { inject: (_name: string, factory: () => unknown) => factory(), register: (entry: Record<string, unknown>, component: React.ComponentType) => { registrations.push({ entry, component }); return () => {}; } },
   };
   try {
@@ -124,4 +125,66 @@ test('sidebar registration uses v2ex panel id and disposes pending work', async 
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('account status and token replacement stay visible without retaining the new token', async () => {
+  const api = remote(true);
+  api.session = async () => ({ ...account(true), tokenScope: 'read', expiresAt: '2027-01-01T00:00:00.000Z' });
+  let finishLogin!: (value: AccountStatus) => void;
+  api.login = async () => new Promise(resolve => { finishLogin = resolve; });
+  const store = new V2exClientStore(api);
+  await store.loadSession();
+  render(<V2exApp store={store} />);
+  assert.ok(screen.getByText(/令牌权限: read/));
+  assert.ok(screen.getByText(/2027/));
+  fireEvent.click(screen.getByRole('button', { name: '更换令牌' }));
+  const input = screen.getByLabelText('V2EX Personal Access Token') as HTMLInputElement;
+  fireEvent.change(input, { target: { value: 'replacement-secret' } });
+  fireEvent.submit(input.closest('form')!);
+  assert.equal(input.value, '');
+  assert.equal(JSON.stringify(store.getSnapshot()).includes('replacement-secret'), false);
+  await act(async () => { finishLogin(account(true)); });
+  store.dispose();
+});
+
+test('latest view filters fetched topics by local keyword and node', async () => {
+  const api = remote(true);
+  const other = { ...item, id: 8, title: 'Rust', node: { name: 'rust', title: 'Rust' } };
+  api.latest = async () => cached<TopicPage>({ items: [item, other], page: 1, hasMore: false, stale: false });
+  const store = new V2exClientStore(api);
+  await store.loadSession();
+  await store.loadLatest();
+  render(<V2exApp store={store} />);
+  fireEvent.change(screen.getByLabelText('关键词'), { target: { value: 'Rust' } });
+  assert.equal(screen.queryByRole('button', { name: /TypeScript/ }), null);
+  assert.ok(screen.getByRole('button', { name: /Rust/ }));
+  fireEvent.change(screen.getByLabelText('筛选节点'), { target: { value: 'dev' } });
+  assert.equal(screen.queryByRole('button', { name: /Rust/ }), null);
+  store.dispose();
+});
+
+test('English copy follows the supplied DSH locale snapshot', async () => {
+  const store = new V2exClientStore(remote(true));
+  await store.loadSession();
+  const snapshot = { active: 'en' };
+  const locale = { getSnapshot: () => snapshot, subscribe: () => () => {} };
+  render(<V2exApp store={store} locale={locale} />);
+  assert.ok(screen.getByRole('button', { name: 'Latest' }));
+  assert.ok(screen.getByRole('button', { name: 'Log out' }));
+  store.dispose();
+});
+
+test('DSH locale changes update the mounted UI without resetting browsing state', async () => {
+  const store = new V2exClientStore(remote(true));
+  await store.loadSession();
+  await store.loadLatest();
+  let snapshot = { active: 'zh' };
+  let notify = () => {};
+  const locale = { getSnapshot: () => snapshot, subscribe: (listener: () => void) => { notify = listener; return () => { notify = () => {}; }; } };
+  render(<V2exApp store={store} locale={locale} />);
+  assert.ok(screen.getByRole('button', { name: '最新' }));
+  await act(async () => { snapshot = { active: 'en' }; notify(); });
+  assert.ok(screen.getByRole('button', { name: 'Latest' }));
+  assert.ok(screen.getByRole('button', { name: /TypeScript/ }));
+  store.dispose();
 });
