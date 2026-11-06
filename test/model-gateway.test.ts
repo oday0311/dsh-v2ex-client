@@ -59,17 +59,48 @@ test('joins sequential documented text blocks', async () => {
   assert.deepEqual(await fixture(chunks).gateway.completeJson(request), { answer: 'yes' });
 });
 
-test('assembles interleaved text blocks in block-index order', async () => {
+test('assembles interleaved text blocks in first-seen start order', async () => {
   const chunks = [
     { type: 'block-start', index: 1, blockType: 'text' },
     { type: 'block-start', index: 0, blockType: 'text' },
-    { type: 'text-delta', index: 1, text: '"yes"}' },
-    { type: 'text-delta', index: 0, text: '{"answer":' },
-    { type: 'block-end', index: 1, block: { type: 'text', text: '"yes"}' } },
-    { type: 'block-end', index: 0, block: { type: 'text', text: '{"answer":' } },
+    { type: 'text-delta', index: 0, text: '"yes"}' },
+    { type: 'text-delta', index: 1, text: '{"answer":' },
+    { type: 'block-end', index: 0, block: { type: 'text', text: '"yes"}' } },
+    { type: 'block-end', index: 1, block: { type: 'text', text: '{"answer":' } },
     { type: 'finish', reason: { kind: 'stop' } },
   ];
   assert.deepEqual(await fixture(chunks).gateway.completeJson(request), { answer: 'yes' });
+});
+
+test('reverse and nonconsecutive indexes retain first-seen text order', async () => {
+  const chunks = [
+    { type: 'block-start', index: 9, blockType: 'text' },
+    { type: 'block-start', index: 2, blockType: 'text' },
+    { type: 'text-delta', index: 2, text: '"yes"}' },
+    { type: 'text-delta', index: 9, text: '{"answer":' },
+    { type: 'block-end', index: 2, block: { type: 'text', text: '"yes"}' } },
+    { type: 'block-end', index: 9, block: { type: 'text', text: '{"answer":' } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ];
+  assert.deepEqual(await fixture(chunks).gateway.completeJson(request), { answer: 'yes' });
+});
+
+test('malformed runtime chunk shapes are invalid_response, provider exceptions are ai_unavailable', async () => {
+  for (const chunks of [
+    [null], [{ type: 'block-start', blockType: 'text' }],
+    [{ type: 'block-start', index: 0 }],
+    [{ type: 'block-start', index: 0, blockType: 'text' }, { type: 'text-delta', index: 0 }],
+    [{ type: 'block-start', index: 0, blockType: 'text' }, { type: 'block-end', index: 0 }],
+    [{ type: 'finish' }], [{ type: 'finish', reason: null }],
+    [{ type: 'finish', reason: { kind: 'error' } }],
+  ]) await assert.rejects(fixture(chunks).gateway.completeJson(request), { code: 'invalid_response' });
+  const gateway = new DshModelGateway({
+    agentDefaultModel: { currentSelection: () => ({ provider: 'p', model: 'm' }) },
+    llm: { async *stream() { throw new Error('secret provider failure'); } },
+  } as never);
+  await assert.rejects(gateway.completeJson(request), { code: 'ai_unavailable' });
+  const aborted = fixture([{ type: 'finish', reason: { kind: 'aborted', failure: { code: 'ABORTED', message: 'secret' } } }]);
+  await assert.rejects(aborted.gateway.completeJson(request), { code: 'timeout' });
 });
 
 test('rejects malformed interleaved block lifecycles', async () => {
@@ -102,7 +133,7 @@ test('deep parsed JSON fails with a stable error instead of overflowing Unicode 
 
 test('maps missing services/provider failures and abort without leaking details', async () => {
   await assert.rejects(new DshModelGateway({} as never).completeJson(request), { code: 'ai_unavailable' });
-  await assert.rejects(fixture([{ type: 'finish', reason: { kind: 'error', failure: { message: 'secret' } } }]).gateway.completeJson(request),
+  await assert.rejects(fixture([{ type: 'finish', reason: { kind: 'error', failure: { code: 'AUTH', message: 'secret' } } }]).gateway.completeJson(request),
     (error: unknown) => (error as Error).message.includes('secret') === false);
   const controller = new AbortController(); controller.abort();
   await assert.rejects(fixture(textChunks('{"answer":"yes"}')).gateway.completeJson({ ...request, signal: controller.signal }), { code: 'timeout' });

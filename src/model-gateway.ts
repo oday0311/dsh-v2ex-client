@@ -8,6 +8,10 @@ const MAX_INPUT_BYTES = 32 * 1024;
 const MAX_OUTPUT_BYTES = 16 * 1024;
 const MAX_OUTPUT_TOKENS = 1024;
 const wellFormed = (value: string) => decoder.decode(encoder.encode(value)) === value;
+const record = (value: unknown): value is Record<string, unknown> =>
+  value !== null && typeof value === 'object' && !Array.isArray(value);
+const blockIndex = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
 
 function validUnicode(value: unknown): boolean {
   const ancestors = new WeakSet<object>();
@@ -104,45 +108,64 @@ export class DshModelGateway implements ModelGateway {
     };
     const blocks = new Map<number, { text: string; closed: boolean }>();
     let finished = false;
+    let protocolError = false;
     try {
-      for await (const chunk of llm.stream(options)) {
-        if (request.signal?.aborted) throw new V2exError('timeout');
-        if (finished) throw new V2exError('invalid_response');
-        if (chunk.type === 'block-start') {
-          if (chunk.blockType !== 'text' || !Number.isSafeInteger(chunk.index) || chunk.index < 0 ||
-            blocks.has(chunk.index) || blocks.size >= 64) throw new V2exError('invalid_response');
-          blocks.set(chunk.index, { text: '', closed: false });
-        } else if (chunk.type === 'text-delta') {
-          const block = blocks.get(chunk.index);
-          if (!block || block.closed || typeof chunk.text !== 'string') throw new V2exError('invalid_response');
-          block.text += chunk.text;
-          if (encoder.encode([...blocks.values()].map(value => value.text).join('')).byteLength > MAX_OUTPUT_BYTES) {
+      for await (const raw of llm.stream(options)) {
+        try {
+          if (request.signal?.aborted) throw new V2exError('timeout');
+          if (finished || !record(raw)) throw new V2exError('invalid_response');
+          const chunk = raw as Record<string, unknown>;
+          if (chunk.type === 'block-start') {
+            if (chunk.blockType !== 'text' || !blockIndex(chunk.index) ||
+              blocks.has(chunk.index) || blocks.size >= 64) throw new V2exError('invalid_response');
+            blocks.set(chunk.index, { text: '', closed: false });
+          } else if (chunk.type === 'text-delta') {
+            if (!blockIndex(chunk.index) || typeof chunk.text !== 'string') throw new V2exError('invalid_response');
+            const block = blocks.get(chunk.index);
+            if (!block || block.closed) throw new V2exError('invalid_response');
+            block.text += chunk.text;
+            if (encoder.encode([...blocks.values()].map(value => value.text).join('')).byteLength > MAX_OUTPUT_BYTES) {
+              throw new V2exError('invalid_response');
+            }
+          } else if (chunk.type === 'block-end') {
+            if (!blockIndex(chunk.index) || !record(chunk.block) ||
+              chunk.block.type !== 'text' || typeof chunk.block.text !== 'string') {
+              throw new V2exError('invalid_response');
+            }
+            const block = blocks.get(chunk.index);
+            if (!block || block.closed || chunk.block.text !== block.text) throw new V2exError('invalid_response');
+            block.closed = true;
+          } else if (chunk.type === 'finish') {
+            if (!record(chunk.reason) || typeof chunk.reason.kind !== 'string') {
+              throw new V2exError('invalid_response');
+            }
+            const reason = chunk.reason;
+            if (reason.kind === 'aborted' || reason.kind === 'error') {
+              if (!record(reason.failure) || typeof reason.failure.code !== 'string' ||
+                typeof reason.failure.message !== 'string') throw new V2exError('invalid_response');
+              throw new V2exError(reason.kind === 'aborted' ? 'timeout' : 'ai_unavailable');
+            }
+            if (reason.kind !== 'stop' || [...blocks.values()].some(block => !block.closed)) {
+              throw new V2exError('invalid_response');
+            }
+            finished = true;
+          } else if (chunk.type === 'usage') {
+            if (!record(chunk.usage)) throw new V2exError('invalid_response');
+          } else {
             throw new V2exError('invalid_response');
           }
-        } else if (chunk.type === 'block-end') {
-          const block = blocks.get(chunk.index);
-          if (!block || block.closed || chunk.block.type !== 'text' || chunk.block.text !== block.text) {
-            throw new V2exError('invalid_response');
-          }
-          block.closed = true;
-        } else if (chunk.type === 'finish') {
-          if (chunk.reason.kind === 'aborted' || request.signal?.aborted) throw new V2exError('timeout');
-          if (chunk.reason.kind === 'error') throw new V2exError('ai_unavailable');
-          if (chunk.reason.kind !== 'stop' || [...blocks.values()].some(block => !block.closed)) {
-            throw new V2exError('invalid_response');
-          }
-          finished = true;
-        } else if (chunk.type !== 'usage') {
-          throw new V2exError('invalid_response');
+        } catch (error) {
+          protocolError = true;
+          throw error instanceof V2exError ? error : new V2exError('invalid_response');
         }
       }
     } catch (error) {
-      if (error instanceof V2exError) throw error;
+      if (request.signal?.aborted) throw new V2exError('timeout');
+      if (protocolError && error instanceof V2exError) throw error;
       throw new V2exError(request.signal?.aborted ? 'timeout' : 'ai_unavailable');
     }
-    const ordered = [...blocks.entries()].sort(([left], [right]) => left - right);
-    if (ordered.some(([index], position) => index !== position)) throw new V2exError('invalid_response');
-    const output = ordered.map(([, block]) => block.text).join('');
+    if (request.signal?.aborted) throw new V2exError('timeout');
+    const output = [...blocks.values()].map(block => block.text).join('');
     if (!finished || !output.trim() || !wellFormed(output) ||
       encoder.encode(output).byteLength > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
     let parsed: unknown;

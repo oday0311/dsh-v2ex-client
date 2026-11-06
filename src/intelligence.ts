@@ -36,6 +36,7 @@ export class IntelligenceService {
 
   async summarizeTopic(input: { topic: TopicThread; mode: SummaryMode }, signal?: AbortSignal): Promise<TopicAiSummary> {
     if (!(input.mode in modes) || !Number.isSafeInteger(input.topic.topic.id) || input.topic.topic.id < 1 ||
+      !Number.isSafeInteger(input.topic.topic.replyCount) || input.topic.topic.replyCount < 0 ||
       !Number.isSafeInteger(input.topic.replyPage) || input.topic.replyPage < 0 || input.topic.replyPage > 10) {
       throw new V2exError('invalid_request');
     }
