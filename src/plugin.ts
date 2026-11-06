@@ -10,6 +10,8 @@ import { DshModelGateway } from './model-gateway.js';
 import { IntelligenceService } from './intelligence.js';
 import { InterestService } from './interests.js';
 import { RecommendationService } from './recommendations.js';
+import { RefreshService } from './refresh.js';
+import { DshReminderSink } from './reminders.js';
 import { DshHistoryReader } from './history.js';
 import { registerV2exHttpRoutes, type FetchConnection } from './http-routes.js';
 import type { Domain } from '@deepseek-ai/dsh-storage-domain';
@@ -25,6 +27,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     llm?: unknown;
     agentDefaultModel?: unknown;
     sessionQuery?: unknown;
+    on?: (name: string, listener: (this: unknown, payload: unknown) => void) => (() => unknown) | unknown;
   };
   if (!host.credentials || !host.storageDomain || !host.tools) {
     throw new V2exError('incompatible_runtime');
@@ -47,7 +50,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       get llm() { return optional('llm'); },
       get agentDefaultModel() { return optional('agentDefaultModel'); },
     } as never);
-    let auth!: AuthService;
+    let auth!: AuthService; let refresh!: RefreshService;
     const identity = {
       withRead: <T>(operation: (lease: import('./credentials.js').IdentityLease) => Promise<T>) => auth.withRead(operation),
       withMutation: <T>(operation: (lease: import('./credentials.js').IdentityLease, guard: import('./credentials.js').IdentityMutationGuard) => Promise<T>, expected?: import('./credentials.js').IdentityLease) =>
@@ -59,13 +62,17 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     }), model, undefined, identity);
     let recommendations!: RecommendationService;
     auth = new AuthService(api, vault, async (account) => {
-      await (account ? Promise.all([interests.clear(account), recommendations.clear(account)]) :
+      await (account ? Promise.all([interests.clear(account), recommendations.clear(account), refresh.clear(account)]) :
         Promise.all([interests.clearLegacy(), recommendations.clearLegacy()]));
     });
-    const service = new ContentService(api, vault,
-      new ContentCache(store), new RequestBudget());
+    const budget = new RequestBudget();
+    const service = new ContentService(api, vault, new ContentCache(store), budget);
     const intelligence = new IntelligenceService(model, store);
     recommendations = new RecommendationService(store, intelligence, identity, undefined, interests);
+    const reminders = new DshReminderSink();
+    disposers.push(reminders.bind(host));
+    refresh = new RefreshService({ store, content: service, recommendations, budget, identity, reminders });
+    await refresh.start(); disposers.push(() => refresh.dispose());
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));

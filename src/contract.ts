@@ -23,7 +23,7 @@ export interface PluginSettings {
   pagesPerNode: number;
   aiCandidateBudget: number;
   notificationThreshold: number;
-  quietHours: { start: string; end: string } | null;
+  quietHours: { start: string; end: string; timeZone: string } | null;
 }
 
 export interface TopicListItem {
@@ -139,8 +139,10 @@ export interface ContentStore {
   getCache(key: string): Promise<CacheRecord | undefined>;
   putCache(key: string, record: CacheRecord): Promise<void>;
   deleteCache(key: string): Promise<void>;
-  getSettings(): Promise<PluginSettings>;
-  putSettings(settings: PluginSettings): Promise<void>;
+  getSettings(scope?: string): Promise<PluginSettings>;
+  putSettings(settings: PluginSettings, scope?: string): Promise<void>;
+  claimNotificationTopicIds(scope: string, topicIds: number[]): Promise<number[]>;
+  clearRefreshState(scope: string): Promise<void>;
   getProfile(scope?: string): Promise<InterestProfile | null>;
   putProfile(profile: InterestProfile, scope?: string): Promise<void>;
   clearProfile(scope?: string): Promise<void>;

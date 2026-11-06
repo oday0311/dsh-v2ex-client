@@ -1,0 +1,168 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import { RequestBudget } from '../src/cache.js';
+import type { IdentityLease, IdentityLeaseProvider } from '../src/credentials.js';
+import { RefreshService, isQuietTime, type RefreshClock } from '../src/refresh.js';
+import { FakeContentStore } from './helpers/fakes.js';
+import type { Recommendation, TopicListItem } from '../src/contract.js';
+import { accountScope } from '../src/account-scope.js';
+import { V2exError } from '../src/errors.js';
+
+const at = '2026-11-07T02:00:00.000Z';
+
+function topic(id: number, node = 'typescript'): TopicListItem {
+  return { id, title: `Topic ${id}`, node: { name: node, title: node }, author: { username: 'user' },
+    replyCount: 0, createdAt: at, lastReplyAt: at, url: `https://www.v2ex.com/t/${id}` };
+}
+
+function recommendation(id: number, score = 0.9, read = false): Recommendation {
+  return { topic: topic(id), score, reason: `Reason ${id}`, matchedInterests: ['TypeScript'],
+    generatedAt: at, read, feedback: null };
+}
+
+class MutableIdentity implements IdentityLeaseProvider {
+  account = 'alice'; generation = 1;
+  lease(): IdentityLease { return { account: this.account, scope: accountScope(this.account),
+    credentialFingerprint: `${this.account}-credential`, generation: this.generation }; }
+  switch(account: string) { this.account = account; this.generation++; }
+  private same(a: IdentityLease, b: IdentityLease) { return a.account === b.account && a.scope === b.scope &&
+    a.credentialFingerprint === b.credentialFingerprint && a.generation === b.generation; }
+  async withRead<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T> {
+    const lease = this.lease(); const value = await operation(lease);
+    if (!this.same(lease, this.lease())) throw new V2exError('not_authenticated');
+    return value;
+  }
+  async withMutation<T>(operation: (lease: IdentityLease, guard: never) => Promise<T>, expected?: IdentityLease): Promise<T> {
+    const lease = this.lease();
+    if (expected && !this.same(expected, lease)) throw new V2exError('not_authenticated');
+    return operation(lease, undefined as never);
+  }
+}
+
+class ManualClock implements RefreshClock {
+  task?: () => void; disposed = 0;
+  constructor(public value = new Date(at)) {}
+  now() { return this.value; }
+  every(_ms: number, task: () => void) { this.task = task; return () => { this.disposed++; this.task = undefined; }; }
+}
+
+function fixture(options: { budget?: boolean; now?: Date; items?: Recommendation[] } = {}) {
+  const store = new FakeContentStore(); const identity = new MutableIdentity(); const clock = new ManualClock(options.now ?? new Date(at));
+  store.accountProfiles.set(accountScope('alice'), { profile: { authorized: true, learningPaused: false,
+    labels: [{ name: 'TypeScript', weight: 1 }], preferredNodes: [{ name: 'typescript', weight: 1 }],
+    exclusions: [], feedback: [], updatedAt: at, source: 'history' }, edits: { labels: false, preferredNodes: false, exclusions: false } });
+  const budget = new RequestBudget({ reserveForInteractive: 2 });
+  budget.update({ limit: 100, remaining: options.budget === false ? 2 : 90, resetAt: Date.parse('2026-11-08T00:00:00Z') });
+  const contentCalls: Array<[string, number?]> = [];
+  const content = {
+    async latest(_input: { page: number }, _signal?: AbortSignal, kind?: string) {
+      contentCalls.push(['latest']); assert.equal(kind, 'background');
+      return { value: { items: [topic(1), topic(2)], page: 1, hasMore: false, stale: false } };
+    },
+    async nodeTopics(input: { node: string; page: number }, _signal?: AbortSignal, kind?: string) {
+      contentCalls.push([input.node, input.page]); assert.equal(kind, 'background');
+      return { value: { items: [topic(2, input.node), topic(input.page + 2, input.node)], page: input.page, hasMore: false, stale: false } };
+    },
+  };
+  let refreshCalls = 0; let release: (() => void) | undefined;
+  const recommender = {
+    hold: false,
+    async refreshCandidates(_candidates: TopicListItem[], signal?: AbortSignal, expected?: IdentityLease) {
+      refreshCalls++; assert.equal(expected?.account, 'alice');
+      if (this.hold) await new Promise<void>((resolve, reject) => {
+        release = resolve; signal?.addEventListener('abort', () => reject(new V2exError('timeout')), { once: true });
+      });
+      return { items: options.items ?? [recommendation(1)], consideredTopicIds: [1], generatedAt: at,
+        stale: false, source: 'generated' as const };
+    },
+  };
+  const notices: Recommendation[][] = [];
+  const reminders = { async notify(items: readonly Recommendation[]) { notices.push([...items]); } };
+  const service = new RefreshService({ store, content, recommendations: recommender, budget, identity, reminders, clock });
+  return { service, store, identity, clock, budget, contentCalls, recommender, notices,
+    get refreshCalls() { return refreshCalls; }, release: () => release?.() };
+}
+
+test('timer skips all content and model work near the V2EX rate limit', async () => {
+  const f = fixture({ budget: false });
+  await f.service.runNow('timer');
+  assert.deepEqual(f.contentCalls, []);
+  assert.equal(f.refreshCalls, 0);
+});
+
+test('concurrent timer and manual triggers join one serialized run', async () => {
+  const f = fixture(); f.recommender.hold = true;
+  const first = f.service.runNow('timer');
+  while (!f.refreshCalls) await Promise.resolve();
+  const second = f.service.runNow('manual');
+  assert.strictEqual(second, first);
+  f.release(); await Promise.all([first, second]);
+  assert.equal(f.refreshCalls, 1);
+});
+
+test('refresh scans latest and no more than two bounded pages per deduped preferred node', async () => {
+  const f = fixture();
+  f.store.settings = { ...f.store.settings, scannedNodes: ['typescript', 'rust'], pagesPerNode: 1000 };
+  await f.service.runNow('manual');
+  assert.deepEqual(f.contentCalls, [['latest'], ['typescript', 1], ['typescript', 2], ['rust', 1], ['rust', 2]]);
+});
+
+test('quiet hours use the configured timezone and work across midnight', () => {
+  const quiet = { start: '22:30', end: '07:15', timeZone: 'Asia/Shanghai' };
+  assert.equal(isQuietTime(new Date('2026-11-06T15:00:00Z'), quiet), true);
+  assert.equal(isQuietTime(new Date('2026-11-06T22:30:00Z'), quiet), true);
+  assert.equal(isQuietTime(new Date('2026-11-07T04:00:00Z'), quiet), false);
+  assert.equal(isQuietTime(new Date('2026-11-07T04:00:00Z'), { start: '10:00', end: '10:00', timeZone: 'UTC' }), false);
+});
+
+test('only new unread recommendations above threshold are claimed and notified once durably', async () => {
+  const f = fixture({ items: [recommendation(1, 0.9), recommendation(2, 0.6), recommendation(3, 1, true)] });
+  f.store.settings = { ...f.store.settings, notificationThreshold: 0.7 };
+  await f.service.runNow('timer'); await f.service.runNow('timer');
+  assert.deepEqual(f.notices.map(batch => batch.map(item => item.topic.id)), [[1]]);
+  assert.deepEqual(await f.store.claimNotificationTopicIds(accountScope('alice'), [1]), []);
+});
+
+test('quiet hours still refresh recommendations but suppress notices', async () => {
+  const f = fixture({ now: new Date('2026-11-06T15:00:00Z') });
+  f.store.settings = { ...f.store.settings, quietHours: { start: '22:00', end: '07:00', timeZone: 'Asia/Shanghai' } };
+  await f.service.runNow('timer');
+  assert.equal(f.refreshCalls, 1); assert.deepEqual(f.notices, []);
+});
+
+test('account replacement before publication prevents stale notification', async () => {
+  const f = fixture(); f.recommender.hold = true;
+  const running = f.service.runNow('timer'); while (!f.refreshCalls) await Promise.resolve();
+  f.identity.switch('bob'); f.release();
+  await assert.rejects(running, { code: 'not_authenticated' });
+  assert.deepEqual(f.notices, []);
+});
+
+test('clear and dispose abort active work, remove account refresh state, and are idempotent', async () => {
+  const f = fixture(); f.recommender.hold = true;
+  await f.store.claimNotificationTopicIds(accountScope('alice'), [99]);
+  const running = f.service.runNow('timer'); while (!f.refreshCalls) await Promise.resolve();
+  await f.service.clear('alice');
+  await assert.rejects(running, { code: 'timeout' });
+  assert.deepEqual(await f.store.claimNotificationTopicIds(accountScope('alice'), [99]), [99]);
+  await f.service.start();
+  const first = f.service.dispose(); const second = f.service.dispose();
+  assert.strictEqual(first, second); await first; assert.equal(f.clock.disposed, 1);
+});
+
+test('clear immediately after scheduling prevents later content or model work', async () => {
+  const f = fixture();
+  const running = f.service.runNow('timer');
+  await f.service.clear('alice');
+  await assert.rejects(running, { code: 'timeout' });
+  assert.deepEqual(f.contentCalls, []); assert.equal(f.refreshCalls, 0);
+});
+
+test('timer callbacks contain rejected refreshes without an unhandled promise', async () => {
+  const f = fixture();
+  f.store.getSettings = async () => { throw new Error('private storage detail'); };
+  await f.service.start();
+  assert.doesNotThrow(() => f.clock.task?.());
+  await new Promise(resolve => setImmediate(resolve));
+  await f.service.dispose();
+});

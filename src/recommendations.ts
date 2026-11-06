@@ -78,10 +78,14 @@ export class RecommendationService {
 
   clearLegacy(): Promise<void> { return this.store.clearLegacyRecommendations(); }
 
-  async refreshCandidates(candidates: TopicListItem[], signal?: AbortSignal): Promise<RecommendationRefresh> {
+  async refreshCandidates(candidates: TopicListItem[], signal?: AbortSignal, expectedLease?: IdentityLease): Promise<RecommendationRefresh> {
     if (!Array.isArray(candidates) || candidates.length > MAX_CANDIDATES) throw new V2exError('invalid_request');
     const loaded = await this.identity.withRead(async lease => {
-      try { const [profile, settings, snapshot] = await Promise.all([this.store.getProfile(lease.scope), this.store.getSettings(),
+      if (expectedLease && (lease.account !== expectedLease.account || lease.scope !== expectedLease.scope ||
+        lease.credentialFingerprint !== expectedLease.credentialFingerprint || lease.generation !== expectedLease.generation)) {
+        throw new V2exError('not_authenticated');
+      }
+      try { const [profile, settings, snapshot] = await Promise.all([this.store.getProfile(lease.scope), this.store.getSettings(lease.scope),
         this.store.getRecommendationSnapshot(lease.scope)]); return { lease, profile, settings, stored: snapshot?.items ?? [] }; }
       catch { throw new V2exError('ai_unavailable'); }
     });
@@ -166,7 +170,7 @@ export class RecommendationService {
     return this.identity.withRead(async lease => {
       let interval: number; let snapshot; let profile: InterestProfile | null;
       try { [snapshot, interval, profile] = await Promise.all([this.store.getRecommendationSnapshot(lease.scope),
-        this.store.getSettings().then(value => value.refreshIntervalMinutes), this.store.getProfile(lease.scope)]); }
+        this.store.getSettings(lease.scope).then(value => value.refreshIntervalMinutes), this.store.getProfile(lease.scope)]); }
       catch { throw new V2exError('ai_unavailable'); }
       let items = snapshot?.items ?? []; const batch = snapshot?.batch;
       const negative = new Set(profile?.feedback.filter(value => !value.interested).map(value => value.topicId) ?? []);

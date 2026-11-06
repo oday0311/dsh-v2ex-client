@@ -39,6 +39,8 @@ export class FakeContentStore implements ContentStore {
   readonly migratedRecommendationScopes = new Set<string>();
   readonly accountProfiles = new Map<string, { profile: InterestProfile; edits: InterestEditFlags }>();
   readonly summaries = new Map<string, TopicAiSummary>();
+  readonly accountSettings = new Map<string, PluginSettings>();
+  readonly notificationStates = new Map<string, number[]>();
   beforeRecommendationSnapshot?: () => Promise<void>;
   beforeRecommendationPublish?: () => Promise<void>;
   beforeProfileRead?: () => Promise<void>;
@@ -57,8 +59,14 @@ export class FakeContentStore implements ContentStore {
   async getCache(key: string) { return this.cache.get(key); }
   async putCache(key: string, value: CacheRecord) { this.cache.set(key, value); }
   async deleteCache(key: string) { this.cache.delete(key); }
-  async getSettings() { return this.settings; }
-  async putSettings(value: PluginSettings) { this.settings = value; }
+  async getSettings(scope?: string) { return scope ? this.accountSettings.get(scope) ?? this.settings : this.settings; }
+  async putSettings(value: PluginSettings, scope?: string) { if (scope) this.accountSettings.set(scope, value); else this.settings = value; }
+  async claimNotificationTopicIds(scope: string, topicIds: number[]) {
+    const previous = this.notificationStates.get(scope) ?? []; const seen = new Set(previous);
+    const claimed = [...new Set(topicIds)].filter(id => !seen.has(id));
+    this.notificationStates.set(scope, [...previous, ...claimed].slice(-500)); return claimed;
+  }
+  async clearRefreshState(scope: string) { this.accountSettings.delete(scope); this.notificationStates.delete(scope); }
   async getProfile(scope?: string) { await this.beforeProfileRead?.(); return scope ? this.accountProfiles.get(scope)?.profile ?? null : this.profile; }
   async putProfile(value: InterestProfile, scope?: string) {
     if (scope) this.accountProfiles.set(scope, { profile: value, edits: this.accountProfiles.get(scope)?.edits ?? { labels: false, preferredNodes: false, exclusions: false } });

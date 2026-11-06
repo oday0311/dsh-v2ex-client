@@ -7,6 +7,20 @@ import { assertPage, assertTopicId } from './validation.js';
 const timestamp = z.iso.datetime({ offset: true });
 const nodeName = z.string().regex(/^[A-Za-z0-9_-]{1,64}$/);
 const topicId = z.number().int().positive().safe();
+const NOTIFICATION_BYTES = 2048;
+const NOTIFICATION_BITS = BigInt(NOTIFICATION_BYTES * 8);
+
+function notificationPositions(id: number): number[] {
+  const value = BigInt(id);
+  return [0x9e3779b1n, 0x85ebca6bn, 0xc2b2ae35n].map((seed, index) =>
+    Number((value * seed + BigInt(index + 1) * 0x27d4eb2fn) % NOTIFICATION_BITS));
+}
+
+function encodeNotificationIds(ids: readonly number[]): string {
+  const bits = Buffer.alloc(NOTIFICATION_BYTES);
+  for (const id of ids) for (const position of notificationPositions(id)) bits[position >> 3] |= 1 << (position & 7);
+  return bits.toString('base64');
+}
 
 export const PluginSettingsSchema = z.strictObject({
   refreshIntervalMinutes: z.number().int().min(1).max(1440),
@@ -14,7 +28,11 @@ export const PluginSettingsSchema = z.strictObject({
   pagesPerNode: z.number().int().min(1).max(1000),
   aiCandidateBudget: z.number().int().min(0).max(100),
   notificationThreshold: z.number().min(0).max(1),
-  quietHours: z.strictObject({ start: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), end: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/) }).nullable(),
+  quietHours: z.strictObject({ start: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+    end: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
+    timeZone: z.string().min(1).max(100).refine(value => {
+      try { new Intl.DateTimeFormat('en-US', { timeZone: value }).format(); return true; } catch { return false; }
+    }).default('UTC') }).nullable(),
 });
 
 const WeightedLabelSchema = z.strictObject({ name: z.string().trim().min(1).max(80), weight: z.number().finite().min(0).max(1) });
@@ -90,6 +108,15 @@ const RecommendationSnapshotsSchema = z.record(accountScope, RecommendationSnaps
   .refine(value => Object.keys(value).length <= 20);
 const MigratedRecommendationScopesSchema = z.record(accountScope, z.literal(true))
   .refine(value => Object.keys(value).length <= 20);
+const AccountSettingsSchema = z.record(accountScope, PluginSettingsSchema)
+  .refine(value => Object.keys(value).length <= 20);
+const NotificationBitmapSchema = z.string().refine(value => {
+  try { const decoded = Buffer.from(value, 'base64'); return decoded.length === NOTIFICATION_BYTES && decoded.toString('base64') === value; }
+  catch { return false; }
+});
+const NotificationStatesSchema = z.record(accountScope,
+  z.union([NotificationBitmapSchema, z.array(topicId).max(500).transform(encodeNotificationIds)]))
+  .refine(value => Object.keys(value).length <= 20);
 
 export const defaultSettings: PluginSettings = {
   refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
@@ -102,9 +129,11 @@ export const v2exDomainSpec = defineDomain({
     schema: z.strictObject({ settings: PluginSettingsSchema, profile: z.union([InterestProfileSchema, LegacyProfileSchema]).nullable(),
       profileEdits: InterestEditFlagsSchema.optional(), accountProfiles: AccountProfilesSchema.optional(),
       recommendationBatches: RecommendationBatchesSchema.optional(), recommendationSnapshots: RecommendationSnapshotsSchema.optional(),
-      migratedRecommendationScopes: MigratedRecommendationScopesSchema.optional() }),
+      migratedRecommendationScopes: MigratedRecommendationScopesSchema.optional(), accountSettings: AccountSettingsSchema.optional(),
+      notificationStates: NotificationStatesSchema.optional() }),
     initial: { settings: defaultSettings, profile: null as InterestProfile | null, profileEdits: noInterestEdits,
-      accountProfiles: {}, recommendationBatches: {}, recommendationSnapshots: {}, migratedRecommendationScopes: {} },
+      accountProfiles: {}, recommendationBatches: {}, recommendationSnapshots: {}, migratedRecommendationScopes: {},
+      accountSettings: {}, notificationStates: {} },
   },
   tables: {
     cache: domainTable<string, CacheRecord>(CacheRecordSchema),
@@ -141,6 +170,8 @@ interface GlobalState {
   recommendationBatches?: Record<string, RecommendationBatch>;
   recommendationSnapshots?: Record<string, RecommendationSnapshot>;
   migratedRecommendationScopes?: Record<string, true>;
+  accountSettings?: Record<string, PluginSettings>;
+  notificationStates?: Record<string, string>;
 }
 
 function scopedRecommendationKey(key: string): { scope: string; topicId: number } | null {
@@ -218,10 +249,41 @@ export class DomainContentStore implements ContentStore {
   async deleteCache(key: string): Promise<void> {
     await this.serialize('cache', () => this.domain.table('cache').delete(assertCacheKey(key)));
   }
-  async getSettings(): Promise<PluginSettings> { return structuredClone(this.domain.global.get().settings); }
-  async putSettings(settings: PluginSettings): Promise<void> {
+  async getSettings(scope?: string): Promise<PluginSettings> {
+    const current = this.domain.global.get() as GlobalState;
+    return structuredClone(scope === undefined ? current.settings : current.accountSettings?.[assertAccountScope(scope)] ?? defaultSettings);
+  }
+  async putSettings(settings: PluginSettings, scope?: string): Promise<void> {
     const parsed = parseWrite(PluginSettingsSchema, settings);
-    await this.updateGlobal((current) => ({ ...current, settings: parsed }));
+    if (scope === undefined) { await this.updateGlobal((current) => ({ ...current, settings: parsed })); return; }
+    const key = assertAccountScope(scope);
+    await this.updateGlobal((current) => ({ ...current, accountSettings: { ...(current.accountSettings ?? {}), [key]: parsed } }));
+  }
+  async claimNotificationTopicIds(scope: string, topicIds: number[]): Promise<number[]> {
+    const key = assertAccountScope(scope);
+    if (!Array.isArray(topicIds) || topicIds.length > 100 || topicIds.some(id => !topicId.safeParse(id).success)) {
+      throw new V2exError('invalid_request');
+    }
+    const unique = [...new Set(topicIds)]; let claimed: number[] = [];
+    await this.updateGlobal((current) => {
+      const bits = current.notificationStates?.[key] ? Buffer.from(current.notificationStates[key], 'base64') : Buffer.alloc(NOTIFICATION_BYTES);
+      claimed = unique.filter(id => {
+        const positions = notificationPositions(id);
+        if (positions.every(position => (bits[position >> 3]! & (1 << (position & 7))) !== 0)) return false;
+        for (const position of positions) bits[position >> 3] |= 1 << (position & 7);
+        return true;
+      });
+      return { ...current, notificationStates: { ...(current.notificationStates ?? {}), [key]: bits.toString('base64') } };
+    });
+    return claimed;
+  }
+  async clearRefreshState(scope: string): Promise<void> {
+    const key = assertAccountScope(scope);
+    await this.updateGlobal((current) => {
+      const accountSettings = { ...(current.accountSettings ?? {}) }; delete accountSettings[key];
+      const notificationStates = { ...(current.notificationStates ?? {}) }; delete notificationStates[key];
+      return { ...current, accountSettings, notificationStates };
+    });
   }
   async getProfile(scope?: string): Promise<InterestProfile | null> {
     if (scope !== undefined) {

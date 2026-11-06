@@ -66,7 +66,8 @@ export class ContentService {
     }
   }
 
-  private async load<T>(key: string, ttl: number, fetcher: (token: string, signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<Cached<T>> {
+  private async load<T>(key: string, ttl: number, fetcher: (token: string, signal: AbortSignal) => Promise<T>, signal?: AbortSignal,
+    kind: 'interactive' | 'background' = 'interactive'): Promise<Cached<T>> {
     if (signal?.aborted) throw new V2exError('timeout');
     let token: string | undefined;
     try { token = await this.vault.resolve(); }
@@ -91,7 +92,7 @@ export class ContentService {
         if (cached && !cached.stale) return cached;
         try {
           const value = await this.withSlot(controller.signal, async () => {
-            if (!this.budget.reserve('interactive')) throw new V2exError('budget_exhausted');
+            if (!this.budget.reserve(kind)) throw new V2exError('budget_exhausted');
             try { return await fetcher(token, controller.signal); }
             finally { this.budget.update(this.api.rateLimit); }
           });
@@ -134,12 +135,12 @@ export class ContentService {
     });
   }
 
-  latest(input: { page: number }, signal?: AbortSignal): Promise<Cached<TopicPage>> {
+  latest(input: { page: number }, signal?: AbortSignal, kind: 'interactive' | 'background' = 'interactive'): Promise<Cached<TopicPage>> {
     const page = assertPage(input.page);
     return this.load(`latest:${page}`, LIST_TTL, async (token, requestSignal) => {
       const topics = await this.api.latest(page, token, requestSignal);
       return { items: topics.map(item), page, hasMore: topics.length >= PAGE_SIZE, stale: false };
-    }, signal).then((result) => ({ ...result, value: { ...result.value, stale: result.stale } }));
+    }, signal, kind).then((result) => ({ ...result, value: { ...result.value, stale: result.stale } }));
   }
 
   hot(signal?: AbortSignal): Promise<Cached<TopicListItem[]>> {
@@ -156,13 +157,14 @@ export class ContentService {
     }, signal);
   }
 
-  nodeTopics(input: { node: string; page: number }, signal?: AbortSignal): Promise<Cached<TopicPage>> {
+  nodeTopics(input: { node: string; page: number }, signal?: AbortSignal,
+    kind: 'interactive' | 'background' = 'interactive'): Promise<Cached<TopicPage>> {
     const name = assertNodeName(input.node);
     const page = assertPage(input.page);
     return this.load(`node:${name}:${page}`, LIST_TTL, async (token, requestSignal) => {
       const topics = await this.api.nodeTopics(name, page, token, requestSignal);
       return { items: topics.map(item), page, hasMore: topics.length >= PAGE_SIZE, stale: false };
-    }, signal).then((result) => ({ ...result, value: { ...result.value, stale: result.stale } }));
+    }, signal, kind).then((result) => ({ ...result, value: { ...result.value, stale: result.stale } }));
   }
 
   replies(input: { topic: string; page: number }, signal?: AbortSignal): Promise<Cached<ReplyItem[]>> {

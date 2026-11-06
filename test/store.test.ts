@@ -4,6 +4,7 @@ import type { Domain } from '@deepseek-ai/dsh-storage-domain';
 import { DomainContentStore, v2exDomainSpec } from '../src/store.js';
 import type { Recommendation, TopicListItem } from '../src/contract.js';
 import { InterestService } from '../src/interests.js';
+import { accountScope } from '../src/account-scope.js';
 
 type TableName = 'cache' | 'summaries' | 'recommendations';
 function memoryDomain() {
@@ -157,6 +158,32 @@ test('concurrent settings and profile writes preserve both global fields', async
   await Promise.all([settingsWrite, profileWrite]);
   assert.equal((await store.getSettings()).refreshIntervalMinutes, 15);
   assert.deepEqual((await store.getProfile())?.preferredNodes, [{ name: 'tech', weight: 1 }]);
+});
+
+test('refresh settings and notification claims are durable and isolated by account', async () => {
+  const memory = memoryDomain(); const alice = accountScope('alice'); const bob = accountScope('bob');
+  const first = new DomainContentStore(memory.domain);
+  await first.putSettings({ ...(await first.getSettings(alice)), refreshIntervalMinutes: 15,
+    quietHours: { start: '22:00', end: '07:00', timeZone: 'Asia/Shanghai' } }, alice);
+  assert.equal((await first.getSettings(bob)).refreshIntervalMinutes, 30);
+  assert.deepEqual(await Promise.all([
+    first.claimNotificationTopicIds(alice, [1, 2]), first.claimNotificationTopicIds(alice, [2, 3]),
+  ]), [[1, 2], [3]]);
+  const reloaded = new DomainContentStore(memory.domain);
+  assert.equal((await reloaded.getSettings(alice)).refreshIntervalMinutes, 15);
+  assert.deepEqual(await reloaded.claimNotificationTopicIds(alice, [1, 2, 3, 4]), [4]);
+  assert.deepEqual(await reloaded.claimNotificationTopicIds(bob, [1]), [1]);
+  await reloaded.clearRefreshState(alice);
+  assert.equal((await reloaded.getSettings(alice)).refreshIntervalMinutes, 30);
+  assert.deepEqual(await reloaded.claimNotificationTopicIds(alice, [1]), [1]);
+  assert.deepEqual(await reloaded.claimNotificationTopicIds(bob, [1]), []);
+});
+
+test('failed durable notification claim is not reported as claimed', async () => {
+  const memory = memoryDomain(); const store = new DomainContentStore(memory.domain); const scope = accountScope('alice');
+  memory.failNextGlobalSet();
+  await assert.rejects(store.claimNotificationTopicIds(scope, [1]), /global set failed/);
+  assert.deepEqual(await store.claimNotificationTopicIds(scope, [1]), [1]);
 });
 
 test('legacy profile is read as unauthorized structured data without changing domain version', async () => {
