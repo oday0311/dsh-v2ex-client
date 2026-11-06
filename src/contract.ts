@@ -8,6 +8,13 @@ export interface AccountStatus {
   expiresAt: string | null;
 }
 
+export interface CredentialVault {
+  resolve(): Promise<string | undefined>;
+  set(value: string): Promise<void>;
+  clear(): Promise<void>;
+  describe(): Promise<{ configured: boolean; writable: boolean }>;
+}
+
 export interface PluginSettings {
   refreshIntervalMinutes: number;
   scannedNodes: string[];
