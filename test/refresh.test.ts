@@ -201,6 +201,58 @@ test('busy notice survives restart and drains from the official idle event', asy
   await restarted.dispose(); await ctx.fiber.dispose();
 });
 
+test('restart idle drain keeps pending notices through quiet hours and delivers once later', async () => {
+  const f = fixture({ now: new Date('2026-11-07T04:00:00Z') });
+  f.reminders.deliver = false; await f.service.runNow('timer'); await f.service.dispose();
+  const scope = accountScope('alice');
+  await f.store.putSettings({ ...f.store.settings,
+    quietHours: { start: '22:00', end: '07:00', timeZone: 'Asia/Shanghai' } }, scope);
+  f.clock.value = new Date('2026-11-06T15:00:00Z');
+  const ctx = new Context(); const sink = new DshReminderSink(); const unbind = sink.bind(ctx as never);
+  const messages: unknown[] = []; const agent = { status: 'running', async followup(message: unknown) { messages.push(message); } };
+  const restarted = new RefreshService({ store: f.store, content: {} as never, recommendations: {} as never,
+    budget: f.budget, identity: f.identity, reminders: sink, clock: f.clock });
+  const removeIdle = sink.onIdle(() => restarted.handleReminderIdle());
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'running' });
+  agent.status = 'idle';
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'idle' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(messages.length, 0);
+  assert.deepEqual((await f.store.getPendingNotifications(scope)).map(value => value.topicId), [1]);
+
+  f.identity.switch('bob'); f.clock.value = new Date('2026-11-07T04:00:00Z');
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'idle' });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(messages.length, 0);
+  f.identity.switch('alice');
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'idle' });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(messages.length, 1); assert.deepEqual(await f.store.getPendingNotifications(scope), []);
+  await restarted.dispose();
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent, status: 'idle' });
+  await new Promise(resolve => setImmediate(resolve)); assert.equal(messages.length, 1);
+  removeIdle(); unbind(); await ctx.fiber.dispose();
+});
+
+test('manual refresh drains an existing notice even when ranking returns no new items', async () => {
+  const f = fixture({ items: [] }); const scope = accountScope('alice');
+  await f.store.enqueuePendingNotifications(scope, [{ noticeId: '00000000-0000-4000-8000-000000000077',
+    topicId: 77, title: 'Existing topic', node: 'tech', reason: 'Relevant', createdAt: at }]);
+  await f.service.runNow('manual');
+  assert.deepEqual(f.notices.map(batch => batch.map(value => value.topicId)), [[77]]);
+  assert.deepEqual(await f.store.getPendingNotifications(scope), []);
+});
+
+test('Unicode-safe notice truncation does not make repeated refresh fail', async () => {
+  const boundary = { ...recommendation(1), topic: { ...recommendation(1).topic,
+    title: `${'x'.repeat(199)}😀\ud800ignored` } };
+  const f = fixture({ items: [boundary] });
+  await f.service.runNow('timer'); await f.service.runNow('timer');
+  assert.equal(f.notices.length, 1);
+  assert.equal(f.notices[0]![0]!.title.isWellFormed(), true);
+  assert.equal(Array.from(f.notices[0]![0]!.title).length, 200);
+  assert.equal(f.notices[0]![0]!.title.endsWith('😀'), true);
+});
+
 test('delivery storage failure keeps stable-id pending notice retryable without duplicate followup', async () => {
   const f = fixture(); let fail = true; const delivered = new Set<string>(); let userVisible = 0;
   f.reminders.notify = async (items) => { for (const item of items) if (!delivered.has(item.noticeId)) {

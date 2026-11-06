@@ -87,3 +87,34 @@ test('sanitization detects credential labels split across normalized outbound fi
   assert.equal(split.title, 'V2EX topic'); assert.equal(split.reason, 'Relevant to your V2EX interests');
   assert.doesNotMatch(JSON.stringify(split), /FAKE_LONG_VALUE/);
 });
+
+test('canonical outbound scan catches split secret and provider shapes', () => {
+  const variants: Recommendation[] = [
+    { ...item, topic: { ...item.topic, title: 'to\u0000ken=FAKE_LONG_VALUE_12345678' } },
+    { ...item, reason: 'pro\u0000vider error detail' },
+    { ...item, topic: { ...item.topic, title: 'tok', node: { ...item.topic.node, name: 'en' } },
+      reason: '= FAKE_LONG_VALUE_12345678' },
+    { ...item, topic: { ...item.topic, title: 'bea', node: { ...item.topic.node, name: 'rer' } },
+      reason: 'FAKE_LONG_VALUE_12345678' },
+    { ...item, reason: 'a\u0000pi-key: FAKE_LONG_VALUE_12345678' },
+    { ...item, topic: { ...item.topic, title: '12345678-1234', node: { ...item.topic.node, name: '5678' } },
+      reason: '90ab-cdef12345678' },
+  ];
+  for (const variant of variants) {
+    const notice = createReminderNotice(variant); const serialized = JSON.stringify(notice);
+    assert.equal(notice.title, 'V2EX topic'); assert.equal(notice.node, 'unknown');
+    assert.equal(notice.reason, 'Relevant to your V2EX interests');
+    assert.doesNotMatch(serialized, /FAKE_LONG_VALUE|provider error|12345678-1234/i);
+  }
+});
+
+test('notice truncation is Unicode-safe after malformed input repair', async () => {
+  const notice = createReminderNotice({ ...item, topic: { ...item.topic,
+    title: `${'x'.repeat(199)}😀\ud800ignored` }, reason: 'safe\udc00reason' });
+  assert.equal(notice.title.isWellFormed(), true); assert.equal(notice.reason.isWellFormed(), true);
+  assert.equal(Array.from(notice.title).length, 200); assert.equal(notice.title.endsWith('😀'), true);
+  const ctx = new Context(); const sink = new DshReminderSink(); const target = agent(); sink.bind(ctx as never);
+  emit(ctx, 'agent/status', { agent: target, status: 'running' });
+  assert.deepEqual(await sink.notify([notice]), [notice.noticeId]);
+  assert.match(JSON.stringify(target.messages[0]), /😀/); await ctx.fiber.dispose();
+});

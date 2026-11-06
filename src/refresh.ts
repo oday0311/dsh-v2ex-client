@@ -121,6 +121,8 @@ export class RefreshService {
     });
     const { lease, settings, profile } = loaded; this.schedule(settings.refreshIntervalMinutes);
     if (signal.aborted) throw new V2exError('timeout');
+    await this.drainPending(lease);
+    if (signal.aborted) throw new V2exError('timeout');
     if (!this.options.budget.canRunBackground(this.clock.now())) return;
 
     const candidates = new Map<number, TopicListItem>();
@@ -171,9 +173,13 @@ export class RefreshService {
     return delivery.promise;
   }
 
+  handleReminderIdle(): Promise<void> { return this.drainPending(); }
+
   private async deliverPending(signal: AbortSignal, expectedLease?: IdentityLease): Promise<void> {
     await this.options.identity.withMutation(async lease => {
       if (signal.aborted) throw new V2exError('timeout');
+      const settings = await this.options.store.getSettings(lease.scope);
+      if (settings.quietHours && isQuietTime(this.clock.now(), settings.quietHours)) return;
       const pending = await this.options.store.getPendingNotifications(lease.scope);
       if (!pending.length) return;
       const delivered = new Set(await abortAware(() => this.options.reminders.notify(pending, signal), signal));

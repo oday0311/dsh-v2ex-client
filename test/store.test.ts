@@ -203,6 +203,11 @@ test('pending reminder storage is bounded, deterministic, and rejects unsafe con
   assert.deepEqual((await store.getPendingNotifications(scope)).map(value => value.topicId), accepted.map(value => value.topicId));
   await assert.rejects(store.enqueuePendingNotifications(scope, [{ ...notice(30), title: 'token=\u0000FAKE_LONG_VALUE_12345678' }]),
     { code: 'invalid_request' });
+  await assert.rejects(store.enqueuePendingNotifications(scope, [{ ...notice(31), title: 'tok', node: 'en',
+    reason: '= FAKE_LONG_VALUE_12345678' }]), { code: 'invalid_request' });
+  const unicodeScope = accountScope('unicode'); const unicode = { ...notice(32), title: `${'x'.repeat(199)}😀` };
+  assert.deepEqual(await store.enqueuePendingNotifications(unicodeScope, [unicode]), [unicode]);
+  assert.equal((await store.getPendingNotifications(unicodeScope))[0]!.title.isWellFormed(), true);
 });
 
 test('legacy profile is read as unauthorized structured data without changing domain version', async () => {

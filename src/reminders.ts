@@ -2,14 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { createUserMessage, freezeMessage, type UserMessage } from '@deepseek-ai/dsh-llm';
 import type { PendingReminderNotice, Recommendation } from './contract.js';
 import type { ReminderSink } from './refresh.js';
+import { isUnsafeReminder, normalizeReminderText, reminderText } from './reminder-safety.js';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
     plugin: { readonly kind: 'plugin'; readonly plugin: string; readonly form: 'notice' };
   }
 }
-
-const unsafeOutbound = /(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{32,}|(?:bearer|token)[^A-Za-z0-9]{0,8}[A-Za-z0-9_-]{8,}|(?:provider|model|api|private)[^A-Za-z0-9]{0,8}(?:error|failure|exception))/i;
 
 interface AgentLike {
   readonly status?: unknown;
@@ -30,33 +29,14 @@ function rootAgent(value: unknown): value is AgentLike {
   } catch { return false; }
 }
 
-function normalize(value: string, limit: number): string {
-  let formed = '';
-  for (let index = 0; index < value.length; index++) {
-    const unit = value.charCodeAt(index);
-    if (unit >= 0xd800 && unit <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (next >= 0xdc00 && next <= 0xdfff) { formed += value[index]! + value[++index]!; continue; }
-      formed += '\ufffd'; continue;
-    }
-    formed += unit >= 0xdc00 && unit <= 0xdfff ? '\ufffd' : value[index]!;
-  }
-  return formed.normalize('NFKC').replace(/[\u0000-\u001f\u007f]/g, ' ')
-    .replace(/\s+/g, ' ').trim().slice(0, limit);
-}
-
-function noticeText(notice: Pick<PendingReminderNotice, 'title' | 'node' | 'reason'>): string {
-  return `V2EX recommendation:\n- ${notice.title} [${notice.node}]\n  ${notice.reason}`;
-}
-
 export function createReminderNotice(item: Recommendation): PendingReminderNotice {
-  let title = normalize(item.topic.title, 200) || 'V2EX topic';
-  let node = normalize(item.topic.node.name, 64) || 'unknown';
-  let reason = normalize(item.reason, 500) || 'Relevant to your V2EX interests';
-  if (unsafeOutbound.test(noticeText({ title, node, reason }))) {
-    title = 'V2EX topic'; node = 'unknown'; reason = 'Relevant to your V2EX interests';
-  }
-  return { noticeId: randomUUID(), topicId: item.topic.id, title, node, reason, createdAt: item.generatedAt };
+  const fallback = { title: 'V2EX topic', node: 'unknown', reason: 'Relevant to your V2EX interests' };
+  let fields = { title: normalizeReminderText(item.topic.title, 200) || fallback.title,
+    node: normalizeReminderText(item.topic.node.name, 64) || fallback.node,
+    reason: normalizeReminderText(item.reason, 500) || fallback.reason };
+  if (isUnsafeReminder(fields)) fields = fallback;
+  if (isUnsafeReminder(fields)) fields = { title: 'Topic', node: 'general', reason: 'Relevant' };
+  return { noticeId: randomUUID(), topicId: item.topic.id, ...fields, createdAt: item.generatedAt };
 }
 
 export class DshReminderSink implements ReminderSink {
@@ -111,8 +91,8 @@ export class DshReminderSink implements ReminderSink {
     const delivered: string[] = [];
     for (const notice of items.slice(0, 20)) {
       if (signal?.aborted || agent !== this.latest || this.disposedAgents.has(agent as object)) break;
-      const text = noticeText(notice);
-      if (unsafeOutbound.test(text)) continue;
+      if (isUnsafeReminder(notice)) continue;
+      const text = reminderText(notice);
       const generated = createUserMessage({ content: [{ type: 'text' as const, text }],
         source: { kind: 'plugin' as const, plugin: 'v2ex', form: 'notice' } });
       const message = freezeMessage({ ...generated, id: notice.noticeId } as unknown as UserMessage);
