@@ -10,6 +10,9 @@ function memoryDomain() {
     cache: new Map<string, unknown>(), summaries: new Map<string, unknown>(), recommendations: new Map<string, unknown>(),
   };
   let global = structuredClone(v2exDomainSpec.global.initial);
+  let failedPut: [TableName, string] | null = null;
+  let failedDelete: [TableName, string] | null = null;
+  let heldPut: { name: TableName; key: string; started: () => void; release: Promise<void> } | null = null;
   const domain = {
     global: { get: () => structuredClone(global), set: async (next: typeof global) => { global = structuredClone(next); } },
     table: (name: TableName) => ({
@@ -17,14 +20,42 @@ function memoryDomain() {
       entries: () => tables[name].entries(),
       keys: () => tables[name].keys(),
       get size() { return tables[name].size; },
-      put: async (key: string, value: unknown) => { tables[name].set(key, structuredClone(value)); },
-      delete: async (key: string) => tables[name].delete(key),
+      put: async (key: string, value: unknown) => {
+        if (heldPut?.name === name && heldPut.key === key) {
+          const held = heldPut;
+          heldPut = null;
+          held.started();
+          await held.release;
+        }
+        if (failedPut?.[0] === name && failedPut[1] === key) {
+          failedPut = null;
+          throw new Error('medium put failed');
+        }
+        tables[name].set(key, structuredClone(value));
+      },
+      delete: async (key: string) => {
+        if (failedDelete?.[0] === name && failedDelete[1] === key) {
+          failedDelete = null;
+          throw new Error('medium delete failed');
+        }
+        return tables[name].delete(key);
+      },
       update: async (key: string, fn: (value: unknown) => unknown) => {
         const next = fn(tables[name].get(key)); tables[name].set(key, structuredClone(next)); return next;
       },
     }),
   } as unknown as Domain<typeof v2exDomainSpec>;
-  return { domain, tables, readGlobal: () => global };
+  return { domain, tables, readGlobal: () => global,
+    failNextPut: (name: TableName, key: string) => { failedPut = [name, key]; },
+    failNextDelete: (name: TableName, key: string) => { failedDelete = [name, key]; },
+    holdNextPut: (name: TableName, key: string) => {
+      let signalStarted!: () => void;
+      let release!: () => void;
+      const started = new Promise<void>((resolve) => { signalStarted = resolve; });
+      const wait = new Promise<void>((resolve) => { release = resolve; });
+      heldPut = { name, key, started: signalStarted, release: wait };
+      return { started, release };
+    } };
 }
 
 const topic: TopicListItem = {
@@ -63,6 +94,30 @@ test('cache LRU bounds list and thread entries independently', async () => {
   for (let i = 1; i <= 301; i++) await store.putCache(`topic:${i}`, record);
   assert.equal(memory.tables.cache.size, 400);
   assert.equal(await store.getCache('topic:1'), undefined);
+});
+
+test('failed cache eviction prevents new durable record and never exceeds the cap', async () => {
+  const memory = memoryDomain();
+  const store = new DomainContentStore(memory.domain);
+  const record = { value: [], fetchedAt: '2026-11-06T00:00:00Z', expiresAt: '2026-11-06T00:01:00Z', accessedAt: '2026-11-06T00:00:00Z' };
+  for (let i = 1; i <= 100; i++) await store.putCache(`latest:${i}`, record);
+  memory.failNextDelete('cache', 'latest:1');
+  await assert.rejects(store.putCache('hot:1', record), /medium delete failed/);
+  assert.equal(memory.tables.cache.size, 100);
+  assert.equal(await store.getCache('hot:1'), undefined);
+  assert.ok(await store.getCache('latest:1'));
+});
+
+test('failed cache put restores the entry evicted to make room', async () => {
+  const memory = memoryDomain();
+  const store = new DomainContentStore(memory.domain);
+  const record = { value: [], fetchedAt: '2026-11-06T00:00:00Z', expiresAt: '2026-11-06T00:01:00Z', accessedAt: '2026-11-06T00:00:00Z' };
+  for (let i = 1; i <= 100; i++) await store.putCache(`latest:${i}`, record);
+  memory.failNextPut('cache', 'hot:1');
+  await assert.rejects(store.putCache('hot:1', record), /medium put failed/);
+  assert.equal(memory.tables.cache.size, 100);
+  assert.ok(await store.getCache('latest:1'));
+  assert.equal(await store.getCache('hot:1'), undefined);
 });
 
 test('settings and profile reject invalid writes before replacing durable global', async () => {
@@ -106,6 +161,23 @@ test('summary writes validate before replacement and evict oldest beyond 300', a
   assert.equal(await store.getSummary('1'), undefined);
 });
 
+test('summary and recommendation eviction failures do not create over-cap records', async () => {
+  const memory = memoryDomain();
+  const store = new DomainContentStore(memory.domain);
+  const summary = { topicId: 1, summary: 'Summary', viewpoints: [], notableReplies: [], generatedAt: '2026-11-06T00:00:00Z', coveredReplyPages: [1], completeDiscussion: false };
+  for (let i = 1; i <= 300; i++) await store.putSummary(String(i), { ...summary, topicId: i });
+  memory.failNextDelete('summaries', '1');
+  await assert.rejects(store.putSummary('301', { ...summary, topicId: 301 }), /medium delete failed/);
+  assert.equal(memory.tables.summaries.size, 300);
+  assert.equal(await store.getSummary('301'), undefined);
+
+  for (let i = 1; i <= 500; i++) await store.putRecommendation(String(i), { ...recommendation, topic: { ...topic, id: i } });
+  memory.failNextDelete('recommendations', '1');
+  await assert.rejects(store.putRecommendation('501', { ...recommendation, topic: { ...topic, id: 501 } }), /medium delete failed/);
+  assert.equal(memory.tables.recommendations.size, 500);
+  assert.equal(await store.getRecommendation('501'), undefined);
+});
+
 test('recommendations persist read state and enforce the table cap', async () => {
   const memory = memoryDomain();
   const store = new DomainContentStore(memory.domain);
@@ -115,4 +187,18 @@ test('recommendations persist read state and enforce the table cap', async () =>
   for (let i = 2; i <= 501; i++) await store.putRecommendation(String(i), { ...recommendation, topic: { ...topic, id: i } });
   assert.equal(memory.tables.recommendations.size, 500);
   assert.equal(await store.getRecommendation('1'), undefined);
+});
+
+test('a delayed mark-read write cannot restore an evicted recommendation', async () => {
+  const memory = memoryDomain();
+  const store = new DomainContentStore(memory.domain);
+  for (let i = 1; i <= 500; i++) await store.putRecommendation(String(i), { ...recommendation, topic: { ...topic, id: i } });
+  const held = memory.holdNextPut('recommendations', '1');
+  const read = store.markRead('1');
+  await held.started;
+  const insert = store.putRecommendation('501', { ...recommendation, topic: { ...topic, id: 501 } });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  held.release();
+  await Promise.all([read, insert]);
+  assert.equal(memory.tables.recommendations.size, 500);
 });

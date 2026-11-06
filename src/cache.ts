@@ -26,7 +26,8 @@ export class ContentCache {
     assertCacheKey(key);
     const pending = this.inflight.get(key);
     if (pending) return pending as Promise<Cached<T>>;
-    const request = Promise.resolve().then(fetcher).then((value) => this.writeSuccess(key, value, ttlMs));
+    const request = Promise.resolve().then(fetcher).then((value) => this.writeSuccess(key, value, ttlMs))
+      .catch((error: unknown) => { throw error instanceof V2exError ? error : new V2exError('upstream'); });
     this.inflight.set(key, request);
     void request.finally(() => this.inflight.delete(key)).catch(() => {});
     return request;
@@ -48,6 +49,7 @@ export class RequestBudget {
   private limit: number | null = null;
   private available: number | null = null;
   private resetTime: number | null = null;
+  private observedWindow: number | null = null;
   private readonly reserveForInteractive: number;
   constructor(options: { reserveForInteractive?: number } = {}) {
     this.reserveForInteractive = options.reserveForInteractive ?? 10;
@@ -55,13 +57,24 @@ export class RequestBudget {
   get remaining(): number | null { return this.available; }
 
   update(rateLimit: RateObservation): void {
-    if (rateLimit.limit !== null && Number.isSafeInteger(rateLimit.limit) && rateLimit.limit >= 0) this.limit = rateLimit.limit;
-    if (rateLimit.remaining !== null && Number.isSafeInteger(rateLimit.remaining) && rateLimit.remaining >= 0) this.available = rateLimit.remaining;
+    const limit = rateLimit.limit !== null && Number.isSafeInteger(rateLimit.limit) && rateLimit.limit >= 0 ? rateLimit.limit : null;
+    const remaining = rateLimit.remaining !== null && Number.isSafeInteger(rateLimit.remaining) && rateLimit.remaining >= 0 ? rateLimit.remaining : null;
+    let reset: number | null = null;
     if (rateLimit.resetAt !== null) {
       const value = typeof rateLimit.resetAt === 'number'
         ? rateLimit.resetAt < 1e12 ? rateLimit.resetAt * 1000 : rateLimit.resetAt
         : Date.parse(rateLimit.resetAt);
-      this.resetTime = Number.isFinite(value) ? value : null;
+      reset = Number.isFinite(value) ? value : null;
+    }
+    if (reset !== null && this.observedWindow !== null && reset < this.observedWindow) return;
+    const newWindow = reset !== null && (this.observedWindow === null || reset > this.observedWindow);
+    if (limit !== null) this.limit = limit;
+    if (newWindow) {
+      this.observedWindow = reset;
+      this.resetTime = reset;
+      this.available = remaining;
+    } else if (remaining !== null) {
+      this.available = this.available === null ? remaining : Math.min(this.available, remaining);
     }
   }
 

@@ -1,4 +1,4 @@
-import { defineDomain, domainTable, type Domain } from '@deepseek-ai/dsh-storage-domain';
+import { defineDomain, domainTable, type Domain, type KvTable } from '@deepseek-ai/dsh-storage-domain';
 import { z } from 'zod';
 import type { CacheRecord, ContentStore, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from './contract.js';
 import { V2exError } from './errors.js';
@@ -83,7 +83,39 @@ function parseWrite<T>(schema: z.ZodType<T>, value: unknown): T {
 
 export class DomainContentStore implements ContentStore {
   private globalWrites: Promise<void> = Promise.resolve();
+  private readonly tableWrites = new Map<string, Promise<void>>();
   constructor(private readonly domain: Domain<typeof v2exDomainSpec>, private readonly clock: () => Date = () => new Date()) {}
+
+  private serialize<T>(name: string, operation: () => Promise<T>): Promise<T> {
+    const write = (this.tableWrites.get(name) ?? Promise.resolve()).then(operation);
+    this.tableWrites.set(name, write.then(() => {}, () => {}));
+    return write;
+  }
+
+  private boundedPut<T>(
+    name: string, table: KvTable<string, T>, key: string, value: T, cap: number,
+    inScope: (key: string) => boolean, age: (value: T) => number,
+  ): Promise<void> {
+    return this.serialize(name, async () => {
+      const entries = [...table.entries()].filter(([entryKey]) => inScope(entryKey));
+      const additional = table.get(key) === undefined ? 1 : 0;
+      const excess = Math.max(0, entries.length + additional - cap);
+      const victims = entries.filter(([entryKey]) => entryKey !== key)
+        .sort((a, b) => age(a[1]) - age(b[1]))
+        .slice(0, excess);
+      const removed: Array<[string, T]> = [];
+      try {
+        for (const [entryKey, record] of victims) {
+          await table.delete(entryKey);
+          removed.push([entryKey, record]);
+        }
+        await table.put(key, value);
+      } catch (error) {
+        for (const [entryKey, record] of removed) await table.put(entryKey, record);
+        throw error;
+      }
+    });
+  }
 
   private updateGlobal(change: (current: { settings: PluginSettings; profile: InterestProfile | null }) => { settings: PluginSettings; profile: InterestProfile | null }): Promise<void> {
     const write = this.globalWrites.then(() => this.domain.global.set(change(this.domain.global.get())));
@@ -94,11 +126,14 @@ export class DomainContentStore implements ContentStore {
   async getCache(key: string): Promise<CacheRecord | undefined> {
     assertCacheKey(key);
     const table = this.domain.table('cache');
-    const record = table.get(key);
-    if (!record) return undefined;
-    const accessedAt = this.clock().toISOString();
-    await table.put(key, { ...record, accessedAt });
-    return { ...record, accessedAt };
+    return this.serialize('cache', async () => {
+      const record = table.get(key);
+      if (!record) return undefined;
+      const accessedAt = this.clock().toISOString();
+      const touched = { ...record, accessedAt };
+      await table.put(key, touched);
+      return touched;
+    });
   }
 
   async putCache(key: string, record: CacheRecord): Promise<void> {
@@ -106,17 +141,16 @@ export class DomainContentStore implements ContentStore {
     const parsed = CacheRecordSchema.safeParse(record);
     if (!parsed.success) throw new V2exError('invalid_response');
     const table = this.domain.table('cache');
-    await table.put(key, parsed.data);
     const isList = /^(latest|hot|node):/.test(key);
-    const entries = [...table.entries()].filter(([entryKey]) => /^(latest|hot|node):/.test(entryKey) === isList);
     const cap = isList ? 100 : 300;
-    if (entries.length > cap) {
-      entries.sort((a, b) => Date.parse(a[1].accessedAt) - Date.parse(b[1].accessedAt));
-      for (const [oldest] of entries.slice(0, entries.length - cap)) await table.delete(oldest);
-    }
+    await this.boundedPut('cache', table, key, parsed.data, cap,
+      (entryKey) => /^(latest|hot|node):/.test(entryKey) === isList,
+      (entry) => Date.parse(entry.accessedAt));
   }
 
-  async deleteCache(key: string): Promise<void> { await this.domain.table('cache').delete(assertCacheKey(key)); }
+  async deleteCache(key: string): Promise<void> {
+    await this.serialize('cache', () => this.domain.table('cache').delete(assertCacheKey(key)));
+  }
   async getSettings(): Promise<PluginSettings> { return structuredClone(this.domain.global.get().settings); }
   async putSettings(settings: PluginSettings): Promise<void> {
     const parsed = parseWrite(PluginSettingsSchema, settings);
@@ -134,17 +168,15 @@ export class DomainContentStore implements ContentStore {
     if (!/^[1-9]\d*$/.test(key) || Number(key) !== recommendation.topic.id) throw new V2exError('invalid_request');
     const parsed = parseWrite(RecommendationSchema, recommendation);
     const table = this.domain.table('recommendations');
-    await table.put(key, parsed);
-    const entries = [...table.entries()];
-    if (entries.length > 500) {
-      entries.sort((a, b) => Date.parse(a[1].createdAt) - Date.parse(b[1].createdAt) || Number(a[0]) - Number(b[0]));
-      for (const [oldest] of entries.slice(0, entries.length - 500)) await table.delete(oldest);
-    }
+    await this.boundedPut('recommendations', table, key, parsed, 500,
+      () => true, (entry) => Date.parse(entry.createdAt));
   }
   async markRead(key: string): Promise<void> {
     const table = this.domain.table('recommendations');
-    const value = table.get(key);
-    if (value && !value.read) await table.put(key, { ...value, read: true });
+    await this.serialize('recommendations', async () => {
+      const value = table.get(key);
+      if (value && !value.read) await table.put(key, { ...value, read: true });
+    });
   }
   async listRecommendations(): Promise<Recommendation[]> { return [...this.domain.table('recommendations').entries()].map(([, value]) => value); }
   async getSummary(key: string): Promise<TopicAiSummary | undefined> { return this.domain.table('summaries').get(key); }
@@ -152,11 +184,7 @@ export class DomainContentStore implements ContentStore {
     if (!/^[1-9]\d*$/.test(key) || Number(key) !== summary.topicId) throw new V2exError('invalid_request');
     const parsed = parseWrite(TopicAiSummarySchema, summary);
     const table = this.domain.table('summaries');
-    await table.put(key, parsed);
-    const entries = [...table.entries()];
-    if (entries.length > 300) {
-      entries.sort((a, b) => Date.parse(a[1].generatedAt) - Date.parse(b[1].generatedAt) || Number(a[0]) - Number(b[0]));
-      for (const [oldest] of entries.slice(0, entries.length - 300)) await table.delete(oldest);
-    }
+    await this.boundedPut('summaries', table, key, parsed, 300,
+      () => true, (entry) => Date.parse(entry.generatedAt));
   }
 }

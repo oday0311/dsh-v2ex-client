@@ -30,6 +30,16 @@ test('failed refresh retains last success and returns bounded stale fallback', a
   });
 });
 
+test('cold cache normalizes unknown fetch failures without exposing internal text', async () => {
+  const cache = new ContentCache(new FakeContentStore());
+  await assert.rejects(cache.readOrRefresh('latest:1', async () => { throw new Error('private upstream header: secret'); }, 1000), (error: unknown) => {
+    assert.ok(error instanceof V2exError);
+    assert.equal(error.code, 'upstream');
+    assert.doesNotMatch(error.message, /private|secret/);
+    return true;
+  });
+});
+
 test('concurrent refreshes of the same resource share one upstream request', async () => {
   const cache = new ContentCache(new FakeContentStore(), () => new Date('2026-11-06T00:00:00Z'));
   let calls = 0;
@@ -56,6 +66,19 @@ test('background reservations stop at the interactive reserve', () => {
   assert.equal(budget.reserve('background'), false);
   assert.equal(budget.reserve('interactive'), true);
   assert.equal(budget.remaining, 9);
+});
+
+test('repeated or delayed rate observations cannot restore locally reserved capacity', () => {
+  const budget = new RequestBudget({ reserveForInteractive: 2 });
+  budget.update({ limit: 20, remaining: 12, resetAt: '2030-01-01T00:00:00Z' });
+  assert.equal(budget.reserve('background'), true);
+  budget.update({ limit: 20, remaining: 12, resetAt: '2030-01-01T00:00:00Z' });
+  assert.equal(budget.remaining, 11);
+  assert.equal(budget.reserve('background'), true);
+  budget.update({ limit: 20, remaining: 15, resetAt: '2029-12-31T00:00:00Z' });
+  assert.equal(budget.remaining, 10);
+  budget.update({ limit: 20, remaining: 19, resetAt: '2030-01-02T00:00:00Z' });
+  assert.equal(budget.remaining, 19);
 });
 
 test('request budget resumes after reset and remains conservative without rate headers', () => {
