@@ -1,0 +1,11 @@
+{
+  "name": "v2ex-dsh-client",
+  "version": "0.1.0",
+  "description": "Read-only V2EX browsing and discovery for DeepSeek Harness",
+  "entry": {
+    "name": "v2ex-dsh-client",
+    "inject": ["credentials", "storageDomain", "tools"]
+  },
+  "client": { "platform": "web" },
+  "bundle": { "patch": "./cordis.patch.yml" }
+}
