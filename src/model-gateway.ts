@@ -9,6 +9,29 @@ const MAX_OUTPUT_BYTES = 16 * 1024;
 const MAX_OUTPUT_TOKENS = 1024;
 const wellFormed = (value: string) => decoder.decode(encoder.encode(value)) === value;
 
+function validUnicode(value: unknown): boolean {
+  const ancestors = new WeakSet<object>();
+  const stack: Array<{ value: unknown; leaving: boolean; depth: number }> = [{ value, leaving: false, depth: 0 }];
+  let visits = 0;
+  while (stack.length) {
+    const item = stack.pop()!;
+    if (typeof item.value === 'string') {
+      if (!wellFormed(item.value)) return false;
+      continue;
+    }
+    if (!item.value || typeof item.value !== 'object') continue;
+    if (item.leaving) { ancestors.delete(item.value); continue; }
+    if (ancestors.has(item.value) || item.depth > 128 || ++visits > 20_000) return false;
+    ancestors.add(item.value);
+    stack.push({ ...item, leaving: true });
+    for (const [key, child] of Object.entries(item.value)) {
+      if (!wellFormed(key)) return false;
+      stack.push({ value: child, leaving: false, depth: item.depth + 1 });
+    }
+  }
+  return true;
+}
+
 export interface JsonModelRequest<T> {
   system: string;
   userData: string;
@@ -45,6 +68,7 @@ export class DshModelGateway implements ModelGateway {
 
   route(): string {
     try {
+      if (typeof this.host.llm?.stream !== 'function') throw new V2exError('ai_unavailable');
       const selected = selection(this.host.agentDefaultModel?.currentSelection());
       return JSON.stringify([selected.provider, selected.model]);
     } catch { throw new V2exError('ai_unavailable'); }
@@ -52,7 +76,11 @@ export class DshModelGateway implements ModelGateway {
 
   async completeJson<T>(request: JsonModelRequest<T>): Promise<T> {
     if (request.signal?.aborted) throw new V2exError('timeout');
-    if (!this.host.llm || !this.host.agentDefaultModel) throw new V2exError('ai_unavailable');
+    let llm: DshModelHost['llm'];
+    let defaultModel: DshModelHost['agentDefaultModel'];
+    try { llm = this.host.llm; defaultModel = this.host.agentDefaultModel; }
+    catch { throw new V2exError('ai_unavailable'); }
+    if (!llm || !defaultModel || typeof llm.stream !== 'function') throw new V2exError('ai_unavailable');
     if (request.tools.length !== 0 || !Number.isSafeInteger(request.maxInputBytes) ||
       request.maxInputBytes < 1 || request.maxInputBytes > MAX_INPUT_BYTES ||
       !Number.isSafeInteger(request.maxOutputTokens) || request.maxOutputTokens < 1 ||
@@ -67,36 +95,42 @@ export class DshModelGateway implements ModelGateway {
         const route: unknown = JSON.parse(request.modelRoute);
         if (!Array.isArray(route) || route.length !== 2) throw new Error('route');
         return selection({ provider: route[0], model: route[1] });
-      })() : selection(this.host.agentDefaultModel.currentSelection());
+      })() : selection(defaultModel.currentSelection());
     } catch { throw new V2exError('ai_unavailable'); }
     const options: GenerateOptions = {
       provider: selected.provider, model: selected.model, system: request.system,
       messages: [{ role: 'user', content: [{ type: 'text', text: request.userData }] }],
       tools: [], maxTokens: request.maxOutputTokens, signal: request.signal,
     };
-    let output = '';
+    const blocks = new Map<number, { text: string; closed: boolean }>();
     let finished = false;
-    let activeIndex: number | undefined;
-    let blockText = '';
     try {
-      for await (const chunk of this.host.llm.stream(options)) {
+      for await (const chunk of llm.stream(options)) {
         if (request.signal?.aborted) throw new V2exError('timeout');
         if (finished) throw new V2exError('invalid_response');
         if (chunk.type === 'block-start') {
-          if (chunk.blockType !== 'text' || activeIndex !== undefined) throw new V2exError('invalid_response');
-          activeIndex = chunk.index; blockText = '';
+          if (chunk.blockType !== 'text' || !Number.isSafeInteger(chunk.index) || chunk.index < 0 ||
+            blocks.has(chunk.index) || blocks.size >= 64) throw new V2exError('invalid_response');
+          blocks.set(chunk.index, { text: '', closed: false });
         } else if (chunk.type === 'text-delta') {
-          if (activeIndex !== chunk.index) throw new V2exError('invalid_response');
-          blockText += chunk.text;
-          output += chunk.text;
-          if (encoder.encode(output).byteLength > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
+          const block = blocks.get(chunk.index);
+          if (!block || block.closed || typeof chunk.text !== 'string') throw new V2exError('invalid_response');
+          block.text += chunk.text;
+          if (encoder.encode([...blocks.values()].map(value => value.text).join('')).byteLength > MAX_OUTPUT_BYTES) {
+            throw new V2exError('invalid_response');
+          }
         } else if (chunk.type === 'block-end') {
-          if (activeIndex !== chunk.index || chunk.block.type !== 'text' || chunk.block.text !== blockText) throw new V2exError('invalid_response');
-          activeIndex = undefined;
+          const block = blocks.get(chunk.index);
+          if (!block || block.closed || chunk.block.type !== 'text' || chunk.block.text !== block.text) {
+            throw new V2exError('invalid_response');
+          }
+          block.closed = true;
         } else if (chunk.type === 'finish') {
           if (chunk.reason.kind === 'aborted' || request.signal?.aborted) throw new V2exError('timeout');
           if (chunk.reason.kind === 'error') throw new V2exError('ai_unavailable');
-          if (chunk.reason.kind !== 'stop' || activeIndex !== undefined) throw new V2exError('invalid_response');
+          if (chunk.reason.kind !== 'stop' || [...blocks.values()].some(block => !block.closed)) {
+            throw new V2exError('invalid_response');
+          }
           finished = true;
         } else if (chunk.type !== 'usage') {
           throw new V2exError('invalid_response');
@@ -106,11 +140,21 @@ export class DshModelGateway implements ModelGateway {
       if (error instanceof V2exError) throw error;
       throw new V2exError(request.signal?.aborted ? 'timeout' : 'ai_unavailable');
     }
-    if (!finished || !output.trim() || !wellFormed(output)) throw new V2exError('invalid_response');
+    const ordered = [...blocks.entries()].sort(([left], [right]) => left - right);
+    if (ordered.some(([index], position) => index !== position)) throw new V2exError('invalid_response');
+    const output = ordered.map(([, block]) => block.text).join('');
+    if (!finished || !output.trim() || !wellFormed(output) ||
+      encoder.encode(output).byteLength > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
     let parsed: unknown;
     try { parsed = JSON.parse(output); } catch { throw new V2exError('invalid_response'); }
-    const result = request.schema.safeParse(parsed);
+    try { if (!validUnicode(parsed)) throw new V2exError('invalid_response'); }
+    catch { throw new V2exError('invalid_response'); }
+    let result: ReturnType<typeof request.schema.safeParse>;
+    try { result = request.schema.safeParse(parsed); }
+    catch { throw new V2exError('invalid_response'); }
     if (!result.success) throw new V2exError('invalid_response');
+    try { if (!validUnicode(result.data)) throw new V2exError('invalid_response'); }
+    catch { throw new V2exError('invalid_response'); }
     return result.data;
   }
 }

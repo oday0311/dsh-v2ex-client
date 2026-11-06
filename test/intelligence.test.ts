@@ -56,3 +56,42 @@ test('rejects model claims about replies outside loaded content', async () => {
   await assert.rejects(new IntelligenceService(gateway as never, new FakeContentStore())
     .summarizeTopic({ topic: thread, mode: 'full' }), { code: 'invalid_response' });
 });
+
+test('cache keys use the final bounded model input, including changed content', async () => {
+  const store = new FakeContentStore(); let calls = 0;
+  const model = { route: () => 'p/m', async completeJson() { calls++; return { summary: 'Summary', viewpoints: [], notableReplies: [] }; } };
+  const service = new IntelligenceService(model as never, store);
+  const base = { ...thread, content: 'a'.repeat(12_000) + 'tail-a' };
+  await service.summarizeTopic({ topic: base, mode: 'quick' });
+  await service.summarizeTopic({ topic: { ...base, content: 'b' + base.content.slice(1) }, mode: 'quick' });
+  await service.summarizeTopic({ topic: { ...base, replies: [{ ...thread.replies[0], content: 'different' }] }, mode: 'quick' });
+  assert.equal(calls, 3);
+  await service.summarizeTopic({ topic: { ...base, content: 'a'.repeat(12_000) + 'tail-b' }, mode: 'quick' });
+  assert.equal(calls, 3);
+});
+
+test('dropped replies keep loaded-page provenance but cannot claim complete discussion', async () => {
+  const store = new FakeContentStore(); let calls = 0; const inputs: string[] = [];
+  const model = { route: () => 'p/m', async completeJson(request: { userData: string }) {
+    calls++; inputs.push(request.userData); return { summary: 'Summary', viewpoints: [], notableReplies: [] };
+  } };
+  const service = new IntelligenceService(model as never, store);
+  const replies = Array.from({ length: 60 }, (_, id) => ({ ...thread.replies[0], id: id + 1,
+    content: '\u0000'.repeat(300) }));
+  const completeThread = { ...thread, topic: { ...topic, replyCount: 60 }, replies, replyPage: 3, hasMoreReplies: false };
+  const partial = await service.summarizeTopic({ topic: completeThread, mode: 'full' });
+  const presented = JSON.parse(inputs[0]) as { replies: unknown[]; coverage: { complete: boolean; loadedReplyPages: number } };
+  assert.ok(presented.replies.length < replies.length);
+  assert.equal(presented.coverage.loadedReplyPages, 3);
+  assert.equal(presented.coverage.complete, false);
+  assert.equal(partial.coverage?.loadedReplyPages, 3);
+  assert.equal(partial.coverage?.complete, false);
+  assert.equal(partial.completeDiscussion, false);
+  assert.equal(partial.coverage?.omittedReplies, replies.length - presented.replies.length);
+  await service.summarizeTopic({ topic: completeThread, mode: 'full' });
+  assert.equal(calls, 1);
+  const small = { ...completeThread, topic: { ...topic, replyCount: 2 }, replies: replies.slice(0, 2), replyPage: 1 };
+  const full = await service.summarizeTopic({ topic: small, mode: 'full' });
+  assert.equal(full.completeDiscussion, true);
+  assert.equal(full.coverage?.complete, true);
+});

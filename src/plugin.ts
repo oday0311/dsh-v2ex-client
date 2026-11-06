@@ -48,7 +48,8 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       try { return host.reflect?.get(name) ?? host[name]; } catch { return undefined; }
     };
     const intelligence = new IntelligenceService(new DshModelGateway({
-      llm: optional('llm'), agentDefaultModel: optional('agentDefaultModel'),
+      get llm() { return optional('llm'); },
+      get agentDefaultModel() { return optional('agentDefaultModel'); },
     } as never), store);
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));

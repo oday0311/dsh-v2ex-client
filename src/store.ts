@@ -42,7 +42,10 @@ export const TopicAiSummarySchema = z.strictObject({
   notableReplies: z.array(topicId).max(100), generatedAt: timestamp,
   coveredReplyPages: z.array(z.number().int().positive().max(1000)).max(100), completeDiscussion: z.boolean(),
   coverage: z.strictObject({ loadedReplyPages: z.number().int().nonnegative().max(1000),
-    totalReplyPages: z.number().int().nonnegative().max(1000), complete: z.boolean() }).optional(),
+    totalReplyPages: z.number().int().nonnegative().max(1000), complete: z.boolean(),
+    includedReplies: z.number().int().nonnegative().max(200).optional(),
+    omittedReplies: z.number().int().nonnegative().max(200).optional(),
+    contentTruncated: z.boolean().optional() }).optional(),
   mode: z.enum(['quick', 'viewpoints', 'full']).optional(), modelRoute: z.string().min(1).max(500).optional(),
   topicUpdatedAt: timestamp.optional(),
 });

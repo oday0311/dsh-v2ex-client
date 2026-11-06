@@ -81,7 +81,8 @@ export interface TopicAiSummary {
   generatedAt: string;
   coveredReplyPages: number[];
   completeDiscussion: boolean;
-  coverage?: { loadedReplyPages: number; totalReplyPages: number; complete: boolean };
+  coverage?: { loadedReplyPages: number; totalReplyPages: number; complete: boolean;
+    includedReplies?: number; omittedReplies?: number; contentTruncated?: boolean };
   mode?: 'quick' | 'viewpoints' | 'full';
   modelRoute?: string;
   topicUpdatedAt?: string;
