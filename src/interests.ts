@@ -79,11 +79,13 @@ export class InterestService {
     const parsed = editSchema.safeParse(edit);
     if (!parsed.success) throw new V2exError('invalid_request');
     const old = await this.current();
+    const structuralEdit = parsed.data.labels !== undefined || parsed.data.preferredNodes !== undefined ||
+      parsed.data.exclusions !== undefined;
     const next = { ...old, learningPaused: parsed.data.learningPaused ?? old.learningPaused,
       labels: parsed.data.labels === undefined ? old.labels : normalize(parsed.data.labels),
       preferredNodes: parsed.data.preferredNodes === undefined ? old.preferredNodes : normalize(parsed.data.preferredNodes),
       exclusions: parsed.data.exclusions === undefined ? old.exclusions : exclusions(parsed.data.exclusions),
-      source: old.source === 'manual' ? 'manual' as const : 'mixed' as const,
+      source: structuralEdit ? old.source === 'manual' ? 'manual' as const : 'mixed' as const : old.source,
       updatedAt: this.clock().toISOString() };
     return this.save(next);
   }); }
@@ -91,7 +93,8 @@ export class InterestService {
     if (!Number.isSafeInteger(topicId) || topicId < 1 || typeof interested !== 'boolean') throw new V2exError('invalid_request');
     const old = await this.current();
     const feedback = [...old.feedback.filter(item => item.topicId !== topicId), { topicId, interested }].slice(-500);
-    return this.save({ ...old, feedback, updatedAt: this.clock().toISOString() });
+    return this.save({ ...old, feedback, source: old.source === 'history' ? 'mixed' : old.source,
+      updatedAt: this.clock().toISOString() });
   }); }
   async perform(action: string, payload?: unknown, signal?: AbortSignal): Promise<InterestProfile> {
     if (action === 'get' && payload === undefined) return this.get();
@@ -109,7 +112,6 @@ export class InterestService {
   relearn(signal?: AbortSignal): Promise<InterestProfile> { const epoch = this.accessEpoch; return this.serialized(async () => {
     const old = await this.current();
     if (!old.authorized || epoch !== this.accessEpoch) throw new V2exError('history_access_denied');
-    if (old.learningPaused) throw new V2exError('invalid_request');
     if (signal?.aborted) throw new V2exError('timeout');
     const controller = new AbortController();
     const abort = () => controller.abort();
@@ -129,8 +131,9 @@ export class InterestService {
     const parsed = modelProfile.safeParse(result);
     if (!parsed.success) throw new V2exError('invalid_response');
     if (effective.aborted) throw new V2exError('timeout');
-    const manual = old.source === 'mixed' || old.source === 'manual' &&
+    const manualSeed = old.source === 'manual' &&
       (old.labels.length > 0 || old.preferredNodes.length > 0 || old.exclusions.length > 0);
+    const mixed = old.source === 'mixed';
     const learnedLabels = normalize(parsed.data.labels);
     const learnedNodes = normalize(parsed.data.preferredNodes);
     const merge = <T extends { name: string; weight: number }>(learned: T[], previous: T[]) => {
@@ -138,10 +141,10 @@ export class InterestService {
       return normalize([...previous, ...learned.filter(item => !manualNames.has(item.name.toLocaleLowerCase('en')))]);
     };
     return this.save({ ...old,
-      labels: manual ? merge(learnedLabels, old.labels) : learnedLabels,
-      preferredNodes: manual ? merge(learnedNodes, old.preferredNodes) : learnedNodes,
-      exclusions: manual ? old.exclusions : exclusions(parsed.data.exclusions),
-      source: manual || old.feedback.length ? 'mixed' : 'history', updatedAt: this.clock().toISOString() });
+      labels: mixed ? old.labels : manualSeed ? merge(learnedLabels, old.labels) : learnedLabels,
+      preferredNodes: mixed ? old.preferredNodes : manualSeed ? merge(learnedNodes, old.preferredNodes) : learnedNodes,
+      exclusions: mixed || manualSeed ? old.exclusions : exclusions(parsed.data.exclusions),
+      source: mixed || manualSeed || old.feedback.length ? 'mixed' : 'history', updatedAt: this.clock().toISOString() });
     } finally {
       signal?.removeEventListener('abort', abort);
       if (this.activeRelearn === controller) this.activeRelearn = undefined;

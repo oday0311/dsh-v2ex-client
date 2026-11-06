@@ -172,17 +172,13 @@ export function createSummaryTool(reader: Pick<ContentReader, 'topic'>,
 }
 
 export function createInterestTool(service: Pick<InterestService, 'perform'>): ToolDefinition {
-  return defineTool({ name: 'v2ex_interest_profile', description: 'Inspect or manage the authorized V2EX interest profile.',
-    parameters: { action: { type: 'string', required: true }, payload: { type: 'string' } }, output,
+  return defineTool({ name: 'v2ex_interest_profile', description: 'Inspect the V2EX interest profile.',
+    parameters: { action: { type: 'string', required: true } }, output,
     async execute(args, exec) {
-      if (typeof args.action !== 'string' || typeof args.payload !== 'string' && args.payload !== undefined ||
-        (args.payload?.length ?? 0) > 4096) throw new V2exError('invalid_request');
-      let payload: unknown;
-      if (args.payload !== undefined) {
-        try { payload = JSON.parse(args.payload); } catch { throw new V2exError('invalid_request'); }
-      }
+      if (!args || typeof args !== 'object' || Array.isArray(args) ||
+        args.action !== 'get' || Object.keys(args).length !== 1) throw new V2exError('invalid_request');
       let result;
-      try { result = await service.perform(args.action, payload, exec.signal); }
+      try { result = await service.perform('get', undefined, exec.signal); }
       catch (error) { throw error instanceof V2exError ? error : new V2exError('ai_unavailable'); }
       if (bytes(result) > MAX_OUTPUT_BYTES) throw new V2exError('invalid_response');
       return JSON.parse(JSON.stringify(result));

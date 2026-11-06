@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { registerV2exHttpRoutes } from '../src/http-routes.js';
 import { createInterestTool } from '../src/tools.js';
+import { InterestService } from '../src/interests.js';
+import { FakeContentStore } from './helpers/fakes.js';
 
 test('interest route and Tool share actions, no-store, and bounded output', async () => {
   const calls: Array<[string, unknown]> = [];
@@ -50,4 +52,47 @@ test('interest entry points reject invalid actions and nonleaking errors', async
   const tool = createInterestTool(service as never);
   await assert.rejects(tool.execute({ action: 'get' }, { signal: new AbortController().signal } as never),
     { code: 'ai_unavailable' });
+});
+
+test('Agent Tool exposes get only and rejects every mutation before service access', async () => {
+  const calls: string[] = [];
+  const service = { async perform(action: string) { calls.push(action); return { authorized: false }; } };
+  const tool = createInterestTool(service as never);
+  for (const action of ['authorize', 'relearn', 'update', 'feedback', 'revoke', 'clear']) {
+    await assert.rejects(tool.execute({ action, payload: '{}' } as never,
+      { signal: new AbortController().signal } as never), { code: 'invalid_request' });
+  }
+  assert.deepEqual(calls, []);
+  await tool.execute({ action: 'get' }, { signal: new AbortController().signal } as never);
+  assert.deepEqual(calls, ['get']);
+});
+
+test('Host revoke and clear abort active learning before stale profile writes', async () => {
+  for (const action of ['revoke', 'clear'] as const) {
+    const store = new FakeContentStore();
+    let release!: () => void;
+    let entered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const service = new InterestService(store, { async readEligibleUserText() { return 'interest'; } },
+      { async completeJson() { entered(); await held; return { labels: [{ name: 'Rust', weight: 1 }],
+        preferredNodes: [], exclusions: [] }; } } as never);
+    let route: { fetch(request: Request): Promise<Response> } | undefined;
+    await registerV2exHttpRoutes({ fetch: { register(value) {
+      if (value.path === '/api/v2ex/interests') route = value;
+      return () => {};
+    } } }, { auth: {} as never, credential: {} as never, content: {} as never, interests: service } as never);
+    const request = (method: string, body?: unknown) => route!.fetch(new Request('https://host.test/api/v2ex/interests',
+      { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+    await request('POST', { action: 'authorize' });
+    const learning = request('POST', { action: 'relearn' });
+    await started;
+    const mutation = action === 'clear' ? request('DELETE') : request('POST', { action: 'revoke' });
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    await Promise.all([learning, mutation]);
+    const profile = await store.getProfile();
+    if (action === 'clear') assert.equal(profile, null);
+    else assert.equal(profile?.authorized, false);
+  }
 });

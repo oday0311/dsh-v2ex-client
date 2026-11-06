@@ -39,28 +39,26 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       responseLimitBytes: config.responseLimitBytes });
     const vault = new DshCredentialVault(host.credentials);
     const store = new DomainContentStore(domain);
+    const optional = (name: 'llm' | 'agentDefaultModel') => {
+      try { return host.reflect?.get(name) ?? host[name]; } catch { return undefined; }
+    };
+    const model = new DshModelGateway({
+      get llm() { return optional('llm'); },
+      get agentDefaultModel() { return optional('agentDefaultModel'); },
+    } as never);
+    const interests = new InterestService(store, new DshHistoryReader(() => {
+      try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }
+      catch { return undefined; }
+    }), model);
     const auth = new AuthService(api, vault, async () => {
-      await store.clearProfile();
+      await interests.clear();
       for (const [key] of domain.table('recommendations').entries()) {
         await domain.table('recommendations').delete(key);
       }
     });
     const service = new ContentService(api, vault,
       new ContentCache(store), new RequestBudget());
-    const optional = (name: 'llm' | 'agentDefaultModel') => {
-      try { return host.reflect?.get(name) ?? host[name]; } catch { return undefined; }
-    };
-    const intelligence = new IntelligenceService(new DshModelGateway({
-      get llm() { return optional('llm'); },
-      get agentDefaultModel() { return optional('agentDefaultModel'); },
-    } as never), store);
-    const interests = new InterestService(store, new DshHistoryReader(() => {
-      try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }
-      catch { return undefined; }
-    }), new DshModelGateway({
-      get llm() { return optional('llm'); },
-      get agentDefaultModel() { return optional('agentDefaultModel'); },
-    } as never));
+    const intelligence = new IntelligenceService(model, store);
     for (const tool of createBrowsingTools(service)) disposers.push(host.tools.register(tool));
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));

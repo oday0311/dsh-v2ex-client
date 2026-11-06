@@ -14,7 +14,8 @@ const record = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 const arrayField = (value: unknown, key: string): unknown[] | null =>
   Array.isArray(value) ? value : record(value) && Array.isArray(value[key]) ? value[key] as unknown[] : null;
-const badSource = /(?:^|[\/_-])(assistant|model|tool|plugin|system|developer|function|agent)(?:[\/_-]|$)/i;
+const badSource = /(?:^|[\/_-])(assistant|model|tool|plugin|system|developer|function|agent|bot)(?:[\/_-]|$)/i;
+const credentialPattern = /\bV2EX_PERSONAL_ACCESS_TOKEN\s*[:=]\s*\S+|\bAuthorization\s*:?\s*Bearer\s+\S+|\b(?:token|api[-_]?key|password|secret)\s*[:=]\s*(?:["'][^"'\r\n]{12,}["']|[A-Za-z0-9_./+=-]{12,})/i;
 function timeValue(value: unknown): number {
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if (typeof value !== 'string' || value.length > 64) return 0;
@@ -24,7 +25,7 @@ function timeValue(value: unknown): number {
 }
 
 function eligible(event: Record<string, unknown>): boolean {
-  if (event.type !== 'user/message') return false;
+  if (!Object.hasOwn(event, 'type') || event.type !== 'user/message') return false;
   const queue: Array<{ value: unknown; depth: number }> = [{ value: event, depth: 0 }];
   const seen = new WeakSet<object>();
   let visited = 0;
@@ -34,6 +35,9 @@ function eligible(event: Record<string, unknown>): boolean {
     if (seen.has(value) || depth > 6 || ++visited > 256) return false;
     seen.add(value);
     if (Array.isArray(value) && value.length > 256) return false;
+    const prototype = Object.getPrototypeOf(value);
+    if (Array.isArray(value) && prototype !== Array.prototype) return false;
+    if (!Array.isArray(value) && prototype !== Object.prototype && prototype !== null) return false;
     let keys = 0;
     for (const key in value) {
       if (!Object.hasOwn(value, key)) continue;
@@ -43,6 +47,7 @@ function eligible(event: Record<string, unknown>): boolean {
       if (/^(role|source|origin|actor|author|sender|kind)$/i.test(key)) {
         if (typeof child === 'string' && badSource.test(child)) return false;
       }
+      if (key === 'type' && depth > 0 && typeof child === 'string' && badSource.test(child)) return false;
       if (child && typeof child === 'object') queue.push({ value: child, depth: depth + 1 });
     }
   }
@@ -58,15 +63,18 @@ function content(event: Record<string, unknown>): unknown {
 function userText(event: Record<string, unknown>): string {
   if (!eligible(event)) return '';
   const blocks = content(event);
-  if (!Array.isArray(blocks)) return '';
+  if (!Array.isArray(blocks) || blocks.length > 32) return '';
   const parts: string[] = [];
   let remaining = 4096;
-  for (const block of blocks.slice(0, 32)) {
+  let tail = '';
+  for (const block of blocks) {
     if (!record(block) || block.type !== 'text' || typeof block.text !== 'string' ||
       Object.keys(block).some(key => !['type', 'text'].includes(key))) continue;
+    if (credentialPattern.test(block.text) || credentialPattern.test(tail + block.text.slice(0, 100))) return '';
+    tail = block.text.slice(-100);
+    if (remaining <= 0) continue;
     const piece = boundUtf8(block.text, remaining).trim();
     if (piece) { parts.push(piece); remaining -= Buffer.byteLength(piece) + 1; }
-    if (remaining <= 0) break;
   }
   return parts.join('\n').trim();
 }
@@ -97,19 +105,25 @@ export class DshHistoryReader implements HistoryReader {
     const lines: string[] = [];
     const seen = new Set<string>();
     let remaining = bounds.maxBytes;
+    let eventBudget = 2000;
     for (const session of selected) {
       if (signal?.aborted) throw new V2exError('timeout');
+      if (eventBudget === 0) break;
       let found: unknown;
       try { found = await query.filterEvents(session.id as string, [{ kind: 'type', values: ['user/message'] }]); }
       catch { throw new V2exError(signal?.aborted ? 'timeout' : 'history_access_denied'); }
       const events = arrayField(found, 'events');
       if (!events) throw new V2exError('history_access_denied');
-      const ordered = events.slice(0, 1000).filter(record).sort((a, b) =>
+      const considered = events.slice(0, Math.min(1000, eventBudget));
+      eventBudget -= considered.length;
+      const ordered = considered.filter(record).sort((a, b) =>
         timeValue(b.timestamp ?? b.createdAt) - timeValue(a.timestamp ?? a.createdAt) ||
         String(a.id ?? '').localeCompare(String(b.id ?? '')));
       for (const event of ordered) {
         if (signal?.aborted) throw new V2exError('timeout');
-        const text = boundUtf8(userText(event), Math.min(4096, remaining));
+        let text: string;
+        try { text = boundUtf8(userText(event), Math.min(4096, remaining)); }
+        catch { continue; }
         if (!text || seen.has(text)) continue;
         seen.add(text); lines.push(text);
         remaining -= Buffer.byteLength(text);

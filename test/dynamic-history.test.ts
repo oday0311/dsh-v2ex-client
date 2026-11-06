@@ -9,7 +9,8 @@ test('late and replaced sessionQuery is resolved only after stored authorization
   let global = { settings: {}, profile: null as unknown };
   const tables = { cache: new Map(), summaries: new Map(), recommendations: new Map() };
   const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
-  ctx.provide('credentials', {});
+  ctx.provide('credentials', { async resolve() { return undefined; }, async unset() {}, async set() {},
+    async describe() { return { configured: false, writable: true }; } });
   ctx.provide('storageDomain', { async open() { return {
     global: { get: () => structuredClone(global), set: async (next: typeof global) => { global = structuredClone(next); } },
     table(name: keyof typeof tables) { const map = tables[name]; return { entries: () => map.entries(), delete: async (key: string) => map.delete(key) }; },
@@ -50,6 +51,24 @@ test('late and replaced sessionQuery is resolved only after stored authorization
     assert.equal((await response('POST', { action: 'relearn' })).status, 403);
     assert.equal(reads, 2);
     assert.equal((await routes.get('/api/v2ex/health')!.fetch(new Request('https://host.test/api/v2ex/health'))).status, 200);
-    await removeReplacement(); await removeLlm(); await removeModel();
+    await removeReplacement();
+    let release!: () => void;
+    let started!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { started = resolve; });
+    const removeHeld = ctx.provide('sessionQuery', { async listSessions() { return [{ id: 'held' }]; },
+      async filterEvents() { started(); await held; return [{ type: 'user/message', content: [{ type: 'text', text: 'interest' }] }]; } });
+    await response('POST', { action: 'authorize' });
+    const learning = response('POST', { action: 'relearn' });
+    await entered;
+    const logout = routes.get('/api/v2ex/session')!.fetch(new Request('https://host.test/api/v2ex/session',
+      { method: 'DELETE', body: JSON.stringify({ clearPersonalData: true }) }));
+    await new Promise<void>(resolve => setImmediate(resolve));
+    release();
+    assert.equal((await logout).status, 200);
+    await learning;
+    assert.equal(global.profile, null);
+    assert.equal((await response('GET').then(value => value.json()) as { data: { authorized: boolean } }).data.authorized, false);
+    await removeHeld(); await removeLlm(); await removeModel();
   } finally { await plugin?.dispose(); await ctx.fiber.dispose(); }
 });

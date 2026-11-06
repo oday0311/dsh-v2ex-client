@@ -53,3 +53,58 @@ test('numeric event timestamps sort newest first and duplicate text is omitted',
     ]; } }));
   assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'newer\nolder');
 });
+
+test('rejects inherited and nested non-user provenance, cycles, tools, and attachments', async () => {
+  const inherited = Object.assign(Object.create({ type: 'user/message' }),
+    { content: [{ type: 'text', text: 'INHERITED_MARKER' }] });
+  const cyclic: Record<string, unknown> = { type: 'user/message', content: [{ type: 'text', text: 'CYCLE_MARKER' }] };
+  cyclic.metadata = cyclic;
+  const events = [inherited, cyclic,
+    { type: 'user/message', source: { type: 'assistant' }, content: [{ type: 'text', text: 'SOURCE_MARKER' }] },
+    { type: 'user/message', role: 'bot', content: [{ type: 'text', text: 'BOT_MARKER' }] },
+    { type: 'user/message', data: { message: { actor: { kind: 'plugin' }, content: [{ type: 'text', text: 'PLUGIN_MARKER' }] } } },
+    { type: 'user/message', content: [{ type: 'text', text: 'TOOL_MARKER' }], metadata: { toolCall: {} } },
+    { type: 'user/message', content: [{ type: 'text', text: 'ATTACHMENT_MARKER' }], attachment: {} },
+    ...(['origin', 'author', 'sender', 'kind'] as const).map(key =>
+      ({ type: 'user/message', [key]: { type: 'model' }, content: [{ type: 'text', text: 'PROVENANCE_MARKER' }] })),
+    { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+  ];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return events; } }));
+  const result = await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 500 });
+  assert.equal(result, 'safe user text');
+});
+
+test('drops whole credential-bearing messages before text accumulation', async () => {
+  const messages = [
+    'private context V2EX_PERSONAL_ACCESS_TOKEN=FAKE_LONG_VALUE_12345678',
+    'private context Authorization: Bearer FAKE_LONG_VALUE_12345678',
+    'private context api_key: FAKE_LONG_VALUE_12345678',
+    'private context password=FAKE_LONG_VALUE_12345678',
+    'private context secret=FAKE_LONG_VALUE_12345678',
+    'private context password="FAKE LONG VALUE PHRASE"',
+    'private context token=00000000-1111-2222-3333-444444444444',
+    'safe user text',
+  ];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return messages.map(text => ({ type: 'user/message', content: [{ type: 'text', text }] })); } }));
+  const result = await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 20 });
+  assert.ok(!result.includes('private context'));
+  assert.ok(result.includes('safe user text'));
+  assert.ok(Buffer.byteLength(result) <= 20);
+});
+
+test('credentials after the text cap or block limit cannot leave a partial message', async () => {
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return [
+      { type: 'user/message', content: [
+        { type: 'text', text: 'private context '.repeat(400) },
+        { type: 'text', text: 'token=FAKE_LONG_VALUE_12345678' },
+      ] },
+      { type: 'user/message', content: Array.from({ length: 33 }, () => ({ type: 'text', text: 'private context' })) },
+      { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  const result = await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 });
+  assert.ok(!result.includes('private context'));
+  assert.ok(result.includes('safe user text'));
+});

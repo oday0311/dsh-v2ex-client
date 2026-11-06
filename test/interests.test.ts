@@ -34,7 +34,7 @@ test('relearning retains edits and feedback; deleted exclusion stays deleted', a
   await service.recordFeedback(42, false);
   const next = await service.relearn();
   assert.deepEqual(next.exclusions, []);
-  assert.deepEqual(next.labels, [{ name: 'Manual', weight: 1 }, { name: 'Rust', weight: 0.8 }]);
+  assert.deepEqual(next.labels, [{ name: 'Manual', weight: 1 }]);
   assert.deepEqual(next.feedback, [{ topicId: 42, interested: false }]);
   await service.clear();
   assert.equal(await store.getProfile(), null);
@@ -94,4 +94,30 @@ test('manual update queued during relearn wins without losing learned labels', a
   assert.deepEqual(profile.labels, [{ name: 'Manual', weight: 1 }]);
   assert.deepEqual(profile.exclusions, []);
   assert.equal(profile.authorized, true);
+});
+
+test('mixed edits preserve exact label, node, and exclusion deletions on repeated relearn', async () => {
+  const store = new FakeContentStore();
+  const service = new InterestService(store, { async readEligibleUserText() { return 'interests'; } },
+    { async completeJson() { return { labels: [{ name: 'Rust', weight: 1 }],
+      preferredNodes: [{ name: 'tech', weight: 1 }], exclusions: ['ads'] }; } } as never);
+  await service.authorize();
+  await service.relearn();
+  await service.update({ labels: [], preferredNodes: [], exclusions: [] });
+  for (let i = 0; i < 2; i++) {
+    const next = await service.relearn();
+    assert.deepEqual([next.labels, next.preferredNodes, next.exclusions], [[], [], []]);
+  }
+});
+
+test('pause-only edit preserves source, manual relearn works, and feedback mixes history', async () => {
+  const store = new FakeContentStore();
+  const service = new InterestService(store, { async readEligibleUserText() { return 'interest'; } },
+    { async completeJson() { return { labels: [], preferredNodes: [], exclusions: [] }; } } as never);
+  await service.authorize();
+  await service.relearn();
+  const paused = await service.update({ learningPaused: true });
+  assert.equal(paused.source, 'history');
+  assert.equal((await service.relearn()).source, 'history');
+  assert.equal((await service.recordFeedback(1, true)).source, 'mixed');
 });
