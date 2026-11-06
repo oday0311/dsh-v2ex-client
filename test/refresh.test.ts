@@ -435,3 +435,92 @@ test('clear and dispose settle noncooperative delivery and late rejection is han
     else assert.deepEqual((await f.store.getPendingNotifications(scope)).map(value => value.topicId), [99]);
   }
 });
+
+test('clear invalidates every awaited prepare stage before external delivery', async () => {
+  for (const stage of ['settings', 'pending'] as const) {
+    const f = fixture({ items: [] }); const scope = accountScope('alice');
+    await f.store.enqueuePendingNotifications(scope, [pending(stage === 'settings' ? 101 : 102)]);
+    let enter!: () => void; let release!: () => void; let notifyCalls = 0;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    if (stage === 'settings') f.store.beforeSettingsRead = async () => { enter(); await gate; };
+    else f.store.beforePendingRead = async () => { enter(); await gate; };
+    f.reminders.notify = async items => { notifyCalls++; return items.map(value => value.noticeId); };
+    const draining = f.service.drainPending().catch(() => {}); await entered;
+    const clearing = f.service.clear('alice'); await clearing; release(); await draining;
+    assert.equal(notifyCalls, 0, stage);
+    assert.deepEqual(await f.store.getPendingNotifications(scope), []);
+  }
+});
+
+test('clear completed while identity prepare is delayed cannot later notify', async () => {
+  const f = fixture({ items: [] }); const scope = accountScope('alice');
+  await f.store.enqueuePendingNotifications(scope, [pending(107)]);
+  let enter!: () => void; let release!: () => void; let notifyCalls = 0;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const original = f.identity.withMutation.bind(f.identity);
+  f.identity.withMutation = async (operation, expected) => {
+    enter(); await gate; return original(operation, expected);
+  };
+  f.reminders.notify = async items => { notifyCalls++; return items.map(value => value.noticeId); };
+  const draining = f.service.drainPending().catch(() => {}); await entered;
+  await f.service.clear('alice'); release(); await draining;
+  assert.equal(notifyCalls, 0); assert.deepEqual(await f.store.getPendingNotifications(scope), []);
+});
+
+test('compatible joiners rerun prepare and drain notices added after the active snapshot', async () => {
+  const f = fixture({ items: [] }); const scope = accountScope('alice');
+  await f.store.enqueuePendingNotifications(scope, [pending(103)]);
+  let enter!: () => void; let release!: () => void; let calls = 0;
+  const entered = new Promise<void>(resolve => { enter = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  f.reminders.notify = async items => { calls++; if (calls === 1) { enter(); await gate; }
+    return items.map(value => value.noticeId); };
+  const first = f.service.drainPending(); await entered;
+  await f.store.enqueuePendingNotifications(scope, [pending(104)]);
+  let joinedDone = 0;
+  const joiners = Array.from({ length: 4 }, () => f.service.drainPending().then(() => { joinedDone++; }));
+  release(); await Promise.all([first, ...joiners]);
+  assert.equal(joinedDone, 4); assert.equal(calls, 2);
+  assert.deepEqual(await f.store.getPendingNotifications(scope), []);
+});
+
+test('compatible joiner follow-up remains finite when delivery cannot progress', async () => {
+  for (const outcome of ['no-agent', 'failure'] as const) {
+    const f = fixture({ items: [] }); const scope = accountScope('alice');
+    await f.store.enqueuePendingNotifications(scope, [pending(outcome === 'no-agent' ? 105 : 106)]);
+    let enter!: () => void; let release!: () => void; let calls = 0;
+    const entered = new Promise<void>(resolve => { enter = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    f.reminders.notify = async () => { calls++; if (calls === 1) { enter(); await gate; }
+      if (outcome === 'failure') throw new Error('host unavailable'); return []; };
+    const first = f.service.drainPending().catch(() => {}); await entered;
+    const joiners = Array.from({ length: 5 }, () => f.service.drainPending().catch(() => {}));
+    release(); await Promise.all([first, ...joiners]);
+    assert.equal(calls, 2, outcome);
+    assert.equal((await f.store.getPendingNotifications(scope)).length, 1);
+  }
+});
+
+test('disposed hanging Agent releases the flight for a later root idle retry', async () => {
+  const f = fixture({ items: [] }); const scope = accountScope('alice'); const sink = new DshReminderSink();
+  const ctx = new Context(); sink.bind(ctx as never);
+  const service = new RefreshService({ store: f.store, content: {} as never, recommendations: {} as never,
+    budget: f.budget, identity: f.identity, reminders: sink, clock: f.clock });
+  const removeIdle = sink.onIdle(() => service.handleReminderIdle());
+  await f.store.enqueuePendingNotifications(scope, [pending(108)]);
+  let oldCalls = 0; let rejectOld!: (error: Error) => void;
+  const old = { status: 'idle', root: true, followup() { oldCalls++;
+    return new Promise<void>((_resolve, reject) => { rejectOld = reject; }); } };
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent: old, status: 'running' });
+  const first = service.drainPending().catch(() => {}); while (!oldCalls) await Promise.resolve();
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/disposed', { agent: old }); await first;
+  rejectOld(new Error('late old Agent failure'));
+  const messages: unknown[] = []; const fresh = { status: 'idle', root: true,
+    async followup(message: unknown) { messages.push(message); } };
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent: fresh, status: 'running' });
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent: fresh, status: 'idle' });
+  while ((await f.store.getPendingNotifications(scope)).length) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(messages.length, 1); removeIdle(); await service.dispose(); await ctx.fiber.dispose();
+});

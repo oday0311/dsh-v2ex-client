@@ -36,7 +36,13 @@ export interface RefreshServiceOptions {
 }
 
 type DeliveryMode = 'cached' | 'normal';
-interface PreparedDelivery { mode: DeliveryMode; lease: IdentityLease; pending: PendingReminderNotice[]; key: string }
+interface PreparedDelivery {
+  mode: DeliveryMode;
+  lease: IdentityLease;
+  pending: PendingReminderNotice[];
+  key: string;
+  epoch: number;
+}
 
 const systemClock: RefreshClock = {
   now: () => new Date(),
@@ -99,7 +105,8 @@ function nodeNames(settings: PluginSettings, profile: InterestProfile | null): s
 export class RefreshService {
   private readonly clock: RefreshClock;
   private active?: { promise: Promise<void>; controller: AbortController };
-  private delivery?: { key: string; promise: Promise<void>; controller: AbortController };
+  private delivery?: { key: string; account: string; promise: Promise<void>; controller: AbortController; rerun?: Promise<void> };
+  private readonly deliveryEpochs = new Map<string, number>();
   private stopTimer?: () => void;
   private timerMinutes?: number;
   private disposing?: Promise<void>;
@@ -194,20 +201,34 @@ export class RefreshService {
     return this.attemptDelivery('cached');
   }
 
-  private async attemptDelivery(mode: DeliveryMode, expectedLease?: IdentityLease): Promise<void> {
+  private deliveryEpoch(account: string): number { return this.deliveryEpochs.get(account) ?? 0; }
+
+  private invalidateDelivery(account: string): void {
+    this.deliveryEpochs.set(account, this.deliveryEpoch(account) + 1);
+    if (this.delivery?.account === account) this.delivery.controller.abort();
+  }
+
+  private async attemptDelivery(mode: DeliveryMode, expectedLease?: IdentityLease, afterJoin = false): Promise<void> {
     if (this.disposed) return Promise.reject(new V2exError('timeout'));
     const prepared = await this.prepareDelivery(mode, expectedLease);
     if (!prepared) return;
     const current = this.delivery;
     if (current) {
-      if (current.key === prepared.key) return current.promise;
+      if (current.key === prepared.key) {
+        if (afterJoin) return current.promise;
+        return current.rerun ??= current.promise.catch(() => {})
+          .then(() => this.attemptDelivery(mode, prepared.lease, true));
+      }
       await current.promise.catch(() => {});
-      return this.attemptDelivery(mode, prepared.lease);
+      return this.attemptDelivery(mode, prepared.lease, true);
     }
-    if (this.disposed) throw new V2exError('timeout');
+    if (this.disposed || prepared.lease.signal?.aborted || this.deliveryEpoch(prepared.lease.account) !== prepared.epoch) {
+      throw new V2exError('timeout');
+    }
     const controller = new AbortController();
     const linked = linkAbortSignals(controller.signal, prepared.lease.signal);
-    const delivery = { key: prepared.key, controller, promise: Promise.resolve() as Promise<void> };
+    const delivery = { key: prepared.key, account: prepared.lease.account, controller,
+      promise: Promise.resolve() as Promise<void>, rerun: undefined as Promise<void> | undefined };
     delivery.promise = this.deliverPrepared(prepared, linked.signal)
       .finally(linked.release)
       .finally(() => { if (this.delivery === delivery) this.delivery = undefined; });
@@ -220,17 +241,22 @@ export class RefreshService {
   private async prepareDelivery(mode: DeliveryMode, expectedLease?: IdentityLease): Promise<PreparedDelivery | undefined> {
     const prepare = async (lease: IdentityLease): Promise<PreparedDelivery | undefined> => {
       if (this.disposed || lease.signal?.aborted) throw new V2exError('timeout');
+      const epoch = this.deliveryEpoch(lease.account);
       const settings = await this.options.store.getSettings(lease.scope);
+      if (this.disposed || lease.signal?.aborted || this.deliveryEpoch(lease.account) !== epoch) throw new V2exError('timeout');
       if (settings.quietHours && isQuietTime(this.clock.now(), settings.quietHours)) return;
       const pending = await this.options.store.getPendingNotifications(lease.scope);
+      if (this.disposed || lease.signal?.aborted || this.deliveryEpoch(lease.account) !== epoch) throw new V2exError('timeout');
       if (!pending.length) return;
-      return { mode, lease, pending: pending.slice(0, 20), key: deliveryKey(mode, lease) };
+      return { mode, lease, pending: pending.slice(0, 20), key: deliveryKey(mode, lease), epoch };
     };
     if (mode === 'cached') return this.options.identity.withCachedMutation?.(prepare, expectedLease);
     return this.options.identity.withMutation(prepare, expectedLease);
   }
 
   private async deliverPrepared(prepared: PreparedDelivery, signal: AbortSignal): Promise<void> {
+    if (this.disposed || signal.aborted || prepared.lease.signal?.aborted ||
+      this.deliveryEpoch(prepared.lease.account) !== prepared.epoch) throw new V2exError('timeout');
     const delivered = new Set(await abortAware(() => this.options.reminders.notify(prepared.pending, signal), signal));
     if (signal.aborted) throw new V2exError('timeout');
     const finalize = async (lease: IdentityLease) => {
@@ -247,8 +273,8 @@ export class RefreshService {
   }
 
   clear(account: string): Promise<void> {
+    this.invalidateDelivery(account);
     this.active?.controller.abort();
-    this.delivery?.controller.abort();
     return this.options.store.clearRefreshState(accountScope(account));
   }
 

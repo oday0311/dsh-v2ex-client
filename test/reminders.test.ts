@@ -130,3 +130,26 @@ test('abort while followup is pending stops the batch without reporting delivery
   while (!calls) await Promise.resolve(); controller.abort(); release();
   assert.deepEqual(await delivery, []); assert.equal(calls, 1); await ctx.fiber.dispose();
 });
+
+test('disposed or replaced target aborts hanging followup and a later root can deliver', async () => {
+  for (const transition of ['disposed', 'replaced', 'sink-dispose'] as const) {
+    const ctx = new Context(); const sink = new DshReminderSink(); let oldCalls = 0; let rejectOld!: (error: Error) => void;
+    const unbind = sink.bind(ctx as never);
+    const old = { status: 'idle', root: true, followup() { oldCalls++;
+      return new Promise<void>((_resolve, reject) => { rejectOld = reject; }); } };
+    emit(ctx, 'agent/status', { agent: old, status: 'running' });
+    const notice = createReminderNotice(item); const delivery = sink.notify([notice]);
+    while (!oldCalls) await Promise.resolve();
+    const fresh = agent();
+    if (transition === 'disposed') emit(ctx, 'agent/disposed', { agent: old });
+    else if (transition === 'replaced') emit(ctx, 'agent/status', { agent: fresh, status: 'running' });
+    else unbind();
+    assert.deepEqual(await delivery, [], transition);
+    rejectOld(new Error('late followup rejection')); await new Promise(resolve => setImmediate(resolve));
+    if (transition !== 'sink-dispose') {
+      if (transition === 'disposed') emit(ctx, 'agent/status', { agent: fresh, status: 'running' });
+      assert.deepEqual(await sink.notify([notice]), [notice.noticeId]);
+    }
+    await ctx.fiber.dispose();
+  }
+});

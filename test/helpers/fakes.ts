@@ -42,6 +42,8 @@ export class FakeContentStore implements ContentStore {
   readonly accountSettings = new Map<string, PluginSettings>();
   readonly notificationStates = new Map<string, { sent: Set<number>; pending: PendingReminderNotice[] }>();
   beforeNotificationSent?: () => Promise<void>;
+  beforeSettingsRead?: () => Promise<void>;
+  beforePendingRead?: () => Promise<void>;
   beforeRecommendationSnapshot?: () => Promise<void>;
   beforeRecommendationPublish?: () => Promise<void>;
   beforeProfileRead?: () => Promise<void>;
@@ -60,7 +62,8 @@ export class FakeContentStore implements ContentStore {
   async getCache(key: string) { return this.cache.get(key); }
   async putCache(key: string, value: CacheRecord) { this.cache.set(key, value); }
   async deleteCache(key: string) { this.cache.delete(key); }
-  async getSettings(scope?: string) { return scope ? this.accountSettings.get(scope) ?? this.settings : this.settings; }
+  async getSettings(scope?: string) { const value = scope ? this.accountSettings.get(scope) ?? this.settings : this.settings;
+    await this.beforeSettingsRead?.(); return value; }
   async putSettings(value: PluginSettings, scope?: string) { if (scope) this.accountSettings.set(scope, value); else this.settings = value; }
   async enqueuePendingNotifications(scope: string, notices: PendingReminderNotice[]) {
     const state = this.notificationStates.get(scope) ?? { sent: new Set<number>(), pending: [] };
@@ -70,7 +73,8 @@ export class FakeContentStore implements ContentStore {
     }
     this.notificationStates.set(scope, state); return accepted;
   }
-  async getPendingNotifications(scope: string) { return structuredClone(this.notificationStates.get(scope)?.pending ?? []); }
+  async getPendingNotifications(scope: string) { const value = structuredClone(this.notificationStates.get(scope)?.pending ?? []);
+    await this.beforePendingRead?.(); return value; }
   async markNotificationSent(scope: string, expected: PendingReminderNotice) { await this.beforeNotificationSent?.();
     const state = this.notificationStates.get(scope); const notice = state?.pending.find(value =>
       value.noticeId === expected.noticeId && value.topicId === expected.topicId && value.title === expected.title &&

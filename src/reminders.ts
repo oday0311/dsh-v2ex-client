@@ -3,6 +3,7 @@ import { createUserMessage, freezeMessage, type UserMessage } from '@deepseek-ai
 import type { PendingReminderNotice, Recommendation } from './contract.js';
 import type { ReminderSink } from './refresh.js';
 import { isUnsafeReminder, normalizeReminderText, reminderText } from './reminder-safety.js';
+import { V2exError } from './errors.js';
 
 declare module '@deepseek-ai/dsh-llm' {
   interface MessageSourceMap {
@@ -40,7 +41,8 @@ export function createReminderNotice(item: Recommendation): PendingReminderNotic
 }
 
 export class DshReminderSink implements ReminderSink {
-  private latest?: AgentLike;
+  private latest?: { agent: AgentLike; controller: AbortController; generation: number };
+  private targetGeneration = 0;
   private readonly disposedAgents = new WeakSet<object>();
   private idleHandler?: () => Promise<void>;
   private unbound = false;
@@ -61,7 +63,8 @@ export class DshReminderSink implements ReminderSink {
     } catch { for (const dispose of disposers.reverse()) try { dispose(); } catch {} return () => {}; }
     let active = true;
     return () => {
-      if (!active) return; active = false; this.unbound = true; this.latest = undefined; this.idleHandler = undefined;
+      if (!active) return; active = false; this.unbound = true; this.latest?.controller.abort();
+      this.latest = undefined; this.idleHandler = undefined;
       for (const dispose of disposers.reverse()) try { dispose(); } catch { /* Host already disposed it. */ }
     };
   }
@@ -70,8 +73,14 @@ export class DshReminderSink implements ReminderSink {
     if (!payload || typeof payload !== 'object') return;
     const event = payload as AgentEvent; const agent = event.agent;
     if (!rootAgent(agent) || this.disposedAgents.has(agent as object)) return;
-    if (event.status === 'running') { this.latest = agent; return; }
-    if (event.status === 'idle' && agent === this.latest && this.idleHandler) void this.idleHandler().catch(() => {});
+    if (event.status === 'running') {
+      if (this.latest?.agent !== agent) {
+        this.latest?.controller.abort();
+        this.latest = { agent, controller: new AbortController(), generation: ++this.targetGeneration };
+      }
+      return;
+    }
+    if (event.status === 'idle' && agent === this.latest?.agent && this.idleHandler) void this.idleHandler().catch(() => {});
   }
 
   private disposedEvent(payload: unknown): void {
@@ -79,33 +88,58 @@ export class DshReminderSink implements ReminderSink {
     const agent = (payload as AgentEvent).agent;
     if (!agent || typeof agent !== 'object') return;
     this.disposedAgents.add(agent);
-    if (agent === this.latest) this.latest = undefined;
+    if (agent === this.latest?.agent) { this.latest.controller.abort(); this.latest = undefined; }
   }
 
   async notify(items: readonly PendingReminderNotice[], signal?: AbortSignal): Promise<string[]> {
-    const agent = this.latest;
-    if (this.unbound || !agent || !rootAgent(agent) || this.disposedAgents.has(agent as object)) return [];
+    const target = this.latest; const agent = target?.agent;
+    if (this.unbound || !target || !agent || !rootAgent(agent) || this.disposedAgents.has(agent as object)) return [];
     let status: unknown;
     try { status = agent.status; } catch { return []; }
     if (status !== 'idle') return [];
+    const linked = linkSignals(signal, target.controller.signal);
     const delivered: string[] = [];
-    for (const notice of items.slice(0, 20)) {
-      if (signal?.aborted || agent !== this.latest || this.disposedAgents.has(agent as object)) break;
+    try { for (const notice of items.slice(0, 20)) {
+      if (linked.signal.aborted || target !== this.latest || agent !== this.latest?.agent ||
+        this.disposedAgents.has(agent as object)) break;
       if (isUnsafeReminder(notice)) continue;
       const text = reminderText(notice);
+      if (linked.signal.aborted || target !== this.latest || this.disposedAgents.has(agent as object)) break;
       const generated = createUserMessage({ content: [{ type: 'text' as const, text }],
         source: { kind: 'plugin' as const, plugin: 'v2ex', form: 'notice' } });
       const message = freezeMessage({ ...generated, id: notice.noticeId } as unknown as UserMessage);
       try {
-        const result = agent.followup!(message);
-        if (result && typeof result === 'object' && typeof (result as PromiseLike<unknown>).then === 'function') {
-          await result;
-        }
-        if (signal?.aborted || agent !== this.latest || this.disposedAgents.has(agent as object)) break;
+        if (linked.signal.aborted || target !== this.latest || this.disposedAgents.has(agent as object)) break;
+        await abortAgentWork(() => agent.followup!(message), linked.signal);
+        if (linked.signal.aborted || target !== this.latest || agent !== this.latest?.agent ||
+          this.disposedAgents.has(agent as object)) break;
         delivered.push(notice.noticeId);
       }
       catch { break; }
-    }
-    return delivered;
+    } return delivered; } finally { linked.release(); }
   }
+}
+
+function linkSignals(caller: AbortSignal | undefined, target: AbortSignal): { signal: AbortSignal; release: () => void } {
+  const controller = new AbortController(); const signals = caller ? [caller, target] : [target];
+  const abort = () => controller.abort();
+  for (const value of signals) {
+    if (value.aborted) controller.abort(); else value.addEventListener('abort', abort, { once: true });
+  }
+  return { signal: controller.signal, release: () => {
+    for (const value of signals) value.removeEventListener('abort', abort);
+  } };
+}
+
+function abortAgentWork(work: () => unknown, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.reject(new V2exError('timeout'));
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => { signal.removeEventListener('abort', abort); };
+    const succeed = () => { if (settled) return; settled = true; cleanup(); resolve(); };
+    const fail = (error: unknown) => { if (settled) return; settled = true; cleanup(); reject(error); };
+    const abort = () => fail(new V2exError('timeout'));
+    signal.addEventListener('abort', abort, { once: true });
+    Promise.resolve().then(work).then(succeed, fail);
+  });
 }
