@@ -108,3 +108,35 @@ test('credentials after the text cap or block limit cannot leave a partial messa
   assert.ok(!result.includes('private context'));
   assert.ok(result.includes('safe user text'));
 });
+
+test('punctuated provenance and credentials split across text blocks are omitted', async () => {
+  const events = [
+    { type: 'user/message', source: 'assistant.message', content: [{ type: 'text', text: 'private context' }] },
+    { type: 'user/message', role: 'system:prompt', content: [{ type: 'text', text: 'private context' }] },
+    { type: 'user/message', origin: 'bot@worker', content: [{ type: 'text', text: 'private context' }] },
+    { type: 'user/message', content: [
+      { type: 'text', text: 'private context token' }, { type: 'text', text: '=' },
+      { type: 'text', text: 'FAKE_LONG_VALUE_12345678' },
+    ] },
+    { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+  ];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return events; } }));
+  const result = await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 });
+  assert.ok(!result.includes('private context'));
+  assert.ok(result.includes('safe user text'));
+});
+
+test('oversized blocks and aggregate message bytes are rejected rather than truncated', async () => {
+  const events = [
+    { type: 'user/message', content: [{ type: 'text', text: 'private context' + 'x'.repeat(5000) }] },
+    { type: 'user/message', content: [{ type: 'text', text: 'private context' + 'x'.repeat(2500) },
+      { type: 'text', text: 'y'.repeat(2500) }] },
+    { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+  ];
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return events; } }));
+  const result = await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 });
+  assert.ok(!result.includes('private context'));
+  assert.ok(result.includes('safe user text'));
+});

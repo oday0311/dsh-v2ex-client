@@ -1,5 +1,5 @@
 import type { CredentialVault } from '../../src/credentials.js';
-import type { CacheRecord, ContentStore, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from '../../src/contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from '../../src/contract.js';
 
 export class FakeCredentialVault implements CredentialVault {
   value: string | undefined;
@@ -41,6 +41,7 @@ export class FakeContentStore implements ContentStore {
     aiCandidateBudget: 10, notificationThreshold: 0.7, quietHours: null,
   };
   profile: InterestProfile | null = null;
+  profileEdits: InterestEditFlags = { labels: false, preferredNodes: false, exclusions: false };
 
   async getCache(key: string) { return this.cache.get(key); }
   async putCache(key: string, value: CacheRecord) { this.cache.set(key, value); }
@@ -49,7 +50,11 @@ export class FakeContentStore implements ContentStore {
   async putSettings(value: PluginSettings) { this.settings = value; }
   async getProfile() { return this.profile; }
   async putProfile(value: InterestProfile) { this.profile = value; }
-  async clearProfile() { this.profile = null; }
+  async getProfileEdits() { return { ...this.profileEdits }; }
+  async putInterestState(profile: InterestProfile, edits: InterestEditFlags) {
+    this.profile = profile; this.profileEdits = { ...edits };
+  }
+  async clearProfile() { this.profile = null; this.profileEdits = { labels: false, preferredNodes: false, exclusions: false }; }
   async getRecommendation(key: string) { return this.recommendations.get(key); }
   async putRecommendation(key: string, value: Recommendation) { this.recommendations.set(key, value); }
   async markRead(key: string) {

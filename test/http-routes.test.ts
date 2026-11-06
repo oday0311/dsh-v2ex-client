@@ -37,7 +37,7 @@ function fixture() {
     const url = new URL(path, 'https://host.test');
     const route = routes.get(url.pathname);
     if (!route) throw new Error('route missing');
-    return route.fetch(new Request(url, init));
+    return route.fetch(new Request(url, init?.body ? { ...init, headers: { 'content-type': 'application/json', ...init.headers } } : init));
   };
   return { routes, calls, removed, dispose, fetch, connection };
 }
@@ -106,6 +106,33 @@ test('all paths dispatch methods with Allow and no-store', async () => {
   assert.deepEqual(f.calls, []);
 });
 
+test('mutating routes reject cross-origin, cross-site, and non-JSON bodies before I/O', async () => {
+  const calls: string[] = [];
+  const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  await registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } },
+    { auth: { async login() { calls.push('login'); return {} as never; }, async logout() { calls.push('logout'); },
+      async status() { calls.push('status'); return {} as never; } },
+    credential: { async resolve() { calls.push('credential'); return undefined; } },
+    content: { async topic() { calls.push('topic'); return {} as never; } },
+    interests: { async perform() { calls.push('interests'); return {} as never; } } } as never);
+  for (const [path, method, body] of [
+    ['/session', 'POST', { token: 'FAKE_VALUE' }],
+    ['/topic/summary', 'POST', { topic: '1', mode: 'quick' }],
+    ['/interests', 'POST', { action: 'authorize' }],
+  ] as const) {
+    for (const headers of [
+      { origin: 'https://other.test', 'content-type': 'application/json' },
+      { origin: 'https://host.test', 'sec-fetch-site': 'cross-site', 'content-type': 'application/json' },
+      { origin: 'https://host.test', 'content-type': 'text/plain' },
+    ]) {
+      const response = await routes.get(`/api/v2ex${path}`)!.fetch(new Request(`https://host.test/api/v2ex${path}`,
+        { method, headers, body: JSON.stringify(body) }));
+      assert.equal(response.status, 400);
+    }
+  }
+  assert.deepEqual(calls, []);
+});
+
 test('login rejects oversize, malformed and extra-key bodies before auth', async () => {
   const f = fixture();
   for (const [body, status] of [
@@ -132,7 +159,7 @@ test('unexpected login account data cannot reflect the submitted token', async (
     async status() { throw new Error('unused'); }, async logout() { throw new Error('unused'); },
   }, content: {} } as never);
   const response = await session!.fetch(new Request('https://host.test/api/v2ex/session', {
-    method: 'POST', body: JSON.stringify({ token: TOKEN }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ token: TOKEN }),
   }));
   assert.equal(response.status, 502);
   assert.doesNotMatch(await response.text(), /00000000/);
@@ -167,7 +194,8 @@ test('session rejects oversized or extra account fields on all methods', async (
     async logout() {},
   }, content: {} } as never);
   for (const [method, body] of [['GET', undefined], ['POST', JSON.stringify({ token: TOKEN })], ['DELETE', undefined]] as const) {
-    const response = await session!.fetch(new Request('https://host.test/api/v2ex/session', { method, body }));
+    const response = await session!.fetch(new Request('https://host.test/api/v2ex/session', { method, body,
+      ...(body ? { headers: { 'content-type': 'application/json' } } : {}) }));
     assert.equal(response.status, 502);
     assert.doesNotMatch(await response.text(), /00000000|x{100}/);
   }
@@ -482,7 +510,7 @@ test('composed logout can clear personal profile and recommendations', async () 
   };
   const plugin = await composePlugin(host as never, Config({}));
   const response = await routes.get('/api/v2ex/session')!.fetch(new Request('https://host.test/api/v2ex/session', {
-    method: 'DELETE', body: JSON.stringify({ clearPersonalData: true }),
+    method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clearPersonalData: true }),
   }));
   assert.equal(response.status, 200);
   assert.equal(global.profile, null);

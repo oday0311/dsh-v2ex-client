@@ -68,6 +68,7 @@ test('versioned domain contains only content tables and an initialized settings/
   assert.equal(v2exDomainSpec.version, 1);
   assert.deepEqual(Object.keys(v2exDomainSpec.tables).sort(), ['cache', 'recommendations', 'summaries']);
   assert.equal(v2exDomainSpec.global.initial.profile, null);
+  assert.deepEqual(v2exDomainSpec.global.initial.profileEdits, { labels: false, preferredNodes: false, exclusions: false });
   assert.equal(v2exDomainSpec.global.initial.settings.refreshIntervalMinutes, 30);
 });
 
@@ -163,6 +164,21 @@ test('legacy profile is read as unauthorized structured data without changing do
     exclusions: ['ads'], feedback: [{ topicId: 42, interested: false }],
     updatedAt: '2026-11-06T00:00:00Z', source: 'manual' });
   assert.equal(v2exDomainSpec.version, 1);
+});
+
+test('legacy mixed profiles preserve edits conservatively and clear resets private flags', async () => {
+  const memory = memoryDomain();
+  const store = new DomainContentStore(memory.domain);
+  const profile = { authorized: true, learningPaused: false, labels: [], preferredNodes: [], exclusions: [],
+    feedback: [], updatedAt: '2026-11-06T00:00:00Z', source: 'mixed' as const };
+  await memory.domain.global.set({ settings: memory.readGlobal().settings, profile } as never);
+  assert.deepEqual(await store.getProfileEdits(), { labels: true, preferredNodes: true, exclusions: true });
+  await store.putInterestState(profile, { labels: true, preferredNodes: false, exclusions: true });
+  assert.deepEqual(await store.getProfileEdits(), { labels: true, preferredNodes: false, exclusions: true });
+  assert.equal('profileEdits' in (await store.getProfile() as object), false);
+  await store.clearProfile();
+  assert.deepEqual(await store.getProfileEdits(), { labels: false, preferredNodes: false, exclusions: false });
+  assert.equal(await store.getProfile(), null);
 });
 
 test('summary writes validate before replacement and evict oldest beyond 300', async () => {

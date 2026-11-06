@@ -1,6 +1,6 @@
 import { defineDomain, domainTable, type Domain, type KvTable } from '@deepseek-ai/dsh-storage-domain';
 import { z } from 'zod';
-import type { CacheRecord, ContentStore, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from './contract.js';
+import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PluginSettings, Recommendation, TopicAiSummary } from './contract.js';
 import { V2exError } from './errors.js';
 import { assertPage, assertTopicId } from './validation.js';
 
@@ -27,6 +27,10 @@ export const InterestProfileSchema = z.strictObject({
   feedback: z.array(z.strictObject({ topicId, interested: z.boolean() })).max(500),
   updatedAt: timestamp, source: z.enum(['manual', 'history', 'mixed']),
 });
+export const InterestEditFlagsSchema = z.strictObject({
+  labels: z.boolean(), preferredNodes: z.boolean(), exclusions: z.boolean(),
+});
+const noInterestEdits: InterestEditFlags = { labels: false, preferredNodes: false, exclusions: false };
 
 const LegacyProfileSchema = z.strictObject({
   labels: z.array(z.strictObject({ name: z.string().trim().min(1).max(80), weight: z.number().finite().min(-1).max(1) })).max(100),
@@ -76,8 +80,9 @@ export const defaultSettings: PluginSettings = {
 export const v2exDomainSpec = defineDomain({
   name: 'v2ex_client', version: 1,
   global: {
-    schema: z.strictObject({ settings: PluginSettingsSchema, profile: z.union([InterestProfileSchema, LegacyProfileSchema]).nullable() }),
-    initial: { settings: defaultSettings, profile: null as InterestProfile | null },
+    schema: z.strictObject({ settings: PluginSettingsSchema, profile: z.union([InterestProfileSchema, LegacyProfileSchema]).nullable(),
+      profileEdits: InterestEditFlagsSchema.optional() }),
+    initial: { settings: defaultSettings, profile: null as InterestProfile | null, profileEdits: noInterestEdits },
   },
   tables: {
     cache: domainTable<string, CacheRecord>(CacheRecordSchema),
@@ -137,7 +142,8 @@ export class DomainContentStore implements ContentStore {
     });
   }
 
-  private updateGlobal(change: (current: { settings: PluginSettings; profile: InterestProfile | null }) => { settings: PluginSettings; profile: InterestProfile | null }): Promise<void> {
+  private updateGlobal(change: (current: { settings: PluginSettings; profile: InterestProfile | null; profileEdits?: InterestEditFlags }) =>
+    { settings: PluginSettings; profile: InterestProfile | null; profileEdits?: InterestEditFlags }): Promise<void> {
     const write = this.globalWrites.then(() => this.domain.global.set(change(this.domain.global.get())));
     this.globalWrites = write.catch(() => {});
     return write;
@@ -187,7 +193,21 @@ export class DomainContentStore implements ContentStore {
     const parsed = parseWrite(InterestProfileSchema, profile);
     await this.updateGlobal((current) => ({ ...current, profile: parsed }));
   }
-  async clearProfile(): Promise<void> { await this.updateGlobal((current) => ({ ...current, profile: null })); }
+  async getProfileEdits(): Promise<InterestEditFlags> {
+    const current = this.domain.global.get();
+    const parsed = InterestEditFlagsSchema.safeParse(current.profileEdits);
+    if (parsed.success) return structuredClone(parsed.data);
+    if (current.profileEdits !== undefined) throw new V2exError('invalid_response');
+    return current.profile?.source === 'mixed' ? { labels: true, preferredNodes: true, exclusions: true } : { ...noInterestEdits };
+  }
+  async putInterestState(profile: InterestProfile, edits: InterestEditFlags): Promise<void> {
+    const parsedProfile = parseWrite(InterestProfileSchema, profile);
+    const parsedEdits = parseWrite(InterestEditFlagsSchema, edits);
+    await this.updateGlobal((current) => ({ ...current, profile: parsedProfile, profileEdits: parsedEdits }));
+  }
+  async clearProfile(): Promise<void> {
+    await this.updateGlobal((current) => ({ ...current, profile: null, profileEdits: { ...noInterestEdits } }));
+  }
 
   async getRecommendation(key: string): Promise<Recommendation | undefined> { return this.domain.table('recommendations').get(key); }
   async putRecommendation(key: string, recommendation: Recommendation): Promise<void> {

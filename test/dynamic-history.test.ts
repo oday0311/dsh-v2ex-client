@@ -21,7 +21,7 @@ test('late and replaced sessionQuery is resolved only after stored authorization
     routes.set(route.path, route); return () => routes.delete(route.path);
   } } });
   const response = (method: string, body?: unknown) => routes.get('/api/v2ex/interests')!.fetch(
-    new Request('https://host.test/api/v2ex/interests', { method, ...(body === undefined ? {} : { body: JSON.stringify(body) }) }));
+    new Request('https://host.test/api/v2ex/interests', { method, ...(body === undefined ? {} : { headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }) }));
   let reads = 0;
   const query = (name: string) => ({ async listSessions() { reads++; return [{ id: name }]; },
     async filterEvents() { return [{ type: 'user/message', content: [{ type: 'text', text: name }] }]; } });
@@ -62,7 +62,7 @@ test('late and replaced sessionQuery is resolved only after stored authorization
     const learning = response('POST', { action: 'relearn' });
     await entered;
     const logout = routes.get('/api/v2ex/session')!.fetch(new Request('https://host.test/api/v2ex/session',
-      { method: 'DELETE', body: JSON.stringify({ clearPersonalData: true }) }));
+      { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clearPersonalData: true }) }));
     await new Promise<void>(resolve => setImmediate(resolve));
     release();
     assert.equal((await logout).status, 200);

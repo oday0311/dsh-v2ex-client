@@ -121,3 +121,53 @@ test('pause-only edit preserves source, manual relearn works, and feedback mixes
   assert.equal((await service.relearn()).source, 'history');
   assert.equal((await service.recordFeedback(1, true)).source, 'mixed');
 });
+
+test('clear and revoke settle promptly while history or model ignore abort', async () => {
+  for (const stage of ['history', 'model'] as const) for (const action of ['clear', 'revoke'] as const) {
+    const store = new FakeContentStore();
+    let entered!: () => void;
+    let release!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const service = new InterestService(store,
+      { async readEligibleUserText() { if (stage === 'history') { entered(); await held; } return 'interest'; } },
+      { async completeJson() { if (stage === 'model') { entered(); await held; }
+        return { labels: [], preferredNodes: [], exclusions: [] }; } } as never);
+    await service.authorize();
+    const learning = service.relearn();
+    await started;
+    const mutation = action === 'clear' ? service.clear() : service.revoke();
+    const settled = await Promise.race([mutation.then(() => true), new Promise<boolean>(resolve => setTimeout(() => resolve(false), 50))]);
+    release();
+    assert.equal(settled, true);
+    await assert.rejects(learning, { code: 'timeout' });
+    const profile = await store.getProfile();
+    if (action === 'clear') assert.equal(profile, null);
+    else assert.equal(profile?.authorized, false);
+  }
+});
+
+test('durable edit flags preserve only edited fields and feedback-only profiles keep learning', async () => {
+  const store = new FakeContentStore();
+  let revision = 1;
+  const history = { async readEligibleUserText() { return 'interest'; } };
+  const model = { async completeJson() { return {
+    labels: [{ name: `label${revision}`, weight: 1 }],
+    preferredNodes: [{ name: `node${revision}`, weight: 1 }], exclusions: [`exclude${revision}`],
+  }; } } as never;
+  const first = new InterestService(store, history, model);
+  await first.authorize();
+  await first.relearn();
+  await first.update({ labels: [] });
+  revision = 2;
+  const restarted = new InterestService(store, history, model);
+  const edited = await restarted.relearn();
+  assert.deepEqual(edited.labels, []);
+  assert.deepEqual(edited.preferredNodes.map(item => item.name), ['node2']);
+  assert.deepEqual(edited.exclusions, ['exclude2']);
+  await restarted.recordFeedback(1, true);
+  revision = 3;
+  const feedback = await new InterestService(store, history, model).relearn();
+  assert.deepEqual(feedback.preferredNodes.map(item => item.name), ['node3']);
+  assert.deepEqual(feedback.feedback, [{ topicId: 1, interested: true }]);
+});

@@ -1,5 +1,4 @@
 import { V2exError } from './errors.js';
-import { boundUtf8 } from './intelligence.js';
 
 export interface HistoryReader {
   readEligibleUserText(bounds: { maxSessions: number; maxBytes: number }, signal?: AbortSignal): Promise<string>;
@@ -14,8 +13,11 @@ const record = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 const arrayField = (value: unknown, key: string): unknown[] | null =>
   Array.isArray(value) ? value : record(value) && Array.isArray(value[key]) ? value[key] as unknown[] : null;
-const badSource = /(?:^|[\/_-])(assistant|model|tool|plugin|system|developer|function|agent|bot)(?:[\/_-]|$)/i;
+const badSource = /(?:^|[^A-Za-z0-9])(assistant|model|tool|plugin|system|developer|function|agent|bot)(?=$|[^A-Za-z0-9])/i;
 const credentialPattern = /\bV2EX_PERSONAL_ACCESS_TOKEN\s*[:=]\s*\S+|\bAuthorization\s*:?\s*Bearer\s+\S+|\b(?:token|api[-_]?key|password|secret)\s*[:=]\s*(?:["'][^"'\r\n]{12,}["']|[A-Za-z0-9_./+=-]{12,})/i;
+const MAX_MESSAGE_BYTES = 4096;
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
 function timeValue(value: unknown): number {
   if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
   if (typeof value !== 'string' || value.length > 64) return 0;
@@ -65,18 +67,18 @@ function userText(event: Record<string, unknown>): string {
   const blocks = content(event);
   if (!Array.isArray(blocks) || blocks.length > 32) return '';
   const parts: string[] = [];
-  let remaining = 4096;
-  let tail = '';
+  let bytes = 0;
   for (const block of blocks) {
     if (!record(block) || block.type !== 'text' || typeof block.text !== 'string' ||
       Object.keys(block).some(key => !['type', 'text'].includes(key))) continue;
-    if (credentialPattern.test(block.text) || credentialPattern.test(tail + block.text.slice(0, 100))) return '';
-    tail = block.text.slice(-100);
-    if (remaining <= 0) continue;
-    const piece = boundUtf8(block.text, remaining).trim();
-    if (piece) { parts.push(piece); remaining -= Buffer.byteLength(piece) + 1; }
+    const size = Buffer.byteLength(block.text);
+    if (size > MAX_MESSAGE_BYTES || bytes + size + (parts.length ? 1 : 0) > MAX_MESSAGE_BYTES) return '';
+    bytes += size + (parts.length ? 1 : 0);
+    parts.push(decoder.decode(encoder.encode(block.text)));
   }
-  return parts.join('\n').trim();
+  const joined = parts.join('\n').trim();
+  if (credentialPattern.test(joined) || credentialPattern.test(parts.join(''))) return '';
+  return joined;
 }
 
 export class DshHistoryReader implements HistoryReader {
@@ -122,13 +124,14 @@ export class DshHistoryReader implements HistoryReader {
       for (const event of ordered) {
         if (signal?.aborted) throw new V2exError('timeout');
         let text: string;
-        try { text = boundUtf8(userText(event), Math.min(4096, remaining)); }
+        try { text = userText(event); }
         catch { continue; }
         if (!text || seen.has(text)) continue;
+        const size = Buffer.byteLength(text);
+        if (size + (lines.length ? 1 : 0) > remaining) continue;
         seen.add(text); lines.push(text);
-        remaining -= Buffer.byteLength(text);
-        if (remaining < 2) return lines.join('\n');
-        remaining--;
+        remaining -= size + (lines.length > 1 ? 1 : 0);
+        if (remaining === 0) return lines.join('\n');
       }
     }
     return lines.join('\n');

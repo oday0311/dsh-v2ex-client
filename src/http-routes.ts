@@ -186,6 +186,16 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
     }
     try {
       const query = new URL(request.url);
+      if (request.method !== 'GET') {
+        const origin = request.headers.get('origin');
+        if (origin !== null && origin !== query.origin ||
+            request.headers.get('sec-fetch-site')?.toLowerCase() === 'cross-site') {
+          throw new V2exError('invalid_request');
+        }
+        if (request.body && !/^application\/json(?:\s*;\s*charset\s*=\s*utf-8)?$/i.test(request.headers.get('content-type') ?? '')) {
+          throw new V2exError('invalid_request');
+        }
+      }
       if (path === '/session') {
         params(query, []);
         if (request.method === 'POST') {

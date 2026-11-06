@@ -99,6 +99,8 @@ export interface InterestProfile {
   source: 'manual' | 'history' | 'mixed';
 }
 
+export interface InterestEditFlags { labels: boolean; preferredNodes: boolean; exclusions: boolean }
+
 export interface Recommendation {
   topic: TopicListItem;
   score: number;
@@ -131,6 +133,8 @@ export interface ContentStore {
   getProfile(): Promise<InterestProfile | null>;
   putProfile(profile: InterestProfile): Promise<void>;
   clearProfile(): Promise<void>;
+  getProfileEdits(): Promise<InterestEditFlags>;
+  putInterestState(profile: InterestProfile, edits: InterestEditFlags): Promise<void>;
   getRecommendation(key: string): Promise<Recommendation | undefined>;
   putRecommendation(key: string, recommendation: Recommendation): Promise<void>;
   markRead(key: string): Promise<void>;

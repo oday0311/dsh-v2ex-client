@@ -21,7 +21,7 @@ test('Host route and Tool share content-first summary behavior and provenance', 
     return () => {};
   } } }, { auth: {} as never, credential: {} as never, content, intelligence } as never);
   const response = await route!.fetch(new Request('https://host.test/api/v2ex/topic/summary', {
-    method: 'POST', body: JSON.stringify({ topic: '1', mode: 'quick', replyPages: 1 }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: '1', mode: 'quick', replyPages: 1 }),
   }));
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('cache-control'), 'no-store');
@@ -48,7 +48,8 @@ test('summary route rejects query/body/method errors before content access', asy
     ['/api/v2ex/topic/summary', { method: 'POST', body: '{' }, 400],
     ['/api/v2ex/topic/summary', { method: 'POST', body: 'x'.repeat(4097) }, 413],
   ] as const) {
-    const response = await route!.fetch(new Request(`https://host.test${path}`, init));
+    const response = await route!.fetch(new Request(`https://host.test${path}`,
+      'body' in init ? { ...init, headers: { 'content-type': 'application/json' } } : init));
     assert.equal(response.status, status);
   }
   assert.equal(calls, 0);
@@ -64,7 +65,7 @@ test('missing AI services return ai_unavailable after authenticated content retr
     content: { async topic() { calls.push('content'); return { value: {}, stale: false, source: 'network', fetchedAt: 'now' }; } },
   } as never);
   const response = await route!.fetch(new Request('https://host.test/api/v2ex/topic/summary', {
-    method: 'POST', body: JSON.stringify({ topic: '1', mode: 'quick' }),
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topic: '1', mode: 'quick' }),
   }));
   assert.equal(response.status, 503);
   assert.equal((await response.json() as { error: { code: string } }).error.code, 'ai_unavailable');
