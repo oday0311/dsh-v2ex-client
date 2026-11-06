@@ -110,7 +110,7 @@ export class InterestService {
     const { profile: old, edits } = await this.state();
     const structuralEdit = parsed.data.labels !== undefined || parsed.data.preferredNodes !== undefined ||
       parsed.data.exclusions !== undefined;
-    const nextEdits = { labels: edits.labels || parsed.data.labels !== undefined,
+    const nextEdits = { ...edits, labels: edits.labels || parsed.data.labels !== undefined,
       preferredNodes: edits.preferredNodes || parsed.data.preferredNodes !== undefined,
       exclusions: edits.exclusions || parsed.data.exclusions !== undefined };
     const next = { ...old, learningPaused: parsed.data.learningPaused ?? old.learningPaused,

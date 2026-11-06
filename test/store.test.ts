@@ -211,6 +211,37 @@ test('legacy manual profile without edit metadata retains human fields after res
   assert.equal('profileEdits' in (await store.getProfile() as object), false);
 });
 
+test('legacy provenance survives pause, feedback, consent, and explicit empty edits across restart', async () => {
+  for (const source of ['manual', 'source-less'] as const) for (const edit of ['pause', 'empty'] as const) {
+    const memory = memoryDomain();
+    const labels = [{ name: 'Manual', weight: 1 }];
+    const preferredNodes = [{ name: 'manual-node', weight: 1 }];
+    const exclusions = ['manual-exclusion'];
+    const oldProfile = source === 'manual'
+      ? { authorized: true, learningPaused: false, labels, preferredNodes, exclusions,
+        feedback: [], updatedAt: '2026-11-06T00:00:00Z', source: 'manual' as const }
+      : { labels, preferredNodes: ['manual-node'], excludedTerms: exclusions,
+        feedback: [], updatedAt: '2026-11-06T00:00:00Z' };
+    await memory.domain.global.set({ settings: memory.readGlobal().settings, profile: oldProfile } as never);
+    const store = new DomainContentStore(memory.domain);
+    const model = { async completeJson() { return { labels: [{ name: 'Learned', weight: 1 }],
+      preferredNodes: [{ name: 'learned-node', weight: 1 }], exclusions: ['learned-exclusion'] }; } } as never;
+    const history = { async readEligibleUserText() { return 'interest'; } };
+    const service = new InterestService(store, history, model);
+    await service.update(edit === 'pause' ? { learningPaused: true } :
+      { labels: [], preferredNodes: [], exclusions: [] });
+    await service.recordFeedback(9, true);
+    await service.revoke();
+    await service.authorize();
+    const relearned = await new InterestService(store, history, model).relearn();
+    assert.deepEqual(relearned.labels, edit === 'pause' ? labels : []);
+    assert.deepEqual(relearned.preferredNodes, edit === 'pause' ? preferredNodes : []);
+    assert.deepEqual(relearned.exclusions, edit === 'pause' ? exclusions : []);
+    assert.deepEqual(relearned.feedback, [{ topicId: 9, interested: true }]);
+    assert.equal('profileEdits' in relearned, false);
+  }
+});
+
 test('summary writes validate before replacement and evict oldest beyond 300', async () => {
   const memory = memoryDomain();
   const store = new DomainContentStore(memory.domain);

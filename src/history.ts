@@ -13,7 +13,8 @@ const record = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === 'object' && !Array.isArray(value);
 const arrayField = (value: unknown, key: string): unknown[] | null =>
   Array.isArray(value) ? value : record(value) && Array.isArray(value[key]) ? value[key] as unknown[] : null;
-const badSource = /(?:^|[^A-Za-z0-9])(assistant|model|tool|plugin|system|developer|function|agent|bot)(?=$|[^A-Za-z0-9])/i;
+const badSource = /(?:^|[^A-Za-z0-9])(assistant|model|llm|tool|plugin|system|developer|function|agent|bot)(?=$|[^A-Za-z0-9])/i;
+const MAX_PROVENANCE_LENGTH = 256;
 const credentialPattern = /\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b|\bV2EX_PERSONAL_ACCESS_TOKEN\s*[:=]\s*\S+|\bAuthorization\s*:?\s*Bearer\s+\S+|\b(?:token|api[-_]?key|password|secret)\s*[:=]\s*(?:["'][^"'\r\n]{12,}["']|[A-Za-z0-9_./+=-]{12,})/i;
 const MAX_MESSAGE_BYTES = 4096;
 const encoder = new TextEncoder();
@@ -27,7 +28,8 @@ function timeValue(value: unknown): number {
 }
 
 function eligible(event: Record<string, unknown>): boolean {
-  if (!Object.hasOwn(event, 'type') || event.type !== 'user/message') return false;
+  if (!Object.hasOwn(event, 'type') || typeof event.type !== 'string' ||
+    event.type.length > MAX_PROVENANCE_LENGTH || event.type !== 'user/message') return false;
   const queue: Array<{ value: unknown; depth: number }> = [{ value: event, depth: 0 }];
   const seen = new WeakSet<object>();
   let visited = 0;
@@ -43,13 +45,14 @@ function eligible(event: Record<string, unknown>): boolean {
     let keys = 0;
     for (const key in value) {
       if (!Object.hasOwn(value, key)) continue;
-      if (++keys > 256) return false;
+      if (++keys > 256 || key.length > MAX_PROVENANCE_LENGTH) return false;
       const child = (value as Record<string, unknown>)[key];
       if (/^(toolCalls?|functionCall|attachments?|files?)$/i.test(key)) return false;
       if (/^(role|source|origin|actor|author|sender|kind)$/i.test(key)) {
-        if (typeof child === 'string' && badSource.test(child)) return false;
+        if (typeof child === 'string' && (child.length > MAX_PROVENANCE_LENGTH || badSource.test(child))) return false;
       }
-      if (key === 'type' && depth > 0 && typeof child === 'string' && badSource.test(child)) return false;
+      if (key === 'type' && depth > 0 && typeof child === 'string' &&
+        (child.length > MAX_PROVENANCE_LENGTH || badSource.test(child))) return false;
       if (child && typeof child === 'object') queue.push({ value: child, depth: depth + 1 });
     }
   }

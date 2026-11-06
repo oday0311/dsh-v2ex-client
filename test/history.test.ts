@@ -168,3 +168,34 @@ test('oversized strings are rejected before UTF-8 byte scanning', async () => {
     assert.equal(scannedOversized, false);
   } finally { Buffer.byteLength = original; }
 });
+
+test('llm provenance aliases are excluded at direct and nested punctuation boundaries', async () => {
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return [
+      { type: 'user/message', role: 'llm', content: [{ type: 'text', text: 'private direct' }] },
+      { type: 'user/message', source: { type: 'llm.message' }, content: [{ type: 'text', text: 'private nested' }] },
+      { type: 'user/message', origin: 'worker:llm@host', content: [{ type: 'text', text: 'private punctuated' }] },
+      { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+});
+
+test('oversized provenance is rejected before regex scanning', async () => {
+  const oversized = 'x'.repeat(20_000);
+  const original = RegExp.prototype.test;
+  let scannedOversized = false;
+  RegExp.prototype.test = function (value: string) {
+    if (value === oversized) scannedOversized = true;
+    return original.call(this, value);
+  };
+  try {
+    const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+      async filterEvents() { return [
+        { type: 'user/message', role: oversized, content: [{ type: 'text', text: 'private context' }] },
+        { type: 'user/message', source: { type: oversized }, content: [{ type: 'text', text: 'private nested' }] },
+        { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+      ]; } }));
+    assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+    assert.equal(scannedOversized, false);
+  } finally { RegExp.prototype.test = original; }
+});
