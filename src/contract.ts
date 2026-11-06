@@ -89,3 +89,35 @@ export interface Recommendation {
   read: boolean;
   createdAt: string;
 }
+
+export interface CacheRecord<T = unknown> {
+  value: T;
+  fetchedAt: string;
+  expiresAt: string;
+  accessedAt: string;
+}
+
+export interface Cached<T> {
+  value: T;
+  fetchedAt: string;
+  stale: boolean;
+  source: 'network' | 'cache';
+  refreshError?: import('./errors.js').PublicError;
+}
+
+export interface ContentStore {
+  getCache(key: string): Promise<CacheRecord | undefined>;
+  putCache(key: string, record: CacheRecord): Promise<void>;
+  deleteCache(key: string): Promise<void>;
+  getSettings(): Promise<PluginSettings>;
+  putSettings(settings: PluginSettings): Promise<void>;
+  getProfile(): Promise<InterestProfile | null>;
+  putProfile(profile: InterestProfile): Promise<void>;
+  clearProfile(): Promise<void>;
+  getRecommendation(key: string): Promise<Recommendation | undefined>;
+  putRecommendation(key: string, recommendation: Recommendation): Promise<void>;
+  markRead(key: string): Promise<void>;
+  getSummary?(key: string): Promise<TopicAiSummary | undefined>;
+  putSummary?(key: string, summary: TopicAiSummary): Promise<void>;
+  listRecommendations?(): Promise<Recommendation[]>;
+}
