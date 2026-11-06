@@ -114,6 +114,8 @@ export class RefreshService {
 
   private async run(signal: AbortSignal): Promise<void> {
     if (signal.aborted) throw new V2exError('timeout');
+    await this.drainCachedPending();
+    if (signal.aborted) throw new V2exError('timeout');
     if (!this.options.budget.canRunBackground(this.clock.now())) return;
     const loaded = await this.options.identity.withRead(async lease => {
       const [settings, profile] = await Promise.all([this.options.store.getSettings(lease.scope), this.options.store.getProfile(lease.scope)]);
@@ -163,11 +165,20 @@ export class RefreshService {
   }
 
   drainPending(expectedLease?: IdentityLease): Promise<void> {
+    return this.startDelivery(expectedLease, false);
+  }
+
+  private drainCachedPending(): Promise<void> {
+    if (!this.options.identity.withCachedMutation) return Promise.resolve();
+    return this.startDelivery(undefined, true);
+  }
+
+  private startDelivery(expectedLease: IdentityLease | undefined, cachedOnly: boolean): Promise<void> {
     if (this.disposed) return Promise.reject(new V2exError('timeout'));
     if (this.delivery) return this.delivery.promise;
     const controller = new AbortController();
     const delivery = { controller, promise: Promise.resolve() as Promise<void> };
-    delivery.promise = this.deliverPending(controller.signal, expectedLease)
+    delivery.promise = this.deliverPending(controller.signal, expectedLease, cachedOnly)
       .finally(() => { if (this.delivery === delivery) this.delivery = undefined; });
     this.delivery = delivery;
     return delivery.promise;
@@ -175,8 +186,8 @@ export class RefreshService {
 
   handleReminderIdle(): Promise<void> { return this.drainPending(); }
 
-  private async deliverPending(signal: AbortSignal, expectedLease?: IdentityLease): Promise<void> {
-    await this.options.identity.withMutation(async lease => {
+  private async deliverPending(signal: AbortSignal, expectedLease?: IdentityLease, cachedOnly = false): Promise<void> {
+    const deliver = async (lease: IdentityLease) => {
       if (signal.aborted) throw new V2exError('timeout');
       const settings = await this.options.store.getSettings(lease.scope);
       if (settings.quietHours && isQuietTime(this.clock.now(), settings.quietHours)) return;
@@ -187,7 +198,9 @@ export class RefreshService {
         if (signal.aborted) throw new V2exError('timeout');
         if (delivered.has(notice.noticeId)) await this.options.store.markNotificationSent(lease.scope, notice.noticeId);
       }
-    }, expectedLease);
+    };
+    if (cachedOnly) { await this.options.identity.withCachedMutation?.(deliver, expectedLease); return; }
+    await this.options.identity.withMutation(deliver, expectedLease);
   }
 
   clear(account: string): Promise<void> {

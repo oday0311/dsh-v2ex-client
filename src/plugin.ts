@@ -55,6 +55,8 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
       withRead: <T>(operation: (lease: import('./credentials.js').IdentityLease) => Promise<T>) => auth.withRead(operation),
       withMutation: <T>(operation: (lease: import('./credentials.js').IdentityLease, guard: import('./credentials.js').IdentityMutationGuard) => Promise<T>, expected?: import('./credentials.js').IdentityLease) =>
         auth.withMutation(operation, expected),
+      withCachedMutation: <T>(operation: (lease: import('./credentials.js').IdentityLease, guard: import('./credentials.js').IdentityMutationGuard) => Promise<T>, expected?: import('./credentials.js').IdentityLease) =>
+        auth.withCachedMutation(operation, expected),
     };
     const interests = new InterestService(store, new DshHistoryReader(() => {
       try { return host.reflect?.get('sessionQuery') ?? host.get?.('sessionQuery') ?? host.sessionQuery; }

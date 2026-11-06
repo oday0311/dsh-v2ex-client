@@ -72,6 +72,20 @@ test('verified account scope remains available offline in memory and clears on l
   await assert.rejects(auth.account(), { code: 'not_authenticated' });
 });
 
+test('cached identity mutation performs no vault read or V2EX identity lookup', async () => {
+  const vault = new FakeCredentialVault();
+  const { api, transport } = apiFrom({ '/api/v2/token': TOKEN_OK, '/api/v2/member': MEMBER_OK });
+  const auth = new AuthService(api, vault); await auth.login(TOKEN); const calls = transport.calls.length;
+  vault.resolve = async () => { throw new Error('vault must not be read'); };
+  const account = await auth.withCachedMutation(async (lease, guard) => guard.run(current =>
+    Promise.resolve(`${lease.account}:${current.account}`)));
+  assert.equal(account, 'alice:alice'); assert.equal(transport.calls.length, calls);
+  await auth.logout(false);
+  let entered = false;
+  assert.equal(await auth.withCachedMutation(async () => { entered = true; }), undefined);
+  assert.equal(entered, false); assert.equal(transport.calls.length, calls);
+});
+
 test('logout revalidates an externally replaced credential before choosing the cleanup account', async () => {
   const vault = new FakeCredentialVault(); const cleaned: Array<string | null> = [];
   const api = { async readToken() { return { scope: 'everything' }; },

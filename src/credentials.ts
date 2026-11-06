@@ -25,6 +25,8 @@ export interface IdentityLease {
 export interface IdentityLeaseProvider {
   withRead<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T>;
   withMutation<T>(operation: (lease: IdentityLease, guard: IdentityMutationGuard) => Promise<T>, expected?: IdentityLease): Promise<T>;
+  withCachedMutation?<T>(operation: (lease: IdentityLease, guard: IdentityMutationGuard) => Promise<T>,
+    expected?: IdentityLease): Promise<T | undefined>;
 }
 
 export interface IdentityMutationGuard {
@@ -68,6 +70,12 @@ export class AuthService {
   private sameLease(left: IdentityLease, right: IdentityLease): boolean {
     return left.generation === right.generation && left.scope === right.scope &&
       left.credentialFingerprint === right.credentialFingerprint && left.account === right.account;
+  }
+
+  private cachedLeaseUnlocked(): IdentityLease | undefined {
+    if (!this.verifiedUsername || !this.verifiedCredentialDigest) return undefined;
+    return { account: this.verifiedUsername, scope: accountScope(this.verifiedUsername),
+      credentialFingerprint: this.verifiedCredentialDigest, generation: this.authGeneration };
   }
 
   status(): Promise<AccountStatus> { return this.fenced(() => this.statusUnlocked()); }
@@ -161,6 +169,24 @@ export class AuthService {
       try {
         const result = await operation(lease, guard); const current = await this.leaseUnlocked();
         if (!this.sameLease(current, lease)) throw new V2exError('not_authenticated');
+        return result;
+      } finally { active = false; }
+    });
+  }
+
+  withCachedMutation<T>(operation: (lease: IdentityLease, guard: IdentityMutationGuard) => Promise<T>,
+    expected?: IdentityLease): Promise<T | undefined> {
+    return this.fenced(async () => {
+      const lease = this.cachedLeaseUnlocked();
+      if (!lease) return undefined;
+      if (expected && !this.sameLease(lease, expected)) throw new V2exError('not_authenticated');
+      let active = true;
+      const guard: IdentityMutationGuard = { lease, run: async nested => {
+        if (!active) throw new V2exError('not_authenticated'); return nested(lease);
+      } };
+      try {
+        const result = await operation(lease, guard); const current = this.cachedLeaseUnlocked();
+        if (!current || !this.sameLease(current, lease)) throw new V2exError('not_authenticated');
         return result;
       } finally { active = false; }
     });

@@ -23,13 +23,15 @@ function recommendation(id: number, score = 0.9, read = false): Recommendation {
 }
 
 class MutableIdentity implements IdentityLeaseProvider {
-  account = 'alice'; generation = 1;
+  account = 'alice'; generation = 1; cached = true; readCalls = 0; cachedMutationCalls = 0;
   lease(): IdentityLease { return { account: this.account, scope: accountScope(this.account),
     credentialFingerprint: `${this.account}-credential`, generation: this.generation }; }
-  switch(account: string) { this.account = account; this.generation++; }
+  switch(account: string) { this.account = account; this.generation++; this.cached = true; }
+  logout() { this.generation++; this.cached = false; }
   private same(a: IdentityLease, b: IdentityLease) { return a.account === b.account && a.scope === b.scope &&
     a.credentialFingerprint === b.credentialFingerprint && a.generation === b.generation; }
   async withRead<T>(operation: (lease: IdentityLease) => Promise<T>): Promise<T> {
+    this.readCalls++;
     const lease = this.lease(); const value = await operation(lease);
     if (!this.same(lease, this.lease())) throw new V2exError('not_authenticated');
     return value;
@@ -38,6 +40,10 @@ class MutableIdentity implements IdentityLeaseProvider {
     const lease = this.lease();
     if (expected && !this.same(expected, lease)) throw new V2exError('not_authenticated');
     return operation(lease, undefined as never);
+  }
+  async withCachedMutation<T>(operation: (lease: IdentityLease, guard: never) => Promise<T>): Promise<T | undefined> {
+    this.cachedMutationCalls++; if (!this.cached) return undefined;
+    return operation(this.lease(), undefined as never);
   }
 }
 
@@ -92,6 +98,54 @@ test('timer skips all content and model work near the V2EX rate limit', async ()
   await f.service.runNow('timer');
   assert.deepEqual(f.contentCalls, []);
   assert.equal(f.refreshCalls, 0);
+});
+
+test('budget exhaustion drains cached-account pending before returning and never duplicates later', async () => {
+  for (const reason of ['timer', 'manual'] as const) {
+    const f = fixture({ budget: false, items: [] }); const scope = accountScope('alice');
+    await f.store.enqueuePendingNotifications(scope, [{ noticeId: '00000000-0000-4000-8000-000000000081',
+      topicId: 81, title: 'Cached topic', node: 'tech', reason: 'Relevant', createdAt: at }]);
+    await f.service.runNow(reason);
+    assert.deepEqual(f.notices.map(batch => batch.map(value => value.topicId)), [[81]]);
+    assert.equal(f.identity.cachedMutationCalls, 1); assert.equal(f.identity.readCalls, 0);
+    assert.deepEqual(f.contentCalls, []); assert.equal(f.refreshCalls, 0);
+    f.budget.update({ limit: 100, remaining: 90, resetAt: Date.parse('2026-11-08T00:00:00Z') });
+    await f.service.runNow(reason === 'timer' ? 'manual' : 'timer');
+    assert.deepEqual(f.notices.map(batch => batch.map(value => value.topicId)), [[81]]);
+  }
+});
+
+test('budget exhaustion keeps cached pending during quiet hours', async () => {
+  const f = fixture({ budget: false, now: new Date('2026-11-06T15:00:00Z') }); const scope = accountScope('alice');
+  await f.store.putSettings({ ...f.store.settings,
+    quietHours: { start: '22:00', end: '07:00', timeZone: 'Asia/Shanghai' } }, scope);
+  await f.store.enqueuePendingNotifications(scope, [{ noticeId: '00000000-0000-4000-8000-000000000082',
+    topicId: 82, title: 'Quiet topic', node: 'tech', reason: 'Relevant', createdAt: at }]);
+  await f.service.runNow('timer');
+  assert.deepEqual(f.notices, []); assert.equal(f.identity.cachedMutationCalls, 1); assert.equal(f.identity.readCalls, 0);
+  assert.deepEqual((await f.store.getPendingNotifications(scope)).map(value => value.topicId), [82]);
+});
+
+test('budget exhaustion without cached identity does no identity or network work', async () => {
+  const f = fixture({ budget: false }); const scope = accountScope('alice'); f.identity.logout();
+  await f.store.enqueuePendingNotifications(scope, [{ noticeId: '00000000-0000-4000-8000-000000000083',
+    topicId: 83, title: 'Logged out topic', node: 'tech', reason: 'Relevant', createdAt: at }]);
+  await f.service.runNow('manual');
+  assert.deepEqual(f.notices, []); assert.equal(f.identity.cachedMutationCalls, 1); assert.equal(f.identity.readCalls, 0);
+  assert.deepEqual(f.contentCalls, []); assert.equal(f.refreshCalls, 0);
+  assert.deepEqual((await f.store.getPendingNotifications(scope)).map(value => value.topicId), [83]);
+});
+
+test('pre-budget cached drain respects account switch, logout, and dispose', async () => {
+  const f = fixture({ budget: false }); const alice = accountScope('alice');
+  await f.store.enqueuePendingNotifications(alice, [{ noticeId: '00000000-0000-4000-8000-000000000084',
+    topicId: 84, title: 'Alice topic', node: 'tech', reason: 'Relevant', createdAt: at }]);
+  f.identity.switch('bob'); await f.service.runNow('timer'); assert.deepEqual(f.notices, []);
+  f.identity.logout(); await f.service.runNow('timer'); assert.deepEqual(f.notices, []);
+  assert.equal(f.identity.cachedMutationCalls, 2); assert.equal(f.identity.readCalls, 0);
+  await f.service.dispose(); f.identity.switch('alice');
+  await assert.rejects(f.service.runNow('manual'), { code: 'timeout' });
+  assert.deepEqual((await f.store.getPendingNotifications(alice)).map(value => value.topicId), [84]);
 });
 
 test('concurrent timer and manual triggers join one serialized run', async () => {
