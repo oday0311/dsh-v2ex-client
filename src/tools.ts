@@ -1,0 +1,127 @@
+import { defineTool, type ToolDefinition } from '@deepseek-ai/dsh-tools';
+import type { Cached, TopicListItem, TopicPage, TopicThread } from './contract.js';
+import { V2exError } from './errors.js';
+import { assertNodeName, assertTopicId } from './validation.js';
+
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const encoder = new TextEncoder();
+
+export interface ContentReader {
+  latest(input: { page: number }, signal?: AbortSignal): Promise<Cached<TopicPage>>;
+  hot(signal?: AbortSignal): Promise<Cached<TopicListItem[]>>;
+  nodeTopics(input: { node: string; page: number }, signal?: AbortSignal): Promise<Cached<TopicPage>>;
+  topic(input: { topic: string; replyPages: number }, signal?: AbortSignal): Promise<Cached<TopicThread>>;
+}
+
+function clamp(value: number | undefined, fallback: number, maximum: number): number {
+  if (value === undefined) return fallback;
+  if (!Number.isSafeInteger(value) || value < 1) throw new V2exError('invalid_request');
+  return Math.min(value, maximum);
+}
+
+function text(value: string, limit: number): { value: string; truncated: boolean } {
+  if (value.length <= limit) return { value, truncated: false };
+  return { value: value.slice(0, limit), truncated: true };
+}
+
+function bytes(value: unknown): number { return encoder.encode(JSON.stringify(value)).byteLength; }
+
+function metadata<T>(cached: Cached<T>) {
+  return { fetchedAt: text(cached.fetchedAt, 64).value, stale: cached.stale,
+    source: cached.source === 'cache' ? 'cache' as const : 'network' as const,
+    ...(cached.refreshError ? { refreshError: { code: text(cached.refreshError.code, 64).value,
+      message: text(cached.refreshError.message, 500).value, retryable: cached.refreshError.retryable } } : {}) };
+}
+
+function listItem(value: TopicListItem) {
+  const title = text(value.title, 300);
+  const nodeName = text(value.node.name, 64);
+  const nodeTitle = text(value.node.title, 100);
+  const username = text(value.author.username, 100);
+  const createdAt = text(value.createdAt, 64);
+  const lastReplyAt = value.lastReplyAt === null ? null : text(value.lastReplyAt, 64);
+  const url = text(value.url, 300);
+  return { id: value.id, title: title.value,
+    node: { name: nodeName.value, title: nodeTitle.value },
+    author: { username: username.value }, replyCount: value.replyCount,
+    createdAt: createdAt.value, lastReplyAt: lastReplyAt?.value ?? null, url: url.value,
+    fieldsTruncated: [title, nodeName, nodeTitle, username, createdAt, url].some((field) => field.truncated) ||
+      (lastReplyAt?.truncated ?? false) };
+}
+
+function listResult(cached: Cached<TopicListItem[]>, page?: number, hasMore?: boolean) {
+  const all = cached.value;
+  const items = all.slice(0, 30).map(listItem);
+  const result = { ok: true, items, ...(page === undefined ? {} : { page }),
+    ...(hasMore === undefined ? {} : { hasMore }), ...metadata(cached),
+    truncated: items.length < all.length || items.some((item) => item.fieldsTruncated),
+    omittedItems: all.length - items.length };
+  while (bytes(result) > MAX_OUTPUT_BYTES && result.items.length) {
+    result.items.pop();
+    result.truncated = true;
+    result.omittedItems++;
+  }
+  return result;
+}
+
+function topicResult(cached: Cached<TopicThread>) {
+  const thread = cached.value;
+  const body = text(thread.content, 12_000);
+  const topic = listItem(thread.topic);
+  const replies = thread.replies.slice(0, 30).map((reply) => {
+    const content = text(reply.content, 1_000);
+    return { id: reply.id, author: { username: text(reply.author.username, 100).value },
+      content: content.value, contentTruncated: content.truncated,
+      createdAt: text(reply.createdAt, 64).value };
+  });
+  const result = { ok: true, topic: { ...topic, content: body.value,
+    contentTruncated: body.truncated }, replies, replyPage: thread.replyPage,
+    hasMoreReplies: thread.hasMoreReplies, ...metadata(cached), truncated: body.truncated ||
+      topic.fieldsTruncated ||
+      replies.length < thread.replies.length || replies.some((reply) => reply.contentTruncated),
+    omittedReplies: thread.replies.length - replies.length };
+  while (bytes(result) > MAX_OUTPUT_BYTES && result.replies.length) {
+    result.replies.pop();
+    result.truncated = true;
+    result.omittedReplies++;
+  }
+  if (bytes(result) > MAX_OUTPUT_BYTES) {
+    result.topic.content = '';
+    result.topic.contentTruncated = true;
+    result.truncated = true;
+  }
+  return result;
+}
+
+const output = { schema: { type: 'json' } as const,
+  render: (_args: unknown, value: unknown) => [{ type: 'text' as const, text: JSON.stringify(value) }] };
+
+export function createBrowsingTools(reader: ContentReader): ToolDefinition[] {
+  return [
+    defineTool({ name: 'v2ex_latest', description: 'Read recent V2EX topics.',
+      parameters: { page: { type: 'integer' } }, output,
+      async execute(args, exec) {
+        const page = clamp(args.page, 1, 1000);
+        const cached = await reader.latest({ page }, exec.signal);
+        return listResult({ ...cached, value: cached.value.items }, cached.value.page, cached.value.hasMore);
+      } }),
+    defineTool({ name: 'v2ex_hot', description: 'Read popular V2EX topics.',
+      parameters: {}, output,
+      async execute(_args, exec) { return listResult(await reader.hot(exec.signal)); } }),
+    defineTool({ name: 'v2ex_node_topics', description: 'Read topics from a V2EX node.',
+      parameters: { node: { type: 'string', required: true }, page: { type: 'integer' } }, output,
+      async execute(args, exec) {
+        const node = assertNodeName(args.node);
+        const page = clamp(args.page, 1, 1000);
+        const cached = await reader.nodeTopics({ node, page }, exec.signal);
+        return listResult({ ...cached, value: cached.value.items }, cached.value.page, cached.value.hasMore);
+      } }),
+    defineTool({ name: 'v2ex_topic', description: 'Read a V2EX topic and a bounded number of reply pages.',
+      parameters: { topic: { type: 'string', required: true }, replyPages: { type: 'integer' } }, output,
+      async execute(args, exec) {
+        const topic = String(assertTopicId(args.topic));
+        const replyPages = clamp(args.replyPages, 1, 3);
+        return topicResult(await reader.topic({ topic, replyPages }, exec.signal));
+      } }),
+  ];
+}

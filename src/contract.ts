@@ -42,6 +42,13 @@ export interface TopicPage {
   stale: boolean;
 }
 
+export interface NodeInfo {
+  name: string;
+  title: string;
+  topicCount: number | null;
+  url: string;
+}
+
 export interface ReplyItem {
   id: number;
   author: { username: string };
