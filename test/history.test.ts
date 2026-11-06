@@ -268,12 +268,102 @@ test('hostile provenance subtrees fail bounded plain-data validation', async () 
     { type: 'user/message', source: ['user', , 'human'], content: [{ type: 'text', text: 'private sparse' }] },
     { type: 'user/message', source: {}, content: [{ type: 'text', text: 'private empty source' }] },
     { type: 'user/message', source: [], content: [{ type: 'text', text: 'private empty array' }] },
-    { type: 'user/message', content: [Object.defineProperty({ type: 'text', text: 'private hidden metadata' },
-      'metadata', { value: { note: 'extra' }, enumerable: false })] },
     { type: 'user/message', source: { name: 'user' }, content: [{ type: 'text', text: 'safe user text' }] },
   ];
   const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
     async filterEvents() { return events; } }));
   assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
   assert.equal(getterCalls, 0);
+});
+
+test('explicit provenance wrappers reject nested non-user leaves', async () => {
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return [
+      { type: 'user/message', provenance: { name: 'assistant.message' }, content: [{ type: 'text', text: 'private direct' }] },
+      { type: 'user/message', data: { message: { provenance: [{ detail: { label: 'llm:worker' } }],
+        content: [{ type: 'text', text: 'private nested' }] } } },
+      { type: 'user/message', provenance: { name: 'user', detail: ['human'] },
+        content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+});
+
+test('host-returned arrays are validated before any indexed read', async () => {
+  for (const stage of ['sessions', 'events'] as const) {
+    let getterCalls = 0;
+    const unsafe = [{ id: 's' }, { id: 'safe' }] as unknown[];
+    Object.defineProperty(unsafe, '0', { get() { getterCalls++; return { id: 's' }; }, enumerable: true });
+    const reader = new DshHistoryReader(() => ({
+      async listSessions() { return stage === 'sessions' ? unsafe : [{ id: 's' }]; },
+      async filterEvents() { return stage === 'events' ? unsafe : []; },
+    }));
+    await assert.rejects(reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), { code: 'history_access_denied' });
+    assert.equal(getterCalls, 0);
+  }
+});
+
+test('host-returned arrays reject sparse, extra, oversized, and wrapped accessor shapes', async () => {
+  for (const unsafe of [Array(2), Object.assign([{ id: 's' }], { extra: 'x' }),
+    Array.from({ length: 1001 }, () => ({ id: 's' })),
+    Object.setPrototypeOf([{ id: 's' }], Object.create(Array.prototype))]) {
+    const reader = new DshHistoryReader(() => ({ async listSessions() { return unsafe; }, async filterEvents() { return []; } }));
+    await assert.rejects(reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), { code: 'history_access_denied' });
+  }
+  let getterCalls = 0;
+  const wrapper = { get sessions() { getterCalls++; return [{ id: 's' }]; } };
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return wrapper; }, async filterEvents() { return []; } }));
+  await assert.rejects(reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), { code: 'history_access_denied' });
+  assert.equal(getterCalls, 0);
+  const eventsWrapper = { get events() { getterCalls++; return []; } };
+  const eventsReader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return eventsWrapper; } }));
+  await assert.rejects(eventsReader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), { code: 'history_access_denied' });
+  assert.equal(getterCalls, 0);
+});
+
+test('unknown hidden and symbol metadata is ignored without reading it', async () => {
+  let getterCalls = 0;
+  const block = { type: 'text', text: 'safe user text' };
+  Object.defineProperty(block, 'metadata', { get() { getterCalls++; return { note: 'hidden' }; } });
+  Object.defineProperty(block, Symbol('extra'), { get() { getterCalls++; return 'hidden'; } });
+  const sessions = [{ id: 's' }];
+  Object.defineProperty(sessions, Symbol('extra'), { get() { getterCalls++; return 'hidden'; } });
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return sessions; },
+    async filterEvents() { return [{ type: 'user/message', content: [block] }]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+  assert.equal(getterCalls, 0);
+});
+
+test('known hidden provenance and consumed fields are rejected without invoking getters', async () => {
+  let getterCalls = 0;
+  const hiddenSource = { type: 'user/message', content: [{ type: 'text', text: 'private source' }] };
+  Object.defineProperty(hiddenSource, 'provenance', { get() { getterCalls++; return { name: 'assistant' }; } });
+  const hiddenText = { type: 'text' };
+  Object.defineProperty(hiddenText, 'text', { get() { getterCalls++; return 'private text'; } });
+  const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+    async filterEvents() { return [hiddenSource,
+      { type: 'user/message', content: [hiddenText] },
+      { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+    ]; } }));
+  assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+  assert.equal(getterCalls, 0);
+});
+
+test('too-wide objects are rejected without whole-key materialization', async () => {
+  const wide = Object.fromEntries(Array.from({ length: 300 }, (_, index) => [`field${index}`, 'user']));
+  const original = Reflect.ownKeys;
+  let wideMaterialized = false;
+  Reflect.ownKeys = function (value: object) {
+    if (value === wide) wideMaterialized = true;
+    return original(value);
+  };
+  try {
+    const reader = new DshHistoryReader(() => ({ async listSessions() { return [{ id: 's' }]; },
+      async filterEvents() { return [
+        { type: 'user/message', provenance: wide, content: [{ type: 'text', text: 'private context' }] },
+        { type: 'user/message', content: [{ type: 'text', text: 'safe user text' }] },
+      ]; } }));
+    assert.equal(await reader.readEligibleUserText({ maxSessions: 1, maxBytes: 100 }), 'safe user text');
+    assert.equal(wideMaterialized, false);
+  } finally { Reflect.ownKeys = original; }
 });

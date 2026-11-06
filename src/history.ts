@@ -17,11 +17,41 @@ const plain = (value: object): boolean => {
 };
 const ownData = (value: object, key: string): { value: unknown } | undefined => {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
-  return descriptor && 'value' in descriptor ? { value: descriptor.value } : undefined;
+  return descriptor?.enumerable && 'value' in descriptor ? { value: descriptor.value } : undefined;
 };
+const CONSUMED_FIELDS = ['type', 'role', 'source', 'origin', 'actor', 'author', 'sender', 'kind', 'provenance',
+  'payload', 'data', 'message', 'content', 'text', 'id', 'timestamp', 'createdAt', 'updatedAt'];
+// Host history is treated as JSON-like data: unknown hidden and symbol fields are never consumed.
+function boundedOwnKeys(value: object, max: number): string[] | null {
+  const keys: string[] = [];
+  for (const key of CONSUMED_FIELDS) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor && (!descriptor.enumerable || !('value' in descriptor))) return null;
+  }
+  for (const key in value) {
+    if (!Object.hasOwn(value, key) || keys.length >= max || key.length > 256) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor?.enumerable || !('value' in descriptor)) return null;
+    keys.push(key);
+  }
+  return keys;
+}
+function plainArrayData(value: unknown, max: number): unknown[] | null {
+  if (!Array.isArray(value) || !plain(value) || value.length > max) return null;
+  const keys = boundedOwnKeys(value, max);
+  if (!keys || keys.length !== value.length ||
+    keys.some(key => !/^(?:0|[1-9]\d*)$/.test(key) || Number(key) >= value.length)) return null;
+  const copy: unknown[] = [];
+  for (let index = 0; index < value.length; index++) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !('value' in descriptor) || !descriptor.enumerable) return null;
+    copy.push(descriptor.value);
+  }
+  return copy;
+}
 const arrayField = (value: unknown, key: string): unknown[] | null => {
   const candidate = Array.isArray(value) ? value : record(value) && plain(value) ? ownData(value, key)?.value : null;
-  return Array.isArray(candidate) && plain(candidate) ? candidate : null;
+  return plainArrayData(candidate, 1000);
 };
 const badSource = /(?:^|[^A-Za-z0-9])(assistant|model|llm|tool|plugin|system|developer|function|agent|bot)(?=$|[^A-Za-z0-9])/i;
 const MAX_PROVENANCE_LENGTH = 256;
@@ -46,7 +76,8 @@ function sortable(value: Record<string, unknown>, timeKey: string, fallbackKey: 
       (idField && (typeof id !== 'string' || id.length > 256))) return null;
   const primary = Object.getOwnPropertyDescriptor(value, timeKey);
   const fallback = Object.getOwnPropertyDescriptor(value, fallbackKey);
-  if (primary && !('value' in primary) || fallback && !('value' in fallback)) return null;
+  if (primary && (!primary.enumerable || !('value' in primary)) ||
+      fallback && (!fallback.enumerable || !('value' in fallback))) return null;
   const time = primary?.value ?? fallback?.value;
   if (time !== undefined && (typeof time !== 'string' && typeof time !== 'number' ||
       typeof time === 'string' && time.length > 64 || typeof time === 'number' && !Number.isFinite(time))) return null;
@@ -69,16 +100,14 @@ function eligible(event: Record<string, unknown>): boolean {
       for (let index = 0; index < value.length; index++) if (!Object.hasOwn(value, index)) return false;
     }
     if (!plain(value)) return false;
-    const keys = Reflect.ownKeys(value);
-    if (keys.length > 257 || provenance && (Array.isArray(value) ? value.length === 0 : keys.length === 0)) return false;
+    const keys = boundedOwnKeys(value, 256);
+    if (!keys || provenance && (Array.isArray(value) ? value.length === 0 : keys.length === 0)) return false;
     for (const key of keys) {
-      if (typeof key !== 'string' || key.length > MAX_PROVENANCE_LENGTH) return false;
       const descriptor = Object.getOwnPropertyDescriptor(value, key);
       if (!descriptor || !('value' in descriptor)) return false;
-      if (Array.isArray(value) && key === 'length') continue;
       const child = descriptor.value as unknown;
       if (/^(toolCalls?|functionCall|attachments?|files?)$/i.test(key)) return false;
-      const source = provenance || /^(role|source|origin|actor|author|sender|kind)$/i.test(key) || key === 'type' && depth > 0;
+      const source = provenance || /^(role|source|origin|actor|author|sender|kind|provenance)$/i.test(key) || key === 'type' && depth > 0;
       if (typeof child === 'string') {
         if (child.length > (source ? MAX_PROVENANCE_LENGTH : MAX_MESSAGE_BYTES) || source && badSource.test(child)) return false;
       } else if (child && typeof child === 'object') {
@@ -105,7 +134,7 @@ function userText(event: Record<string, unknown>): string {
   let bytes = 0;
   for (const block of blocks) {
     if (!record(block) || ownData(block, 'type')?.value !== 'text' || typeof ownData(block, 'text')?.value !== 'string' ||
-      Reflect.ownKeys(block).some(key => key !== 'type' && key !== 'text')) continue;
+      boundedOwnKeys(block, 2)?.some(key => key !== 'type' && key !== 'text') !== false) continue;
     const text = ownData(block, 'text')!.value as string;
     if (text.length > MAX_MESSAGE_BYTES) return '';
     const size = Buffer.byteLength(text);
