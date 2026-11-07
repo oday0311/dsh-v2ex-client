@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { lstat, mkdtemp, readFile, rm } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdtemp, open, readFile, rm } from 'node:fs/promises';
 import { dirname, posix, resolve, sep, win32 } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
@@ -25,19 +26,27 @@ function safePath(path) {
     path.split('/').every(part => part !== '' && part !== '.' && part !== '..');
 }
 
-function safeSourcePath(value, allowEmpty = false) {
+function safeSourceLayer(value, allowEmpty) {
   if (typeof value !== 'string' || value.length > 2_048 || (!allowEmpty && value.length === 0)) return false;
   if (value === '') return allowEmpty;
-  let decoded;
-  try { decoded = decodeURIComponent(value); } catch { return false; }
-  for (const candidate of new Set([value, decoded])) {
-    if (/^[a-z][a-z0-9+.-]*:/i.test(candidate) || /^[a-z]:/i.test(candidate) ||
-        posix.isAbsolute(candidate) || win32.isAbsolute(candidate) || candidate.includes('\\') ||
-        candidate.startsWith('//')) return false;
-    const parts = candidate.split('/');
-    if (parts.some(part => part === '' || part === '.' || part === '..') || posix.normalize(candidate) !== candidate) return false;
-  }
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value) || /^[a-z]:/i.test(value) ||
+      posix.isAbsolute(value) || win32.isAbsolute(value) || value.includes('\\') || value.startsWith('//')) return false;
+  const parts = value.split('/');
+  if (parts.some(part => part === '' || part === '.' || part === '..') || posix.normalize(value) !== value) return false;
   return true;
+}
+
+function safeSourcePath(value, allowEmpty = false) {
+  let current = value;
+  for (let depth = 0; depth <= 5; depth++) {
+    if (!safeSourceLayer(current, allowEmpty)) return false;
+    let decoded;
+    try { decoded = decodeURIComponent(current); } catch { return false; }
+    if (decoded === current) return true;
+    if (depth === 5) return false;
+    current = decoded;
+  }
+  return false;
 }
 
 function inspectText(path, text) {
@@ -60,6 +69,76 @@ function inspectText(path, text) {
   }
 }
 
+function sameIdentity(left, right) {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function sameSnapshot(left, right) {
+  return sameIdentity(left, right) && left.size === right.size &&
+    left.mtimeNs === right.mtimeNs && left.ctimeNs === right.ctimeNs;
+}
+
+async function openWithoutFollowing(absolute, path) {
+  const noFollow = typeof constants.O_NOFOLLOW === 'number' ? constants.O_NOFOLLOW : 0;
+  try {
+    return await open(absolute, constants.O_RDONLY | noFollow);
+  } catch (error) {
+    if (noFollow !== 0 && error && typeof error === 'object' &&
+        (error.code === 'EINVAL' || error.code === 'ENOTSUP' || error.code === 'EOPNOTSUPP')) {
+      try { return await open(absolute, constants.O_RDONLY); }
+      catch { fail(`package_file_forbidden:${path}`); }
+    }
+    fail(`package_file_forbidden:${path}`);
+  }
+}
+
+export async function readStablePackageFile(baseDirectory, path, expectedSize, hooks = {}) {
+  if (!safePath(path) || !Number.isSafeInteger(expectedSize) || expectedSize < 0 || expectedSize > MAX_FILE_BYTES) {
+    fail(`package_size_invalid:${path}`);
+  }
+  const absolute = resolve(baseDirectory, path);
+  if (!absolute.startsWith(`${resolve(baseDirectory)}${sep}`)) fail(`package_file_forbidden:${path}`);
+  let beforePath;
+  try { beforePath = await lstat(absolute, { bigint: true }); }
+  catch { fail(`package_file_forbidden:${path}`); }
+  if (!beforePath.isFile() || beforePath.isSymbolicLink()) fail(`package_file_forbidden:${path}`);
+
+  const handle = await openWithoutFollowing(absolute, path);
+  try {
+    const initial = await handle.stat({ bigint: true });
+    if (!initial.isFile() || !sameSnapshot(beforePath, initial)) fail(`package_file_changed:${path}`);
+    if (initial.size > BigInt(MAX_FILE_BYTES)) fail(`package_size_invalid:${path}`);
+    if (initial.size !== BigInt(expectedSize)) fail(`package_size_mismatch:${path}`);
+    if (typeof hooks.afterInitialStat === 'function') await hooks.afterInitialStat();
+
+    const chunks = [];
+    let total = 0;
+    while (total <= expectedSize) {
+      const requestSize = Math.min(64 * 1024, expectedSize + 1 - total, MAX_FILE_BYTES + 1 - total);
+      if (requestSize <= 0) break;
+      const chunk = Buffer.allocUnsafe(requestSize);
+      const { bytesRead } = await handle.read(chunk, 0, requestSize, null);
+      if (bytesRead === 0) break;
+      total += bytesRead;
+      if (total > expectedSize || total > MAX_FILE_BYTES) fail(`package_size_mismatch:${path}`);
+      chunks.push(chunk.subarray(0, bytesRead));
+    }
+    if (total !== expectedSize) fail(`package_size_mismatch:${path}`);
+
+    const finalDescriptor = await handle.stat({ bigint: true });
+    if (!finalDescriptor.isFile() || !sameSnapshot(initial, finalDescriptor)) fail(`package_file_changed:${path}`);
+    let finalPath;
+    try { finalPath = await lstat(absolute, { bigint: true }); }
+    catch { fail(`package_file_changed:${path}`); }
+    if (!finalPath.isFile() || finalPath.isSymbolicLink() || !sameSnapshot(finalDescriptor, finalPath)) {
+      fail(`package_file_changed:${path}`);
+    }
+    return Buffer.concat(chunks, total);
+  } finally {
+    await handle.close();
+  }
+}
+
 export async function inspectPackageEntries(entries, read = undefined) {
   if (!Array.isArray(entries) || entries.length === 0 || entries.length > 2_000) fail('pack_metadata_invalid');
   const seen = new Set();
@@ -76,21 +155,7 @@ export async function inspectPackageEntries(entries, read = undefined) {
   }
   for (const path of REQUIRED) if (!seen.has(path)) fail(`package_file_missing:${path}`);
 
-  const readEntry = read ?? (async (path, expectedSize) => {
-    const absolute = resolve(root, path);
-    if (!absolute.startsWith(`${root}${sep}`)) fail(`package_file_forbidden:${path}`);
-    const before = await lstat(absolute);
-    if (!before.isFile() || before.isSymbolicLink()) fail(`package_file_forbidden:${path}`);
-    if (before.size > MAX_FILE_BYTES) fail(`package_size_invalid:${path}`);
-    if (before.size !== expectedSize) fail(`package_size_mismatch:${path}`);
-    const bytes = await readFile(absolute);
-    const after = await lstat(absolute);
-    if (!after.isFile() || after.isSymbolicLink() || before.dev !== after.dev || before.ino !== after.ino ||
-        before.size !== after.size || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs) {
-      fail(`package_file_changed:${path}`);
-    }
-    return bytes;
-  });
+  const readEntry = read ?? ((path, expectedSize) => readStablePackageFile(root, path, expectedSize));
   let actualTotal = 0;
   for (const path of seen) {
     const bytes = await readEntry(path, sizes.get(path));

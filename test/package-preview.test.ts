@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, rename, rm, symlink, truncate, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { resolve } from 'node:path';
 import test from 'node:test';
 import {
   inspectPackageEntries,
   parsePackOutput,
+  readStablePackageFile,
   validateReleaseMetadata,
   verifyPackagePreview,
 } from '../scripts/verify-package.mjs';
@@ -87,6 +90,49 @@ test('package scanner bounds actual bytes before decoding and rejects metadata m
   /package_size_mismatch:lib\/index\.js/);
 });
 
+test('descriptor reader rejects growth, truncation, replacement, and initial symlinks', async (context) => {
+  const directory = await mkdtemp(resolve(tmpdir(), 'v2ex-package-reader-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+
+  await writeFile(resolve(directory, 'growth.js'), 'safe');
+  await assert.rejects(readStablePackageFile(directory, 'growth.js', 4, {
+    afterInitialStat: () => appendFile(resolve(directory, 'growth.js'), 'x'),
+  }), /package_size_mismatch|package_file_changed/);
+
+  await writeFile(resolve(directory, 'truncated.js'), 'safe');
+  await assert.rejects(readStablePackageFile(directory, 'truncated.js', 4, {
+    afterInitialStat: () => truncate(resolve(directory, 'truncated.js'), 2),
+  }), /package_size_mismatch|package_file_changed/);
+
+  await writeFile(resolve(directory, 'replaced.js'), 'safe');
+  await assert.rejects(readStablePackageFile(directory, 'replaced.js', 4, {
+    afterInitialStat: async () => {
+      await rename(resolve(directory, 'replaced.js'), resolve(directory, 'original.js'));
+      await writeFile(resolve(directory, 'replaced.js'), 'safe');
+    },
+  }), /package_file_changed/);
+
+  await writeFile(resolve(directory, 'target.js'), 'safe');
+  await symlink(resolve(directory, 'target.js'), resolve(directory, 'linked.js'));
+  await assert.rejects(readStablePackageFile(directory, 'linked.js', 4), /package_file_forbidden/);
+});
+
+test('descriptor reader rejects a same-size symlink swap and an oversized file before allocation', async (context) => {
+  const directory = await mkdtemp(resolve(tmpdir(), 'v2ex-package-swap-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  await writeFile(resolve(directory, 'victim.js'), 'safe');
+  await writeFile(resolve(directory, 'other.js'), 'same');
+  await assert.rejects(readStablePackageFile(directory, 'victim.js', 4, {
+    afterInitialStat: async () => {
+      await rename(resolve(directory, 'victim.js'), resolve(directory, 'saved.js'));
+      await symlink(resolve(directory, 'other.js'), resolve(directory, 'victim.js'));
+    },
+  }), /package_file_changed|package_file_forbidden/);
+
+  await writeFile(resolve(directory, 'oversized.js'), Buffer.alloc(5_000_001, 0x20));
+  await assert.rejects(readStablePackageFile(directory, 'oversized.js', 1), /package_size_invalid/);
+});
+
 test('package scanner enforces total actual bytes rather than trusting only metadata totals', async () => {
   const entries = [...validEntries, ...Array.from({ length: 7 }, (_, index) => ({
     path: `lib/extra-${index}.js`, size: 4_000_000,
@@ -107,9 +153,14 @@ test('package scanner rejects static credentials', async () => {
 });
 
 test('package scanner rejects absolute source-map paths', async () => {
+  let overEncoded = '../src/index.ts';
+  for (let depth = 0; depth < 7; depth++) overEncoded = encodeURIComponent(overEncoded);
   const unsafe = ['/root/index.ts', 'C:\\root\\index.ts', 'C:/root/index.ts',
     '\\\\server\\share\\index.ts', '\\rooted\\index.ts', '//server/share/index.ts',
-    'file:///root/index.ts', 'https://example.test/index.ts', '../src/index.ts'];
+    'file:///root/index.ts', 'https://example.test/index.ts', '../src/index.ts',
+    '%252e%252e%252fsrc%252findex.ts', '%25252froot%252findex.ts',
+    'file%25253A%252f%252f%252froot%252findex.ts', '%25255croot%25255cindex.ts', '%not-hex',
+    overEncoded];
   for (const source of unsafe) {
     const map = Buffer.from(JSON.stringify({ version: 3, sources: [source] }));
     const entries = [...validEntries, { path: 'lib/index.js.map', size: map.byteLength }];
