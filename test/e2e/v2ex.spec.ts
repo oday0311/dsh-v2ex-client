@@ -1,5 +1,5 @@
 import { expect, test, type Page, type Route, type TestInfo } from '@playwright/test';
-import { PNG } from 'pngjs';
+import { analyzePng, informativeImageFailures } from '../support/png-stats.js';
 
 const NOW = '2026-11-07T08:00:00.000Z';
 const error = (code: string) => ({ ok: false, error: { code, message: 'fixture error', retryable: true } });
@@ -126,12 +126,14 @@ async function assertLayout(page: Page): Promise<void> {
   const issues = await page.evaluate(() => {
     const app = document.querySelector<HTMLElement>('.v2ex-app'); if (!app) return ['missing app'];
     const failures: string[] = []; const appRect = app.getBoundingClientRect();
+    const visible = (element: HTMLElement) => {
+      const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
+      return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0 &&
+        rect.bottom > appRect.top && rect.top < appRect.bottom && rect.right > appRect.left && rect.left < appRect.right;
+    };
     if (document.documentElement.scrollWidth > document.documentElement.clientWidth + 1) failures.push('document horizontal overflow');
     if (app.scrollWidth > app.clientWidth + 1) failures.push('app horizontal overflow');
-    const controls = [...app.querySelectorAll<HTMLElement>('button,input')].filter(element => {
-      const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
-      return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0;
-    });
+    const controls = [...app.querySelectorAll<HTMLElement>('button,input')].filter(visible);
     for (const control of controls) {
       const rect = control.getBoundingClientRect();
       if (rect.left < appRect.left - 1 || rect.right > appRect.right + 1) failures.push(`control clipped: ${control.getAttribute('aria-label') ?? control.textContent}`);
@@ -139,11 +141,6 @@ async function assertLayout(page: Page): Promise<void> {
         (control.id ? document.querySelector(`label[for="${CSS.escape(control.id)}"]`)?.textContent?.trim() : '') || control.closest('label')?.textContent?.trim();
       if (!name) failures.push('unnamed control');
     }
-    const visible = (element: HTMLElement) => {
-      const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
-      return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0 &&
-        rect.bottom > appRect.top && rect.top < appRect.bottom && rect.right > appRect.left && rect.left < appRect.right;
-    };
     const textElements = [...app.querySelectorAll<HTMLElement>('h1,h2,h3,h4,p,span,label,button,legend')]
       .filter(element => visible(element) && [...element.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()));
     for (const element of textElements) {
@@ -177,18 +174,34 @@ async function assertStable(page: Page): Promise<void> {
   const first = await page.locator('.v2ex-app').boundingBox(); await page.waitForTimeout(120);
   expect(await page.locator('.v2ex-app').boundingBox()).toEqual(first);
 }
-async function screenshot(page: Page, testInfo: TestInfo, name: string) {
-  const pixels = await page.screenshot({ path: testInfo.outputPath(`${name}.png`), fullPage: true, animations: 'disabled' });
-  const png = PNG.sync.read(pixels); let dark = 0; let sum = 0; let sumSquares = 0;
-  const populatedRows = new Set<number>(); const populatedColumns = new Set<number>();
-  for (let y = 0; y < png.height; y += 2) for (let x = 0; x < png.width; x += 2) {
-    const offset = (y * png.width + x) * 4; const luminance = (png.data[offset]! + png.data[offset + 1]! + png.data[offset + 2]!) / 3;
-    sum += luminance; sumSquares += luminance * luminance;
-    if (luminance < 240) { dark++; populatedRows.add(y); populatedColumns.add(x); }
+type ScrollDepth = 'top' | 'mid' | 'bottom';
+async function traverseScrollSlices(page: Page, testInfo: TestInfo, scenario: string,
+  atDepth?: (depth: ScrollDepth) => Promise<void>): Promise<string[]> {
+  const app = page.locator('.v2ex-app');
+  const metrics = await app.evaluate(element => ({ initial: element.scrollTop,
+    maximum: Math.max(0, element.scrollHeight - element.clientHeight) }));
+  const requested: Array<{ depth: ScrollDepth; position: number }> = [
+    { depth: 'top', position: 0 },
+    { depth: 'mid', position: Math.round(metrics.maximum / 2) },
+    { depth: 'bottom', position: metrics.maximum },
+  ];
+  const positions = requested.filter((entry, index) => requested.findIndex(other => Math.abs(other.position - entry.position) <= 1) === index);
+  const names: string[] = [];
+  try {
+    for (const { depth, position } of positions) {
+      await app.evaluate((element, target) => { element.scrollTop = target; }, position);
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      await page.waitForTimeout(120);
+      await expect.poll(() => app.evaluate(element => element.scrollTop)).toBeCloseTo(position, 0);
+      await assertStable(page); await assertLayout(page); await atDepth?.(depth);
+      const name = `${scenario}-${depth}`;
+      const pixels = await app.screenshot({ path: testInfo.outputPath(`${name}.png`), animations: 'disabled' });
+      expect(informativeImageFailures(analyzePng(pixels)), name).toEqual([]); names.push(name);
+    }
+  } finally {
+    await app.evaluate((element, target) => { element.scrollTop = target; }, metrics.initial);
   }
-  const samples = Math.ceil(png.width / 2) * Math.ceil(png.height / 2); const mean = sum / samples;
-  expect(dark / samples).toBeGreaterThan(0.002); expect(sumSquares / samples - mean * mean).toBeGreaterThan(5);
-  expect(populatedRows.size).toBeGreaterThanOrEqual(8); expect(populatedColumns.size).toBeGreaterThanOrEqual(8);
+  return names;
 }
 function assertNoEscapes(state: ApiState) { expect(state.external).toEqual([]); expect(state.consoleErrors).toEqual([]); }
 
@@ -199,7 +212,11 @@ test('login to recommendation to summary workflow', async ({ page }, testInfo) =
   await expect(page.getByRole('tab', { name: /智能推荐/ })).toBeFocused();
   await page.getByRole('tab', { name: /智能推荐/ }).click(); await page.getByRole('button', { name: /TypeScript 6/ }).click();
   await page.getByRole('button', { name: '生成总结' }).click(); await expect(page.getByText('已覆盖 1/3 页回复')).toBeVisible();
-  await assertStable(page); await assertLayout(page); await screenshot(page, testInfo, 'workflow'); assertNoEscapes(state);
+  const captures = await traverseScrollSlices(page, testInfo, 'workflow', async depth => {
+    if (depth === 'bottom') await expect(page.getByText('已覆盖 1/3 页回复')).toBeInViewport();
+  });
+  if (testInfo.project.name === 'mobile-390') expect(captures).toEqual(['workflow-top', 'workflow-mid', 'workflow-bottom']);
+  assertNoEscapes(state);
 });
 
 test('interest consent, editing, settings, account switch, and clear logout', async ({ page }, testInfo) => {
@@ -213,7 +230,8 @@ test('interest consent, editing, settings, account switch, and clear logout', as
   await page.getByRole('button', { name: '更换令牌' }).click(); await page.getByLabel('V2EX Personal Access Token').fill('fixture-second-token');
   await page.getByRole('button', { name: '更换令牌' }).last().click(); await expect(page.getByText('fixture-second', { exact: true })).toBeVisible();
   await page.getByLabel('同时清除个人数据').check(); await page.getByRole('button', { name: '退出登录' }).click();
-  await expect(page.getByRole('button', { name: '登录' })).toBeVisible(); await assertLayout(page); await screenshot(page, testInfo, 'lifecycle'); assertNoEscapes(state);
+  await expect(page.getByRole('button', { name: '登录' })).toBeVisible();
+  await traverseScrollSlices(page, testInfo, 'lifecycle'); assertNoEscapes(state);
 });
 
 test('offline, expired token, AI unavailable, and malformed response stay contained', async ({ page }, testInfo) => {
@@ -223,14 +241,22 @@ test('offline, expired token, AI unavailable, and malformed response stay contai
   state.offline = false; await page.getByRole('button', { name: '刷新' }).click(); await page.getByRole('button', { name: /TypeScript 6/ }).click();
   state.aiUnavailable = true; await page.getByRole('button', { name: '生成总结' }).click(); await expect(page.getByRole('alert')).toContainText('智能功能暂不可用');
   await page.getByRole('button', { name: '返回列表' }).click(); state.malformed = true; await page.getByRole('button', { name: '刷新' }).click();
-  await expect(page.getByRole('alert')).toContainText('返回内容异常'); await assertLayout(page); await screenshot(page, testInfo, 'contained-errors'); assertNoEscapes(state);
+  await expect(page.getByRole('alert')).toContainText('返回内容异常');
+  await traverseScrollSlices(page, testInfo, 'contained-errors'); assertNoEscapes(state);
 });
 
 test('long unbroken titles and content wrap without clipping', async ({ page }, testInfo) => {
   const state = await setup(page); state.longContent = true; await page.goto('/'); await login(page);
   await page.getByRole('tab', { name: /智能推荐/ }).click(); await page.getByRole('button', { name: /TypeScript 6/ }).click();
-  await expect(page.locator('.v2ex-detail h3')).toBeVisible(); await assertStable(page); await assertLayout(page);
-  await screenshot(page, testInfo, 'long-content'); assertNoEscapes(state);
+  await expect(page.locator('.v2ex-detail h3')).toBeVisible();
+  const captures = await traverseScrollSlices(page, testInfo, 'long-content', async depth => {
+    if (depth === 'bottom') {
+      await expect(page.locator('.v2ex-replies')).toBeInViewport();
+      await expect(page.locator('.v2ex-ai-panel')).toBeInViewport();
+    }
+  });
+  expect(captures).toEqual(['long-content-top', 'long-content-mid', 'long-content-bottom']);
+  assertNoEscapes(state);
 });
 
 test('external origin cannot reuse the local V2EX API fixture path', async ({ page }) => {
