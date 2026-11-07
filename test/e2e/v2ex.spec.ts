@@ -1,4 +1,5 @@
 import { expect, test, type Page, type Route, type TestInfo } from '@playwright/test';
+import { PNG } from 'pngjs';
 
 const NOW = '2026-11-07T08:00:00.000Z';
 const error = (code: string) => ({ ok: false, error: { code, message: 'fixture error', retryable: true } });
@@ -12,6 +13,7 @@ function topic(id = 61, title = 'TypeScript 6 严格模式实践') {
 
 interface ApiState {
   authenticated: boolean; username: string; external: string[]; consoleErrors: string[];
+  localApiRequests: string[];
   offline: boolean; aiUnavailable: boolean; malformed: boolean; longContent: boolean;
   profile: { authorized: boolean; learningPaused: boolean; labels: Array<{ name: string; weight: number }>;
     preferredNodes: Array<{ name: string; weight: number }>; exclusions: string[];
@@ -22,8 +24,11 @@ interface ApiState {
 }
 
 async function setup(page: Page): Promise<ApiState> {
+  const baseURL = test.info().project.use.baseURL;
+  if (typeof baseURL !== 'string') throw new Error('Playwright baseURL is required');
+  const harnessOrigin = new URL(baseURL).origin;
   const state: ApiState = {
-    authenticated: false, username: 'fixture-reader', external: [], consoleErrors: [], offline: false,
+    authenticated: false, username: 'fixture-reader', external: [], consoleErrors: [], localApiRequests: [], offline: false,
     aiUnavailable: false, malformed: false, longContent: false,
     profile: { authorized: false, learningPaused: false, labels: [{ name: 'TypeScript', weight: 0.9 }],
       preferredNodes: [{ name: 'typescript', weight: 0.8 }], exclusions: ['招聘'], feedback: [], updatedAt: NOW, source: 'manual' },
@@ -40,17 +45,24 @@ async function setup(page: Page): Promise<ApiState> {
     }
     Object.defineProperty(window, 'Date', { value: FixtureDate });
   }, NOW);
-  await page.route('**/*', async route => {
+  await page.route('**/api/v2ex/**', route => {
     const url = new URL(route.request().url());
-    if (url.origin === 'http://127.0.0.1:4173') return route.continue();
-    state.external.push(url.toString()); return route.abort('blockedbyclient');
+    if (url.origin !== harnessOrigin) { state.external.push(url.toString()); return route.abort('blockedbyclient'); }
+    return api(route, state);
   });
-  await page.route('**/api/v2ex/**', route => api(route, state));
+  // Registered last, this guard runs first; local API calls fall through to the exact fixture above.
+  await page.route('**/*', route => {
+    const url = new URL(route.request().url());
+    if (url.origin !== harnessOrigin) { state.external.push(url.toString()); return route.abort('blockedbyclient'); }
+    if (url.pathname.startsWith('/api/v2ex/')) return route.fallback();
+    return route.continue();
+  });
   return state;
 }
 
 async function api(route: Route, state: ApiState): Promise<void> {
   const request = route.request(); const url = new URL(request.url());
+  state.localApiRequests.push(url.toString());
   const path = url.pathname.slice('/api/v2ex'.length); const method = request.method();
   let body: unknown; try { body = request.postDataJSON(); } catch { body = undefined; }
   let result: unknown;
@@ -127,11 +139,33 @@ async function assertLayout(page: Page): Promise<void> {
         (control.id ? document.querySelector(`label[for="${CSS.escape(control.id)}"]`)?.textContent?.trim() : '') || control.closest('label')?.textContent?.trim();
       if (!name) failures.push('unnamed control');
     }
-    for (const parent of [...app.querySelectorAll<HTMLElement>('.v2ex-header,.v2ex-tabs,.v2ex-inline-actions,.v2ex-recommendation-actions')]) {
-      const children = [...parent.children].map(element => (element as HTMLElement).getBoundingClientRect()).filter(rect => rect.width && rect.height);
-      for (let left = 0; left < children.length; left++) for (let right = left + 1; right < children.length; right++) {
-        const a = children[left]!, b = children[right]!;
-        if (Math.min(a.right, b.right) - Math.max(a.left, b.left) > 1 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 1) failures.push(`overlap in ${parent.className}`);
+    const visible = (element: HTMLElement) => {
+      const style = getComputedStyle(element); const rect = element.getBoundingClientRect();
+      return style.visibility !== 'hidden' && style.display !== 'none' && rect.width > 0 && rect.height > 0 &&
+        rect.bottom > appRect.top && rect.top < appRect.bottom && rect.right > appRect.left && rect.left < appRect.right;
+    };
+    const textElements = [...app.querySelectorAll<HTMLElement>('h1,h2,h3,h4,p,span,label,button,legend')]
+      .filter(element => visible(element) && [...element.childNodes].some(node => node.nodeType === Node.TEXT_NODE && node.textContent?.trim()));
+    for (const element of textElements) {
+      const style = getComputedStyle(element);
+      const horizontal = element.scrollWidth > element.clientWidth + 1;
+      const vertical = element.scrollHeight > element.clientHeight + 1;
+      if (horizontal && /^(hidden|clip|auto|scroll)$/.test(style.overflowX)) failures.push(`text horizontally clipped: ${element.textContent?.trim().slice(0, 40)}`);
+      if (vertical && /^(hidden|clip|auto|scroll)$/.test(style.overflowY)) failures.push(`text vertically clipped: ${element.textContent?.trim().slice(0, 40)}`);
+      for (let parent = element.parentElement; parent && parent !== app; parent = parent.parentElement) {
+        const parentStyle = getComputedStyle(parent); const parentRect = parent.getBoundingClientRect(); const rect = element.getBoundingClientRect();
+        if (/^(hidden|clip)$/.test(parentStyle.overflowX) && (rect.left < parentRect.left - 1 || rect.right > parentRect.right + 1)) failures.push(`text clipped by ancestor: ${element.textContent?.trim().slice(0, 40)}`);
+        if (/^(hidden|clip)$/.test(parentStyle.overflowY) && (rect.top < parentRect.top - 1 || rect.bottom > parentRect.bottom + 1)) failures.push(`text vertically clipped by ancestor: ${element.textContent?.trim().slice(0, 40)}`);
+      }
+    }
+    const regions = [...app.querySelectorAll<HTMLElement>('.v2ex-header,.v2ex-tabs,.v2ex-active-panel,.v2ex-detail,.v2ex-workflow')].filter(visible);
+    const candidates = [...app.querySelectorAll<HTMLElement>('button,input,h2,h3,h4,p,label')].filter(visible);
+    for (let left = 0; left < candidates.length; left++) for (let right = left + 1; right < candidates.length; right++) {
+      const first = candidates[left]!, second = candidates[right]!;
+      if (first.contains(second) || second.contains(first) || !regions.some(region => region.contains(first) && region.contains(second))) continue;
+      const a = first.getBoundingClientRect(), b = second.getBoundingClientRect();
+      if (Math.min(a.right, b.right) - Math.max(a.left, b.left) > 1 && Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top) > 1) {
+        failures.push(`visible elements overlap: ${first.tagName}/${second.tagName}`);
       }
     }
     return failures;
@@ -145,7 +179,16 @@ async function assertStable(page: Page): Promise<void> {
 }
 async function screenshot(page: Page, testInfo: TestInfo, name: string) {
   const pixels = await page.screenshot({ path: testInfo.outputPath(`${name}.png`), fullPage: true, animations: 'disabled' });
-  expect(pixels.byteLength).toBeGreaterThan(5_000);
+  const png = PNG.sync.read(pixels); let dark = 0; let sum = 0; let sumSquares = 0;
+  const populatedRows = new Set<number>(); const populatedColumns = new Set<number>();
+  for (let y = 0; y < png.height; y += 2) for (let x = 0; x < png.width; x += 2) {
+    const offset = (y * png.width + x) * 4; const luminance = (png.data[offset]! + png.data[offset + 1]! + png.data[offset + 2]!) / 3;
+    sum += luminance; sumSquares += luminance * luminance;
+    if (luminance < 240) { dark++; populatedRows.add(y); populatedColumns.add(x); }
+  }
+  const samples = Math.ceil(png.width / 2) * Math.ceil(png.height / 2); const mean = sum / samples;
+  expect(dark / samples).toBeGreaterThan(0.002); expect(sumSquares / samples - mean * mean).toBeGreaterThan(5);
+  expect(populatedRows.size).toBeGreaterThanOrEqual(8); expect(populatedColumns.size).toBeGreaterThanOrEqual(8);
 }
 function assertNoEscapes(state: ApiState) { expect(state.external).toEqual([]); expect(state.consoleErrors).toEqual([]); }
 
@@ -188,6 +231,21 @@ test('long unbroken titles and content wrap without clipping', async ({ page }, 
   await page.getByRole('tab', { name: /智能推荐/ }).click(); await page.getByRole('button', { name: /TypeScript 6/ }).click();
   await expect(page.locator('.v2ex-detail h3')).toBeVisible(); await assertStable(page); await assertLayout(page);
   await screenshot(page, testInfo, 'long-content'); assertNoEscapes(state);
+});
+
+test('external origin cannot reuse the local V2EX API fixture path', async ({ page }) => {
+  const state = await setup(page); await page.goto('/');
+  await expect.poll(() => page.evaluate(() => window.__V2EX_HARNESS__?.mounted)).toBe(true);
+  await expect.poll(() => state.localApiRequests.length).toBeGreaterThan(0);
+  const localRequestCount = state.localApiRequests.length;
+  const result = await page.evaluate(async () => {
+    try { await fetch('https://evil.example/api/v2ex/session'); return 'unexpected-success'; }
+    catch { return 'blocked'; }
+  });
+  expect(result).toBe('blocked');
+  expect(state.authenticated).toBe(false);
+  expect(state.localApiRequests).toHaveLength(localRequestCount);
+  expect(state.external).toEqual(['https://evil.example/api/v2ex/session']);
 });
 
 test.afterEach(async ({ page }) => { await page.evaluate(() => window.__V2EX_HARNESS__?.cleanup()); });
