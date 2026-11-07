@@ -5,6 +5,7 @@ import { assertNodeName, assertTopicId } from './validation.js';
 import type { IntelligenceService, SummaryMode } from './intelligence.js';
 import type { InterestService } from './interests.js';
 import type { RecommendationService } from './recommendations.js';
+import { publicTopicSummary } from './public-summary.js';
 
 const MAX_OUTPUT_BYTES = 64 * 1024;
 const RUNTIME_ENVELOPE_HEADROOM_BYTES = 256;
@@ -145,7 +146,8 @@ export function createSummaryTool(reader: Pick<ContentReader, 'topic'>,
       if (args.mode !== 'quick' && args.mode !== 'viewpoints' && args.mode !== 'full') throw new V2exError('invalid_request');
       const replyPages = clamp(args.replyPages, 1, 3);
       const cached = await reader.topic({ topic, replyPages }, exec.signal);
-      const source = await intelligence.summarizeTopic({ topic: cached.value, mode: args.mode as SummaryMode }, exec.signal);
+      const internal = await intelligence.summarizeTopic({ topic: cached.value, mode: args.mode as SummaryMode }, exec.signal);
+      const source = publicTopicSummary(internal, { topicId: Number(topic), mode: args.mode as SummaryMode });
       const result = {
         topicId: source.topicId, summary: text(source.summary, 5000).value,
         viewpoints: source.viewpoints.slice(0, 30).map(value => text(value, 1000).value),
@@ -155,8 +157,6 @@ export function createSummaryTool(reader: Pick<ContentReader, 'topic'>,
         completeDiscussion: source.completeDiscussion,
         ...(source.coverage ? { coverage: source.coverage } : {}),
         ...(source.mode ? { mode: source.mode } : {}),
-        ...(source.modelRoute ? { modelRoute: text(source.modelRoute, 500).value } : {}),
-        ...(source.topicUpdatedAt ? { topicUpdatedAt: text(source.topicUpdatedAt, 64).value } : {}),
         truncated: false,
       };
       result.truncated = result.summary !== source.summary || result.viewpoints.length < source.viewpoints.length;

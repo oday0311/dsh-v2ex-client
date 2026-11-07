@@ -61,9 +61,10 @@ class MutableIdentity implements IdentityLeaseProvider {
 
 class ManualClock implements RefreshClock {
   task?: () => void; disposed = 0;
+  intervals: number[] = [];
   constructor(public value = new Date(at)) {}
   now() { return this.value; }
-  every(_ms: number, task: () => void) { this.task = task; return () => { this.disposed++; this.task = undefined; }; }
+  every(ms: number, task: () => void) { this.intervals.push(ms); this.task = task; return () => { this.disposed++; this.task = undefined; }; }
 }
 
 function fixture(options: { budget?: boolean; now?: Date; items?: Recommendation[] } = {}) {
@@ -104,6 +105,28 @@ function fixture(options: { budget?: boolean; now?: Date; items?: Recommendation
   return { service, store, identity, clock, budget, contentCalls, recommender, reminders, notices,
     get refreshCalls() { return refreshCalls; }, release: () => release?.() };
 }
+
+test('authenticated settings reschedule immediately without content or model work', async () => {
+  const f = fixture(); await f.service.start();
+  assert.deepEqual(f.clock.intervals, [30 * 60_000]);
+  f.service.applyAuthenticatedSettings({ ...f.store.settings, refreshIntervalMinutes: 1 });
+  f.service.applyAuthenticatedSettings({ ...f.store.settings, refreshIntervalMinutes: 60 });
+  assert.deepEqual(f.clock.intervals, [30 * 60_000, 1 * 60_000, 60 * 60_000]);
+  assert.equal(f.clock.disposed, 2);
+  assert.deepEqual(f.contentCalls, []); assert.equal(f.refreshCalls, 0);
+});
+
+test('account activation loads its persisted interval and account switches replace it', async () => {
+  const f = fixture();
+  await f.store.putSettings({ ...f.store.settings, refreshIntervalMinutes: 1 }, accountScope('alice'));
+  await f.store.putSettings({ ...f.store.settings, refreshIntervalMinutes: 60 }, accountScope('bob'));
+  await f.service.start();
+  await f.service.syncAuthenticatedSettings('alice');
+  await f.service.syncAuthenticatedSettings('bob');
+  await f.service.syncAuthenticatedSettings(null);
+  assert.deepEqual(f.clock.intervals, [30 * 60_000, 1 * 60_000, 60 * 60_000, 30 * 60_000]);
+  assert.deepEqual(f.contentCalls, []); assert.equal(f.refreshCalls, 0);
+});
 
 test('timer skips all content and model work near the V2EX rate limit', async () => {
   const f = fixture({ budget: false });

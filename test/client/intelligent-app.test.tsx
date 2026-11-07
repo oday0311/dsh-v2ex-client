@@ -73,5 +73,8 @@ test('topic detail connects explicit summary generation and incomplete disclosur
   await act(async () => { fireEvent.click(screen.getByRole('button', { name: '生成总结' })); });
   assert.ok(screen.getByText('总结结果'));
   assert.ok(screen.getByText('内容并非完整讨论归纳'));
+  fireEvent.click(screen.getByRole('radio', { name: '观点与争议' }));
+  assert.equal(screen.queryByText('总结结果'), null);
+  assert.ok(screen.getByRole('button', { name: '生成总结' }));
   f.store.dispose();
 });

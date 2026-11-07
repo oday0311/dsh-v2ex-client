@@ -89,6 +89,10 @@ export interface TopicAiSummary {
   topicUpdatedAt?: string;
 }
 
+export type PublicTopicAiSummary = Pick<TopicAiSummary, 'topicId' | 'summary' | 'viewpoints' | 'notableReplies' |
+  'generatedAt' | 'coveredReplyPages' | 'completeDiscussion' | 'coverage'> &
+  { mode: NonNullable<TopicAiSummary['mode']> };
+
 export interface InterestProfile {
   authorized: boolean;
   learningPaused: boolean;

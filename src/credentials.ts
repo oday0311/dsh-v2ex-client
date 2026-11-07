@@ -56,6 +56,7 @@ export class AuthService {
     private readonly api: V2exApi,
     private readonly vault: CredentialVault,
     private readonly clearPersonalData: (account: string | null) => Promise<void> = async () => {},
+    private readonly identityChanged: (account: string | null) => Promise<void> = async () => {},
   ) {}
 
   private invalidate(clearIdentity = true): void {
@@ -89,6 +90,7 @@ export class AuthService {
     const { writable } = await this.vault.describe();
     if (!token) {
       if (this.verifiedUsername !== null || this.verifiedCredentialDigest !== null) this.invalidate();
+      await this.identityChanged(null);
       return { authenticated: false, writable, username: null, tokenScope: null, expiresAt: null };
     }
     const digest = createHash('sha256').update(token).digest('hex');
@@ -102,6 +104,7 @@ export class AuthService {
     }
     this.verifiedUsername = status.username;
     this.verifiedCredentialDigest = digest;
+    await this.identityChanged(status.username);
     return status;
   }
 
@@ -124,6 +127,7 @@ export class AuthService {
     this.invalidate();
     this.verifiedUsername = status.username;
     this.verifiedCredentialDigest = digest;
+    await this.identityChanged(status.username);
     return status;
   }); }
 
@@ -204,7 +208,8 @@ export class AuthService {
     }
     await this.vault.clear();
     this.invalidate();
-    if (clearPersonalData) await this.clearPersonalData(account);
+    try { if (clearPersonalData) await this.clearPersonalData(account); }
+    finally { await this.identityChanged(null); }
   }); }
 
   private async validate(token: string, writable: boolean): Promise<AccountStatus> {

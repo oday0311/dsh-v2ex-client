@@ -120,6 +120,17 @@ export class RefreshService {
     return Promise.resolve();
   }
 
+  applyAuthenticatedSettings(settings: PluginSettings): void {
+    this.schedule(settings.refreshIntervalMinutes);
+  }
+
+  async syncAuthenticatedSettings(account: string | null): Promise<void> {
+    if (this.disposed) throw new V2exError('timeout');
+    if (account === null) { this.schedule(30); return; }
+    const settings = await this.options.store.getSettings(accountScope(account));
+    this.applyAuthenticatedSettings(settings);
+  }
+
   private schedule(minutes: number): void {
     const interval = Math.max(1, Math.min(1440, minutes));
     if (this.disposed || this.timerMinutes === interval) return;

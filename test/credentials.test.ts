@@ -43,6 +43,18 @@ test('status resolves the stored credential and returns anonymous status when ab
   assert.equal((await auth.status()).username, 'alice');
 });
 
+test('identity activation and logout publish account changes after the fence is established', async () => {
+  const vault = new FakeCredentialVault();
+  const api = { async readToken() { return { scope: 'everything' }; },
+    async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+  const activated: Array<string | null> = [];
+  const auth = new AuthService(api as never, vault, undefined, async account => { activated.push(account); });
+  await auth.login('ALICE_FAKE_VALUE');
+  vault.value = 'BOB_FAKE_VALUE'; await auth.status();
+  await auth.logout(false);
+  assert.deepEqual(activated, ['alice', 'bob', null]);
+});
+
 test('logout clears the credential and calls personal-data cleanup only when requested', async () => {
   const vault = new FakeCredentialVault();
   vault.value = TOKEN;
@@ -172,6 +184,16 @@ test('overlapping logouts stay ordered and cleanup failure does not poison later
   await auth.login('ALICE_FAKE_VALUE'); failCleanup = true;
   await assert.rejects(auth.logout(true), /cleanup failed/);
   failCleanup = false; await auth.login('ALICE_FAKE_VALUE'); assert.equal(await auth.account(), 'alice');
+});
+
+test('logout publishes anonymous identity even when personal-data cleanup fails', async () => {
+  const vault = new FakeCredentialVault(); const changes: Array<string | null> = [];
+  const api = { async readToken() { return { scope: 'everything' }; }, async readMember() { return { username: 'alice' }; } };
+  const auth = new AuthService(api as never, vault, async () => { throw new Error('cleanup failed'); },
+    async account => { changes.push(account); });
+  await auth.login('ALICE_FAKE_VALUE');
+  await assert.rejects(auth.logout(true), /cleanup failed/);
+  assert.deepEqual(changes, ['alice', null]);
 });
 
 test('nested mutation capability expires when the outer identity fence exits', async () => {

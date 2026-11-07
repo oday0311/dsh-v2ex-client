@@ -5,7 +5,9 @@ import { createSummaryTool } from '../src/tools.js';
 import { V2exError } from '../src/errors.js';
 
 const summary = { topicId: 1, summary: 'Summary', viewpoints: [], notableReplies: [],
-  generatedAt: '2026-11-06T00:00:00Z', coveredReplyPages: [1], completeDiscussion: false };
+  generatedAt: '2026-11-06T00:00:00Z', coveredReplyPages: [1], completeDiscussion: false,
+  mode: 'quick' as const, modelRoute: 'private-provider/private-model', topicUpdatedAt: '2026-11-06T00:00:00Z',
+  internalCacheKey: 'private-cache-identity' };
 
 test('Host route and Tool share content-first summary behavior and provenance', async () => {
   const calls: string[] = [];
@@ -25,10 +27,20 @@ test('Host route and Tool share content-first summary behavior and provenance', 
   }));
   assert.equal(response.status, 200);
   assert.equal(response.headers.get('cache-control'), 'no-store');
-  assert.deepEqual((await response.json() as { data: unknown }).data, summary);
+  const routeData = (await response.json() as { data: Record<string, unknown> }).data;
+  assert.equal(routeData.summary, 'Summary');
+  assert.equal(routeData.mode, 'quick');
+  assert.equal('modelRoute' in routeData, false);
+  assert.equal('topicUpdatedAt' in routeData, false);
+  assert.equal('internalCacheKey' in routeData, false);
   const tool = createSummaryTool(content as never, intelligence as never);
   const result = await tool.execute({ topic: '1', mode: 'quick', replyPages: 1 }, { signal: new AbortController().signal } as never);
   assert.equal((result as { summary: string }).summary, 'Summary');
+  const serialized = JSON.stringify(result);
+  assert.equal(serialized.includes('private-provider'), false);
+  assert.equal(serialized.includes('private-cache-identity'), false);
+  assert.equal(serialized.includes('modelRoute'), false);
+  assert.equal(serialized.includes('topicUpdatedAt'), false);
   assert.deepEqual(calls, ['content:1:1', 'ai:quick', 'content:1:1', 'ai:quick']);
 });
 
@@ -75,7 +87,7 @@ test('missing AI services return ai_unavailable after authenticated content retr
 test('Tool output remains bounded under extreme stored summary and unavailable AI', async () => {
   const content = { async topic() { return { value: {}, stale: false, source: 'network', fetchedAt: 'now' }; } };
   const tool = createSummaryTool(content as never, { async summarizeTopic() {
-    return { ...summary, summary: '\u0000😀'.repeat(100_000), viewpoints: Array(30).fill('x'.repeat(1000)) };
+    return { ...summary, mode: 'full' as const, summary: '\u0000😀'.repeat(100_000), viewpoints: Array(30).fill('x'.repeat(1000)) };
   } } as never);
   const args = { topic: '1', mode: 'full', replyPages: 1 };
   const result = await tool.execute(args, { signal: new AbortController().signal } as never);

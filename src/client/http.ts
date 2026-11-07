@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, RecommendationList, ReplyItem, TopicAiSummary, TopicListItem, TopicPage, TopicThread } from '../contract.js';
+import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, PublicTopicAiSummary, RecommendationList, ReplyItem, TopicListItem, TopicPage, TopicThread } from '../contract.js';
 import type { V2exErrorCode } from '../errors.js';
 import { account, cached, envelope, interestProfile, node, pluginSettings, recommendationList, reply, summary, thread, topicItem, topicPage, updated } from './schema.js';
 
@@ -23,7 +23,7 @@ export interface V2exClientRemote {
   nodeTopics(node: string, page: number, signal?: AbortSignal): Promise<Cached<TopicPage>>;
   topic(id: string, signal?: AbortSignal): Promise<Cached<TopicThread>>;
   replies(id: string, page: number, signal?: AbortSignal): Promise<Cached<ReplyItem[]>>;
-  summary?(id: string, mode: 'quick' | 'viewpoints' | 'full', replyPages: number, signal?: AbortSignal): Promise<TopicAiSummary>;
+  summary?(id: string, mode: 'quick' | 'viewpoints' | 'full', replyPages: number, signal?: AbortSignal): Promise<PublicTopicAiSummary>;
   interests?(method?: 'get' | 'authorize' | 'revoke' | 'relearn' | 'clear' | 'update', payload?: unknown, signal?: AbortSignal): Promise<InterestProfile>;
   recommendations?(signal?: AbortSignal): Promise<RecommendationList>;
   recommendationFeedback?(topicId: number, value: 'interested' | 'not_interested', signal?: AbortSignal): Promise<void>;

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { registerV2exHttpRoutes } from '../src/http-routes.js';
 import type { PluginSettings } from '../src/contract.js';
+import { createSettingsService } from '../src/plugin.js';
 
 const settings: PluginSettings = { refreshIntervalMinutes: 30, scannedNodes: ['programmer'], pagesPerNode: 2,
   aiCandidateBudget: 10, maxModelCallsPerRefresh: 1, notificationThreshold: 0.7,
@@ -44,4 +45,19 @@ test('settings route rejects invalid, extra, cross-origin, and non-JSON input be
     assert.equal(response.status, 400);
   }
   assert.deepEqual(f.calls, []);
+});
+
+test('composed settings save persists inside the identity fence and immediately applies the timer interval', async () => {
+  const calls: string[] = []; let stored = settings;
+  const auth = {
+    async withRead<T>(operation: (lease: { scope: string }) => Promise<T>) { calls.push('read-fence'); return operation({ scope: 'account:alice' }); },
+    async withMutation<T>(operation: (lease: { scope: string }) => Promise<T>) { calls.push('write-fence'); return operation({ scope: 'account:alice' }); },
+  };
+  const service = createSettingsService(auth as never, {
+    async getSettings(scope?: string) { calls.push(`get:${scope}`); return stored; },
+    async putSettings(value: PluginSettings, scope?: string) { calls.push(`put:${scope}:${value.refreshIntervalMinutes}`); stored = value; },
+  }, { applyAuthenticatedSettings(value) { calls.push(`schedule:${value.refreshIntervalMinutes}`); } });
+  const next = { ...settings, refreshIntervalMinutes: 1 };
+  assert.deepEqual(await service.update(next), next);
+  assert.deepEqual(calls, ['write-fence', 'put:account:alice:1', 'schedule:1', 'get:account:alice']);
 });

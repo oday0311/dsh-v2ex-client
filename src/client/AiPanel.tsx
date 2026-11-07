@@ -1,6 +1,6 @@
 import React from 'react';
 import { RefreshCw, Sparkles } from 'lucide-react';
-import type { TopicAiSummary } from '../contract.js';
+import type { PublicTopicAiSummary } from '../contract.js';
 import type { ClientErrorCode } from './http.js';
 import { formatTime, type Copy } from './locales.js';
 
@@ -8,7 +8,7 @@ export type SummaryMode = 'quick' | 'viewpoints' | 'full';
 const modes: SummaryMode[] = ['quick', 'viewpoints', 'full'];
 
 export function AiPanel({ summary, mode, loading, error, available = true, onMode, onGenerate, copy, locale }: {
-  summary: TopicAiSummary | null; mode: SummaryMode; loading: boolean; error: ClientErrorCode | null;
+  summary: PublicTopicAiSummary | null; mode: SummaryMode; loading: boolean; error: ClientErrorCode | null;
   available?: boolean;
   onMode(mode: SummaryMode): void; onGenerate(): void; copy: Copy; locale: string;
 }) {

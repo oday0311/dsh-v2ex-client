@@ -7,6 +7,7 @@ import type { IntelligenceService, SummaryMode } from './intelligence.js';
 import type { InterestService } from './interests.js';
 import type { RecommendationService } from './recommendations.js';
 import { PluginSettingsSchema } from './store.js';
+import { publicTopicSummary } from './public-summary.js';
 
 const PREFIX = '/api/v2ex';
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -246,7 +247,8 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
         const input = await summaryBody(request);
         const thread = await services.content.topic({ topic: input.topic, replyPages: input.replyPages }, request.signal);
         if (!services.intelligence) throw new V2exError('ai_unavailable');
-        return json({ ok: true, data: await services.intelligence.summarizeTopic({ topic: thread.value, mode: input.mode }, request.signal) });
+        const generated = await services.intelligence.summarizeTopic({ topic: thread.value, mode: input.mode }, request.signal);
+        return json({ ok: true, data: publicTopicSummary(generated, { topicId: Number(input.topic), mode: input.mode }) });
       }
       if (path === '/interests') {
         params(query, []);

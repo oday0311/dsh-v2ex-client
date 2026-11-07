@@ -91,7 +91,7 @@ test('intelligent transport sends same-origin JSON mutations and validates setti
     const path = String(input); const body = init?.body ? JSON.parse(String(init.body)) : undefined;
     calls.push({ path, method: init?.method ?? 'GET', body });
     const data = path.endsWith('/topic/summary') ? { topicId: 7, summary: 'Summary', viewpoints: [], notableReplies: [],
-      generatedAt: '2026-11-06T00:00:00.000Z', coveredReplyPages: [1], completeDiscussion: true } :
+      generatedAt: '2026-11-06T00:00:00.000Z', coveredReplyPages: [1], completeDiscussion: true, mode: 'quick' } :
       path.endsWith('/interests') ? profile : path.endsWith('/settings') ? settings : { updated: true };
     return new Response(JSON.stringify({ ok: true, data }), { headers: { 'content-type': 'application/json' } });
   });
@@ -115,4 +115,12 @@ test('intelligent transport rejects malformed profile and settings responses', a
     (error: unknown) => error instanceof V2exClientError && error.code === 'invalid_response');
   await assert.rejects(fake({ refreshIntervalMinutes: 0 }).settings!(),
     (error: unknown) => error instanceof V2exClientError && error.code === 'invalid_response');
+});
+
+test('summary transport rejects internal routing and cache identity fields', async () => {
+  const client = createV2exHttpClient(async () => new Response(JSON.stringify({ ok: true, data: {
+    topicId: 7, summary: 'Summary', viewpoints: [], notableReplies: [], generatedAt: '2026-11-06T00:00:00.000Z',
+    coveredReplyPages: [1], completeDiscussion: true, mode: 'quick', modelRoute: 'private/model', topicUpdatedAt: '2026-11-06T00:00:00.000Z',
+  } }), { headers: { 'content-type': 'application/json' } }));
+  await assert.rejects(client.summary!('7', 'quick', 1), { code: 'invalid_response' });
 });

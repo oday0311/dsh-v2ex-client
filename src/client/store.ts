@@ -1,4 +1,4 @@
-import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, RecommendationList, TopicAiSummary, TopicPage, TopicThread } from '../contract.js';
+import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, PublicTopicAiSummary, RecommendationList, TopicPage, TopicThread } from '../contract.js';
 import { V2exClientError, type V2exClientRemote, type ClientErrorCode } from './http.js';
 
 export type BrowseView = 'smart' | 'latest' | 'hot' | 'node' | 'interests' | 'settings';
@@ -16,7 +16,7 @@ export interface ClientState {
   error: ClientErrorCode | null;
   detailError: ClientErrorCode | null;
   repliesError: ClientErrorCode | null;
-  summary: TopicAiSummary | null;
+  summary: PublicTopicAiSummary | null;
   summaryMode: 'quick' | 'viewpoints' | 'full';
   summaryLoading: boolean;
   summaryError: ClientErrorCode | null;
@@ -36,7 +36,8 @@ const initial: ClientState = { phase: 'checking', account: null, view: 'latest',
   interests: null, interestsLoading: false, interestsError: null,
   recommendations: null, recommendationsLoading: false, recommendationsError: null,
   settings: null, settingsLoading: false, settingsError: null };
-type Lane = 'session' | 'list' | 'detail' | 'replies' | 'summary' | 'interests' | 'recommendations' | 'recommendationAction' | 'settings';
+type Lane = 'session' | 'list' | 'detail' | 'replies' | 'summary' | 'interests' | 'recommendations' | 'settings' |
+  `recommendationRead:${number}` | `recommendationFeedback:${number}`;
 
 export class V2exClientStore {
   private state: Readonly<ClientState> = initial;
@@ -55,15 +56,26 @@ export class V2exClientStore {
     this.state = { ...this.state, ...patch };
     for (const listener of this.listeners) listener();
   }
-  private start(lane: Lane): { signal: AbortSignal; current(): boolean } {
+  private start(lane: Lane): { signal: AbortSignal; current(): boolean; finish(): void } {
     this.controllers.get(lane)?.abort();
     const controller = new AbortController();
     this.controllers.set(lane, controller);
     const version = (this.versions.get(lane) ?? 0) + 1;
     this.versions.set(lane, version);
-    return { signal: controller.signal, current: () => !this.disposed && !controller.signal.aborted && this.versions.get(lane) === version };
+    const current = () => !this.disposed && !controller.signal.aborted && this.versions.get(lane) === version;
+    return { signal: controller.signal, current, finish: () => {
+      if (!current()) return;
+      this.controllers.delete(lane); this.versions.delete(lane);
+    } };
   }
   private stop(...lanes: Lane[]): void { for (const lane of lanes) this.controllers.get(lane)?.abort(); }
+  private stopRecommendationActions(): void {
+    for (const [lane, controller] of this.controllers) {
+      if (lane.startsWith('recommendationRead:') || lane.startsWith('recommendationFeedback:')) {
+        controller.abort(); this.controllers.delete(lane); this.versions.delete(lane);
+      }
+    }
+  }
   private code(error: unknown): ClientErrorCode { return error instanceof V2exClientError ? error.code : 'upstream'; }
   private fail(error: unknown, patch: Partial<ClientState>): void {
     const code = this.code(error);
@@ -73,7 +85,8 @@ export class V2exClientStore {
     } else this.set(patch);
   }
   private sessionStatus(account: AccountStatus): void {
-    this.stop('list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'recommendationAction', 'settings');
+    this.stop('list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'settings');
+    this.stopRecommendationActions();
     this.selectedTopicId = null;
     this.set({ account, phase: account.authenticated ? 'ready' : 'guest', topics: null, thread: null, nodeInfo: null, loading: false, detailLoading: false, repliesLoading: false, error: null, detailError: null, repliesError: null,
       summary: null, summaryLoading: false, summaryError: null, interests: null, interestsLoading: false, interestsError: null,
@@ -98,7 +111,8 @@ export class V2exClientStore {
   async logout(clearPersonalData = false): Promise<void> {
     if (this.disposed) return;
     const request = this.start('session');
-    this.stop('list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'recommendationAction', 'settings');
+    this.stop('list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'settings');
+    this.stopRecommendationActions();
     this.set({ loading: true, error: null });
     try { const status = await this.remote.logout(clearPersonalData, request.signal); if (request.current()) this.sessionStatus(status); }
     catch (error) { if (request.current()) this.set({ error: this.code(error), loading: false }); }
@@ -173,15 +187,19 @@ export class V2exClientStore {
   async generateSummary(mode: 'quick' | 'viewpoints' | 'full' = this.state.summaryMode): Promise<void> {
     const thread = this.state.thread;
     if (this.disposed || this.state.phase !== 'ready' || !thread || !this.remote.summary) return;
+    const topicId = thread.value.topic.id;
     const request = this.start('summary');
-    this.set({ summaryMode: mode, summaryLoading: true, summaryError: null });
+    this.set({ summary: null, summaryMode: mode, summaryLoading: true, summaryError: null });
     try {
-      const summary = await this.remote.summary(String(thread.value.topic.id), mode, Math.max(1, thread.value.replyPage || 1), request.signal);
-      if (request.current() && this.state.thread?.value.topic.id === thread.value.topic.id) this.set({ summary, summaryLoading: false });
-    } catch (error) { if (request.current()) this.fail(error, { summaryLoading: false, summaryError: this.code(error) }); }
+      const summary = await this.remote.summary(String(topicId), mode, Math.max(1, thread.value.replyPage || 1), request.signal);
+      if (summary.topicId !== topicId || summary.mode !== mode) throw new V2exClientError('invalid_response');
+      if (request.current() && this.state.thread?.value.topic.id === topicId && this.state.summaryMode === mode) this.set({ summary, summaryLoading: false });
+    } catch (error) { if (request.current()) this.fail(error, { summary: null, summaryLoading: false, summaryError: this.code(error) }); }
   }
   setSummaryMode(mode: 'quick' | 'viewpoints' | 'full'): void {
-    if (!this.state.summaryLoading) this.set({ summaryMode: mode });
+    if (mode === this.state.summaryMode) return;
+    this.stop('summary');
+    this.set({ summary: null, summaryMode: mode, summaryLoading: false, summaryError: null });
   }
   async loadInterests(): Promise<void> {
     if (this.disposed || this.state.phase !== 'ready' || !this.remote.interests) return;
@@ -204,17 +222,19 @@ export class V2exClientStore {
   }
   async markRecommendationRead(topicId: number): Promise<void> {
     if (this.disposed || !this.remote.recommendationRead) return;
-    const request = this.start('recommendationAction');
+    const request = this.start(`recommendationRead:${topicId}`);
     try { await this.remote.recommendationRead(topicId, request.signal); if (request.current() && this.state.recommendations) this.set({ recommendations: {
       ...this.state.recommendations, items: this.state.recommendations.items.map(item => item.topic.id === topicId ? { ...item, read: true } : item) } }); }
     catch (error) { if (request.current()) this.set({ recommendationsError: this.code(error) }); }
+    finally { request.finish(); }
   }
   async setRecommendationFeedback(topicId: number, value: 'interested' | 'not_interested'): Promise<void> {
     if (this.disposed || !this.remote.recommendationFeedback) return;
-    const request = this.start('recommendationAction');
+    const request = this.start(`recommendationFeedback:${topicId}`);
     try { await this.remote.recommendationFeedback(topicId, value, request.signal); if (request.current() && this.state.recommendations) this.set({ recommendations: {
       ...this.state.recommendations, items: this.state.recommendations.items.map(item => item.topic.id === topicId ? { ...item, feedback: value } : item) } }); }
     catch (error) { if (request.current()) this.set({ recommendationsError: this.code(error) }); }
+    finally { request.finish(); }
   }
   async loadSettings(): Promise<void> {
     if (this.disposed || this.state.phase !== 'ready' || !this.remote.settings) return;
@@ -236,5 +256,5 @@ export class V2exClientStore {
     else if (this.state.view === 'node') void this.loadNode(this.state.nodeName);
     else void this.loadLatest();
   }
-  dispose(): void { if (this.disposed) return; this.disposed = true; this.stop('session', 'list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'recommendationAction', 'settings'); this.controllers.clear(); this.listeners.clear(); }
+  dispose(): void { if (this.disposed) return; this.disposed = true; this.stop('session', 'list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'settings'); this.stopRecommendationActions(); this.controllers.clear(); this.listeners.clear(); }
 }

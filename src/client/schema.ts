@@ -35,8 +35,7 @@ export const summary = z.object({ topicId: id, summary: label(20_000), viewpoint
   notableReplies: z.array(id).max(100), generatedAt: date, coveredReplyPages: z.array(z.number().int().min(1).max(1_000)).max(1_000),
   completeDiscussion: z.boolean(), coverage: z.object({ loadedReplyPages: z.number().int().nonnegative(), totalReplyPages: z.number().int().nonnegative(),
     complete: z.boolean(), includedReplies: z.number().int().nonnegative().optional(), omittedReplies: z.number().int().nonnegative().optional(),
-    contentTruncated: z.boolean().optional() }).strict().optional(), mode: z.enum(['quick', 'viewpoints', 'full']).optional(),
-  modelRoute: label(512).optional(), topicUpdatedAt: date.optional() }).strict();
+    contentTruncated: z.boolean().optional() }).strict().optional(), mode: z.enum(['quick', 'viewpoints', 'full']) }).strict();
 export const interestProfile = z.object({ authorized: z.boolean(), learningPaused: z.boolean(), labels: z.array(weight).max(100),
   preferredNodes: z.array(weight.extend({ name: nodeName })).max(100), exclusions: z.array(label(100)).max(100),
   feedback: z.array(z.object({ topicId: id, interested: z.boolean() }).strict()).max(500), updatedAt: date,

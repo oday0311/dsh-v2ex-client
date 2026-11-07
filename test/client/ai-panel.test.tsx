@@ -4,7 +4,7 @@ import React from 'react';
 import { JSDOM } from 'jsdom';
 import { AiPanel } from '../../src/client/AiPanel.js';
 import { zh } from '../../src/client/locales.js';
-import type { TopicAiSummary } from '../../src/contract.js';
+import type { PublicTopicAiSummary } from '../../src/contract.js';
 
 const dom = new JSDOM('<!doctype html><html><body></body></html>', { url: 'https://host.test/' });
 Object.assign(globalThis, { window: dom.window, document: dom.window.document, HTMLElement: dom.window.HTMLElement,
@@ -13,11 +13,11 @@ Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, co
 const { cleanup, fireEvent, render, screen } = await import('@testing-library/react');
 afterEach(cleanup);
 
-const summary: TopicAiSummary = {
+const summary: PublicTopicAiSummary = {
   topicId: 7, summary: '简明归纳', viewpoints: ['观点 A'], notableReplies: [11],
   generatedAt: '2026-11-06T00:00:00.000Z', coveredReplyPages: [1, 2], completeDiscussion: false,
   coverage: { loadedReplyPages: 2, totalReplyPages: 5, complete: false, includedReplies: 20, omittedReplies: 30 },
-  mode: 'quick', modelRoute: 'provider/model', topicUpdatedAt: '2026-11-06T00:00:00.000Z',
+  mode: 'quick',
 };
 
 test('partial summaries disclose reply coverage without exposing provider routing', () => {

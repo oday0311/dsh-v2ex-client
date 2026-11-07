@@ -16,6 +16,22 @@ import { DshHistoryReader } from './history.js';
 import { registerV2exHttpRoutes, type FetchConnection } from './http-routes.js';
 import type { Domain } from '@deepseek-ai/dsh-storage-domain';
 import type { ToolDefinition } from '@deepseek-ai/dsh-tools';
+import type { ContentStore, PluginSettings } from './contract.js';
+
+export function createSettingsService(
+  auth: Pick<AuthService, 'withRead' | 'withMutation'>,
+  store: Pick<ContentStore, 'getSettings' | 'putSettings'>,
+  refresh: Pick<RefreshService, 'applyAuthenticatedSettings'>,
+) {
+  return {
+    get: () => auth.withRead(lease => store.getSettings(lease.scope)),
+    update: (value: PluginSettings) => auth.withMutation(async lease => {
+      await store.putSettings(value, lease.scope);
+      refresh.applyAuthenticatedSettings(value);
+      return store.getSettings(lease.scope);
+    }),
+  };
+}
 
 export async function composePlugin(ctx: unknown, config: Config): Promise<{ dispose(): Promise<void> }> {
   const host = ctx as {
@@ -66,7 +82,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     auth = new AuthService(api, vault, async (account) => {
       await (account ? Promise.all([interests.clear(account), recommendations.clear(account), refresh.clear(account)]) :
         Promise.all([interests.clearLegacy(), recommendations.clearLegacy()]));
-    });
+    }, account => refresh.syncAuthenticatedSettings(account));
     const budget = new RequestBudget();
     const service = new ContentService(api, vault, new ContentCache(store), budget);
     const intelligence = new IntelligenceService(model, store);
@@ -80,12 +96,7 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));
     disposers.push(host.tools.register(createRecommendationTool(service, recommendations)));
-    const settings = {
-      get: () => auth.withRead(lease => store.getSettings(lease.scope)),
-      update: (value: import('./contract.js').PluginSettings) => auth.withMutation(async lease => {
-        await store.putSettings(value, lease.scope); return store.getSettings(lease.scope);
-      }),
-    };
+    const settings = createSettingsService(auth, store, refresh);
     disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence, interests, recommendations, settings }));
   } catch (error) {
     for (const dispose of disposers.reverse()) { try { await dispose(); } catch { /* Preserve startup error. */ } }
