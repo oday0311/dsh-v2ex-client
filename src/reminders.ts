@@ -140,6 +140,9 @@ function abortAgentWork(work: () => unknown, signal: AbortSignal): Promise<void>
     const fail = (error: unknown) => { if (settled) return; settled = true; cleanup(); reject(error); };
     const abort = () => fail(new V2exError('timeout'));
     signal.addEventListener('abort', abort, { once: true });
-    Promise.resolve().then(work).then(succeed, fail);
+    Promise.resolve().then(() => {
+      if (signal.aborted) throw new V2exError('timeout');
+      return work();
+    }).then(succeed, fail);
   });
 }

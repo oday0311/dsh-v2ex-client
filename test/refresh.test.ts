@@ -524,3 +524,29 @@ test('disposed hanging Agent releases the flight for a later root idle retry', a
   while ((await f.store.getPendingNotifications(scope)).length) await new Promise(resolve => setImmediate(resolve));
   assert.equal(messages.length, 1); removeIdle(); await service.dispose(); await ctx.fiber.dispose();
 });
+
+test('synchronous Agent disposal before followup microtask retains pending for idle retry', async () => {
+  const f = fixture({ items: [] }); const scope = accountScope('alice'); const sink = new DshReminderSink();
+  const ctx = new Context(); sink.bind(ctx as never); await f.store.enqueuePendingNotifications(scope, [pending(109)]);
+  let staleCalls = 0; const stale = { status: 'idle', root: true, async followup() { staleCalls++; } };
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent: stale, status: 'running' });
+  let disposeBeforeInvocation = true;
+  const service = new RefreshService({ store: f.store, content: {} as never, recommendations: {} as never,
+    budget: f.budget, identity: f.identity, reminders: { notify(items, signal) {
+      const result = sink.notify(items, signal);
+      if (disposeBeforeInvocation) {
+        disposeBeforeInvocation = false;
+        (ctx.emit as (name: string, payload: unknown) => void)('agent/disposed', { agent: stale });
+      }
+      return result;
+    } }, clock: f.clock });
+  const removeIdle = sink.onIdle(() => service.handleReminderIdle());
+  await service.drainPending(); assert.equal(staleCalls, 0);
+  assert.deepEqual((await f.store.getPendingNotifications(scope)).map(value => value.topicId), [109]);
+  const messages: unknown[] = []; const fresh = { status: 'idle', root: true,
+    async followup(message: unknown) { messages.push(message); } };
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent: fresh, status: 'running' });
+  (ctx.emit as (name: string, payload: unknown) => void)('agent/status', { agent: fresh, status: 'idle' });
+  while ((await f.store.getPendingNotifications(scope)).length) await new Promise(resolve => setImmediate(resolve));
+  assert.equal(messages.length, 1); removeIdle(); await service.dispose(); await ctx.fiber.dispose();
+});

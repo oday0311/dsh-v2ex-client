@@ -153,3 +153,36 @@ test('disposed or replaced target aborts hanging followup and a later root can d
     await ctx.fiber.dispose();
   }
 });
+
+test('lifecycle abort before the queued followup microtask never calls the stale Agent', async () => {
+  for (const transition of ['disposed', 'replaced', 'sink-dispose'] as const) {
+    const ctx = new Context(); const sink = new DshReminderSink(); const unbind = sink.bind(ctx as never);
+    let staleCalls = 0; const stale = { status: 'idle', root: true, async followup() { staleCalls++; } };
+    const fresh = agent(); const notice = createReminderNotice(item);
+    emit(ctx, 'agent/status', { agent: stale, status: 'running' });
+    const delivery = sink.notify([notice]);
+    if (transition === 'disposed') emit(ctx, 'agent/disposed', { agent: stale });
+    else if (transition === 'replaced') emit(ctx, 'agent/status', { agent: fresh, status: 'running' });
+    else unbind();
+    assert.deepEqual(await delivery, [], transition); assert.equal(staleCalls, 0, transition);
+    if (transition !== 'sink-dispose') {
+      if (transition === 'disposed') emit(ctx, 'agent/status', { agent: fresh, status: 'running' });
+      assert.deepEqual(await sink.notify([notice]), [notice.noticeId]);
+      assert.equal(fresh.messages.length, 1);
+    }
+    await ctx.fiber.dispose();
+  }
+});
+
+test('caller abort before or between followup scheduling and invocation calls no Agent', async () => {
+  for (const timing of ['already-aborted', 'after-notify'] as const) {
+    const ctx = new Context(); const sink = new DshReminderSink(); sink.bind(ctx as never);
+    let calls = 0; const target = { status: 'idle', root: true, async followup() { calls++; } };
+    emit(ctx, 'agent/status', { agent: target, status: 'running' });
+    const controller = new AbortController(); if (timing === 'already-aborted') controller.abort();
+    const delivery = sink.notify([createReminderNotice(item)], controller.signal);
+    if (timing === 'after-notify') controller.abort();
+    assert.deepEqual(await delivery, [], timing); assert.equal(calls, 0, timing);
+    await ctx.fiber.dispose();
+  }
+});
