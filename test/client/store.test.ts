@@ -112,6 +112,18 @@ test('failed token replacement keeps the prior authenticated session and topics'
   store.dispose();
 });
 
+test('successful account replacement clears prior account content immediately', async () => {
+  const bob: AccountStatus = { authenticated: true, writable: false, username: 'bob', tokenScope: null, expiresAt: null };
+  const store = new V2exClientStore(remote({ login: async () => bob }));
+  await store.loadSession(); await store.loadLatest(); await store.openTopic('7');
+  assert.ok(store.getSnapshot().topics); assert.ok(store.getSnapshot().thread);
+  await store.login('bob-replacement');
+  assert.equal(store.getSnapshot().account?.username, 'bob');
+  assert.equal(store.getSnapshot().topics, null); assert.equal(store.getSnapshot().thread, null);
+  assert.equal(store.getSnapshot().recommendations, null); assert.equal(store.getSnapshot().interests, null);
+  store.dispose();
+});
+
 test('unauthenticated login success envelope cannot demote an existing ready session', async () => {
   const client = createV2exHttpClient(async (_input, init) => new Response(JSON.stringify({ ok: true, data:
     init?.method === 'POST' ? account(false) : account(true),

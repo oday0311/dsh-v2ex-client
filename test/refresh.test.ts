@@ -128,6 +128,37 @@ test('account activation loads its persisted interval and account switches repla
   assert.deepEqual(f.contentCalls, []); assert.equal(f.refreshCalls, 0);
 });
 
+test('failed account settings sync replaces the prior interval with a safe default and later recovers', async () => {
+  const f = fixture(); await f.service.start();
+  f.service.applyAuthenticatedSettings({ ...f.store.settings, refreshIntervalMinutes: 1 });
+  const read = f.store.getSettings.bind(f.store);
+  f.store.getSettings = async () => { throw new Error('private storage failure'); };
+  await f.service.syncAuthenticatedSettings('bob');
+  assert.deepEqual(f.clock.intervals, [30 * 60_000, 1 * 60_000, 30 * 60_000]);
+  f.store.getSettings = read;
+  await f.store.putSettings({ ...f.store.settings, refreshIntervalMinutes: 60 }, accountScope('bob'));
+  await f.service.syncAuthenticatedSettings('bob');
+  assert.deepEqual(f.clock.intervals, [30 * 60_000, 1 * 60_000, 30 * 60_000, 60 * 60_000]);
+});
+
+test('Alice to Bob replacement commits Bob while failed Bob settings use the safe interval', async () => {
+  const f = fixture(); await f.service.start();
+  await f.store.putSettings({ ...f.store.settings, refreshIntervalMinutes: 1 }, accountScope('alice'));
+  const read = f.store.getSettings.bind(f.store);
+  f.store.getSettings = async scope => {
+    if (scope === accountScope('bob')) throw new Error('private Bob settings failure');
+    return read(scope);
+  };
+  const vault = new FakeCredentialVault();
+  const api = { async readToken() { return { scope: 'everything' }; },
+    async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+  const auth = new AuthService(api as never, vault, undefined, account => f.service.syncAuthenticatedSettings(account));
+  await auth.login('ALICE_FAKE_VALUE');
+  const bob = await auth.login('BOB_FAKE_VALUE');
+  assert.equal(bob.username, 'bob'); assert.equal(vault.value, 'BOB_FAKE_VALUE'); assert.equal(await auth.account(), 'bob');
+  assert.deepEqual(f.clock.intervals, [30 * 60_000, 1 * 60_000, 30 * 60_000]);
+});
+
 test('timer skips all content and model work near the V2EX rate limit', async () => {
   const f = fixture({ budget: false });
   await f.service.runNow('timer');

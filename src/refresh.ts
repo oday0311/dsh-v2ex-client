@@ -10,6 +10,7 @@ import { createReminderNotice } from './reminders.js';
 const MAX_NODES = 20;
 const MAX_NODE_PAGES = 2;
 const MAX_CANDIDATES = 500;
+const DEFAULT_REFRESH_MINUTES = 30;
 
 export interface RefreshClock {
   now(): Date;
@@ -116,7 +117,7 @@ export class RefreshService {
 
   start(): Promise<void> {
     if (this.disposed) return Promise.reject(new V2exError('timeout'));
-    this.schedule(30);
+    this.schedule(DEFAULT_REFRESH_MINUTES);
     return Promise.resolve();
   }
 
@@ -126,9 +127,11 @@ export class RefreshService {
 
   async syncAuthenticatedSettings(account: string | null): Promise<void> {
     if (this.disposed) throw new V2exError('timeout');
-    if (account === null) { this.schedule(30); return; }
-    const settings = await this.options.store.getSettings(accountScope(account));
-    this.applyAuthenticatedSettings(settings);
+    if (account === null) { this.schedule(DEFAULT_REFRESH_MINUTES); return; }
+    try {
+      const settings = await this.options.store.getSettings(accountScope(account));
+      this.applyAuthenticatedSettings(settings);
+    } catch { this.schedule(DEFAULT_REFRESH_MINUTES); }
   }
 
   private schedule(minutes: number): void {

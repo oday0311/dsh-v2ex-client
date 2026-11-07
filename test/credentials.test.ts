@@ -55,6 +55,34 @@ test('identity activation and logout publish account changes after the fence is 
   assert.deepEqual(activated, ['alice', 'bob', null]);
 });
 
+test('committed login replacement survives synchronous and asynchronous activation failures', async () => {
+  for (const mode of ['throw', 'reject'] as const) {
+    const vault = new FakeCredentialVault();
+    const api = { async readToken() { return { scope: 'everything' }; },
+      async readMember(token: string) { return { username: token === 'ALICE_FAKE_VALUE' ? 'alice' : 'bob' }; } };
+    const auth = new AuthService(api as never, vault, undefined, account => {
+      if (account !== 'bob') return Promise.resolve();
+      if (mode === 'throw') throw new Error('private settings failure');
+      return Promise.reject(new Error('private settings rejection'));
+    });
+    await auth.login('ALICE_FAKE_VALUE');
+    const status = await auth.login('BOB_FAKE_VALUE');
+    assert.equal(status.username, 'bob');
+    assert.equal(vault.value, 'BOB_FAKE_VALUE');
+    assert.equal(await auth.account(), 'bob');
+  }
+});
+
+test('cold status recovery survives rejected activation scheduling', async () => {
+  const vault = new FakeCredentialVault(); vault.value = 'BOB_FAKE_VALUE';
+  const api = { async readToken() { return { scope: 'everything' }; }, async readMember() { return { username: 'bob' }; } };
+  const auth = new AuthService(api as never, vault, undefined,
+    async () => { throw new Error('private persisted settings failure'); });
+  const status = await auth.status();
+  assert.equal(status.authenticated, true); assert.equal(status.username, 'bob');
+  assert.equal(await auth.account(), 'bob');
+});
+
 test('logout clears the credential and calls personal-data cleanup only when requested', async () => {
   const vault = new FakeCredentialVault();
   vault.value = TOKEN;

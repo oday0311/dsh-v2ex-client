@@ -76,6 +76,11 @@ export class AuthService {
       left.credentialFingerprint === right.credentialFingerprint && left.account === right.account;
   }
 
+  private async notifyIdentityChanged(account: string | null): Promise<void> {
+    try { await this.identityChanged(account); }
+    catch { /* Identity is already committed; ancillary scheduling must not roll it back. */ }
+  }
+
   private cachedLeaseUnlocked(): IdentityLease | undefined {
     if (!this.verifiedUsername || !this.verifiedCredentialDigest) return undefined;
     return { account: this.verifiedUsername, scope: accountScope(this.verifiedUsername),
@@ -90,7 +95,7 @@ export class AuthService {
     const { writable } = await this.vault.describe();
     if (!token) {
       if (this.verifiedUsername !== null || this.verifiedCredentialDigest !== null) this.invalidate();
-      await this.identityChanged(null);
+      await this.notifyIdentityChanged(null);
       return { authenticated: false, writable, username: null, tokenScope: null, expiresAt: null };
     }
     const digest = createHash('sha256').update(token).digest('hex');
@@ -104,7 +109,7 @@ export class AuthService {
     }
     this.verifiedUsername = status.username;
     this.verifiedCredentialDigest = digest;
-    await this.identityChanged(status.username);
+    await this.notifyIdentityChanged(status.username);
     return status;
   }
 
@@ -127,7 +132,7 @@ export class AuthService {
     this.invalidate();
     this.verifiedUsername = status.username;
     this.verifiedCredentialDigest = digest;
-    await this.identityChanged(status.username);
+    await this.notifyIdentityChanged(status.username);
     return status;
   }); }
 
@@ -209,7 +214,7 @@ export class AuthService {
     await this.vault.clear();
     this.invalidate();
     try { if (clearPersonalData) await this.clearPersonalData(account); }
-    finally { await this.identityChanged(null); }
+    finally { await this.notifyIdentityChanged(null); }
   }); }
 
   private async validate(token: string, writable: boolean): Promise<AccountStatus> {

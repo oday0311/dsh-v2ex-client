@@ -61,3 +61,14 @@ test('composed settings save persists inside the identity fence and immediately 
   assert.deepEqual(await service.update(next), next);
   assert.deepEqual(calls, ['write-fence', 'put:account:alice:1', 'schedule:1', 'get:account:alice']);
 });
+
+test('settings storage failures remain save errors and never reschedule', async () => {
+  const scheduled: number[] = [];
+  const auth = { async withRead<T>(operation: (lease: { scope: string }) => Promise<T>) { return operation({ scope: 'account:alice' }); },
+    async withMutation<T>(operation: (lease: { scope: string }) => Promise<T>) { return operation({ scope: 'account:alice' }); } };
+  const service = createSettingsService(auth as never, {
+    async getSettings() { return settings; }, async putSettings() { throw new Error('storage unavailable'); },
+  }, { applyAuthenticatedSettings(value) { scheduled.push(value.refreshIntervalMinutes); } });
+  await assert.rejects(service.update({ ...settings, refreshIntervalMinutes: 1 }), /storage unavailable/);
+  assert.deepEqual(scheduled, []);
+});
