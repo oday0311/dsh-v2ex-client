@@ -1,5 +1,6 @@
 import { expect, test, type Page, type Route, type TestInfo } from '@playwright/test';
 import { analyzePng, informativeImageFailures } from '../support/png-stats.js';
+import { positionScroll, type ScrollPositionAdapter } from '../support/scroll-position.js';
 
 const NOW = '2026-11-07T08:00:00.000Z';
 const error = (code: string) => ({ ok: false, error: { code, message: 'fixture error', retryable: true } });
@@ -178,29 +179,47 @@ type ScrollDepth = 'top' | 'mid' | 'bottom';
 async function traverseScrollSlices(page: Page, testInfo: TestInfo, scenario: string,
   atDepth?: (depth: ScrollDepth) => Promise<void>): Promise<string[]> {
   const app = page.locator('.v2ex-app');
-  const metrics = await app.evaluate(element => ({ initial: element.scrollTop,
-    maximum: Math.max(0, element.scrollHeight - element.clientHeight) }));
+  const scroll: ScrollPositionAdapter = {
+    setScrollTop: target => app.evaluate((element, value) => { element.scrollTop = value; }, target),
+    readScrollMetrics: () => app.evaluate(element => ({ position: element.scrollTop,
+      maximum: Math.max(0, element.scrollHeight - element.clientHeight) })),
+    settleFrame: () => page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => resolve()))),
+  };
+  const initial = await scroll.readScrollMetrics();
   const requested: Array<{ depth: ScrollDepth; position: number }> = [
     { depth: 'top', position: 0 },
-    { depth: 'mid', position: Math.round(metrics.maximum / 2) },
-    { depth: 'bottom', position: metrics.maximum },
+    { depth: 'mid', position: Math.round(initial.maximum / 2) },
+    { depth: 'bottom', position: initial.maximum },
   ];
   const positions = requested.filter((entry, index) => requested.findIndex(other => Math.abs(other.position - entry.position) <= 1) === index);
   const names: string[] = [];
+  const positionAndValidate = async (target: number) => {
+    const settled = await positionScroll(scroll, target);
+    await page.waitForTimeout(120); await assertStable(page); await assertLayout(page);
+    return settled;
+  };
+  let primaryFailure: unknown; let failed = false;
   try {
     for (const { depth, position } of positions) {
-      await app.evaluate((element, target) => { element.scrollTop = target; }, position);
-      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
-      await page.waitForTimeout(120);
-      await expect.poll(() => app.evaluate(element => element.scrollTop)).toBeCloseTo(position, 0);
-      await assertStable(page); await assertLayout(page); await atDepth?.(depth);
+      await positionAndValidate(position); await atDepth?.(depth);
       const name = `${scenario}-${depth}`;
       const pixels = await app.screenshot({ path: testInfo.outputPath(`${name}.png`), animations: 'disabled' });
       expect(informativeImageFailures(analyzePng(pixels)), name).toEqual([]); names.push(name);
     }
-  } finally {
-    await app.evaluate((element, target) => { element.scrollTop = target; }, metrics.initial);
+  } catch (error) {
+    failed = true; primaryFailure = error;
   }
+  let restorationFailure: unknown;
+  try {
+    await positionAndValidate(initial.position);
+  } catch (error) {
+    restorationFailure = error;
+  }
+  if (failed && restorationFailure !== undefined) {
+    throw new AggregateError([primaryFailure, restorationFailure], `${scenario}: scenario and scroll restoration both failed`);
+  }
+  if (failed) throw primaryFailure;
+  if (restorationFailure !== undefined) throw restorationFailure;
   return names;
 }
 function assertNoEscapes(state: ApiState) { expect(state.external).toEqual([]); expect(state.consoleErrors).toEqual([]); }
