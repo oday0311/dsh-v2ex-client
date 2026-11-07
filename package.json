@@ -38,7 +38,8 @@
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit && tsc -p tsconfig.client.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts test/client/*.test.ts test/client/*.test.tsx",
-    "test:e2e": "playwright test",
+    "test:integration": "node --import tsx --test test/integration/*.test.ts",
+    "test:e2e": "node test/e2e/harness/build.mjs && playwright test",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:release": "node scripts/verify-release.mjs"
   },
@@ -46,6 +47,7 @@
   "devDependencies": {
     "@deepseek-ai/dsh-client-ui-layout": "0.2.1-rc.5",
     "@deepseek-ai/dsh-client-ui-sidebar": "0.2.1-rc.5",
+    "@playwright/test": "1.61.0",
     "@testing-library/react": "16.3.3",
     "@types/node": "22.20.5",
     "@types/react": "18.3.31",

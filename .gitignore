@@ -2,3 +2,4 @@ node_modules/
 lib/
 playwright-report/
 test-results/
+/test/e2e/harness/dist/
