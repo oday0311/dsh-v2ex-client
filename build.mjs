@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { readFile, mkdir, rm, stat } from 'node:fs/promises';
+import { readFile, mkdir, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { build } from 'esbuild';
 
 const pkg = JSON.parse(await readFile(new URL('./package.json', import.meta.url), 'utf8'));
@@ -25,6 +25,20 @@ await build({
   banner: { js: `window.__ModuleLoader__.load({ id: '${pkg.name}', factory: (require) => { var module = { exports: {} }; var exports = module.exports;` },
   footer: { js: 'return module.exports; } });' },
 });
+for (const name of await readdir(new URL('./lib/', import.meta.url))) {
+  if (!name.endsWith('.map')) continue;
+  const url = new URL(`./lib/${name}`, import.meta.url);
+  const map = JSON.parse(await readFile(url, 'utf8'));
+  if (!Array.isArray(map.sources)) throw new Error(`Generated source map is invalid: ${name}`);
+  map.sources = map.sources.map((source) => {
+    if (typeof source !== 'string') throw new Error(`Generated source map is invalid: ${name}`);
+    const safe = source.replaceAll('\\', '/').split('/').filter(part => part && part !== '.' && part !== '..').join('/');
+    if (!safe) throw new Error(`Generated source map path is invalid: ${name}`);
+    return safe;
+  });
+  delete map.sourceRoot;
+  await writeFile(url, JSON.stringify(map));
+}
 for (const project of ['tsconfig.json', 'tsconfig.client.json']) {
   execFileSync(process.execPath, ['node_modules/typescript/bin/tsc', '-p', project,
     '--declaration', '--emitDeclarationOnly', '--outDir', 'lib/types'], { stdio: 'inherit' });

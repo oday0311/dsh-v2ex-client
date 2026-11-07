@@ -62,7 +62,7 @@ Normal operation has no token setting or environment variable. Authentication us
 - **No reminder:** check quiet hours, threshold, unread items, and whether an active top-level Agent can accept delivery.
 - **Wrong account data:** log out with personal-data clearing, then sign in to the intended account.
 
-Public errors use stable codes and intentionally omit raw provider diagnostics.
+Public errors use stable codes together with bounded static messages and retryability metadata. They never include raw upstream or model-provider diagnostics.
 
 ## Development and release verification
 

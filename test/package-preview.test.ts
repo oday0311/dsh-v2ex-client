@@ -13,21 +13,26 @@ const validEntries = [
   { path: 'README.md', size: 100 },
   { path: 'README_ZH.md', size: 100 },
   { path: 'LICENSE', size: 100 },
-  { path: 'cordis.patch.yml', size: 10 },
+  { path: 'cordis.patch.yml', size: 100 },
   { path: 'dsh.plugin.json', size: 100 },
   { path: 'lib/index.js', size: 100 },
   { path: 'lib/client.js', size: 100 },
   { path: 'lib/plugin.js', size: 100 },
   { path: 'lib/types/index.d.ts', size: 100 },
+  { path: 'lib/types/client/index.d.ts', size: 100 },
 ];
 
+const fixtureReader = (entries = validEntries, overrides: Readonly<Record<string, Buffer>> = {}) =>
+  async (path: string) => overrides[path] ?? Buffer.alloc(entries.find(entry => entry.path === path)?.size ?? 0, 0x20);
+
 test('package entry policy accepts only the documented runtime allowlist', async () => {
-  await assert.doesNotReject(inspectPackageEntries(validEntries));
+  await assert.doesNotReject(inspectPackageEntries(validEntries, fixtureReader()));
   for (const path of [
     'test/fixtures/secret.txt', 'src/plugin.ts', '.env', 'docs/private.md',
     'lib/private.pem', 'lib/token.txt', '../outside', '/absolute/path',
   ]) {
-    await assert.rejects(inspectPackageEntries([...validEntries, { path, size: 10 }]), /package_file_forbidden/);
+    const entries = [...validEntries, { path, size: 10 }];
+    await assert.rejects(inspectPackageEntries(entries, fixtureReader(entries)), /package_file_forbidden/);
   }
 });
 
@@ -43,6 +48,7 @@ test('package metadata parser rejects malformed or ambiguous npm pack output', (
 test('release metadata ties package exports, allowlist, engine and license to the manifest', () => {
   const pkg = {
     name: 'v2ex-dsh-client', version: '0.1.0', license: 'MIT',
+    description: 'Read-only V2EX browsing and discovery for DeepSeek Harness',
     main: './lib/index.js', types: './lib/types/index.d.ts',
     files: ['lib', 'cordis.patch.yml', 'dsh.plugin.json', 'README.md', 'README_ZH.md', 'LICENSE'],
     exports: {
@@ -51,38 +57,76 @@ test('release metadata ties package exports, allowlist, engine and license to th
       './package.json': './package.json',
     },
     engines: { node: '>=22', dsh: '>=0.2.1-rc.5 <0.3.0' },
-    dsh: { bundle: { patch: './cordis.patch.yml' } },
+    dsh: { bundle: { patch: './cordis.patch.yml' }, client: { platform: 'web' } },
   };
   const manifest = { name: 'v2ex-dsh-client', version: '0.1.0', license: 'MIT',
+    description: 'Read-only V2EX browsing and discovery for DeepSeek Harness',
     entry: { name: 'v2ex-dsh-client' }, client: { platform: 'web' },
     bundle: { patch: './cordis.patch.yml' } };
-  assert.doesNotThrow(() => validateReleaseMetadata(pkg, manifest));
-  assert.throws(() => validateReleaseMetadata({ ...pkg, license: 'UNLICENSED' }, manifest), /package_metadata_invalid/);
-  assert.throws(() => validateReleaseMetadata({ ...pkg, files: [...pkg.files, 'src'] }, manifest), /package_metadata_invalid/);
+  const patch = '- insert:\n    - id: v2ex-dsh-client\n      name: v2ex-dsh-client\n';
+  const files = validEntries.map(entry => entry.path);
+  assert.doesNotThrow(() => validateReleaseMetadata(pkg, manifest, patch, files));
+  assert.throws(() => validateReleaseMetadata({ ...pkg, license: 'UNLICENSED' }, manifest, patch, files), /package_metadata_invalid/);
+  assert.throws(() => validateReleaseMetadata({ ...pkg, files: [...pkg.files, 'src'] }, manifest, patch, files), /package_metadata_invalid/);
+  assert.throws(() => validateReleaseMetadata(pkg, { ...manifest, description: 'mismatch' }, patch, files), /package_metadata_invalid/);
+  assert.throws(() => validateReleaseMetadata(pkg, manifest, patch.replace(/name:.+/, 'name: other'), files), /package_metadata_invalid/);
+  for (const target of ['lib/index.js', 'lib/types/index.d.ts', 'lib/client.js',
+    'lib/types/client/index.d.ts', 'package.json', 'cordis.patch.yml']) {
+    assert.throws(() => validateReleaseMetadata(pkg, manifest, patch, files.filter(path => path !== target)),
+      new RegExp(`package_file_missing:${target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+  }
+});
+
+test('package scanner bounds actual bytes before decoding and rejects metadata mismatch', async () => {
+  const oversized = Buffer.alloc(5_000_001, 0x20) as Buffer & { toString: () => string };
+  oversized.toString = () => { throw new Error('must not decode oversized input'); };
+  await assert.rejects(inspectPackageEntries(validEntries.map(entry => ({ ...entry, size: 1 })), async path =>
+    path === 'lib/index.js' ? oversized : Buffer.alloc(1, 0x20)), /package_size_invalid:lib\/index\.js/);
+  await assert.rejects(inspectPackageEntries(validEntries, async path =>
+    path === 'lib/index.js' ? Buffer.alloc(101, 0x20) : Buffer.alloc(100, 0x20)),
+  /package_size_mismatch:lib\/index\.js/);
+});
+
+test('package scanner enforces total actual bytes rather than trusting only metadata totals', async () => {
+  const entries = [...validEntries, ...Array.from({ length: 7 }, (_, index) => ({
+    path: `lib/extra-${index}.js`, size: 4_000_000,
+  }))].map(entry => ({ ...entry, size: entry.path.startsWith('lib/extra-') ? entry.size : 100 }));
+  const shared = Buffer.alloc(4_000_000, 0x20);
+  await assert.rejects(inspectPackageEntries(entries, async path =>
+    path.startsWith('lib/extra-') ? shared : Buffer.alloc(100, 0x20)), /package_size_invalid:total/);
 });
 
 test('package scanner rejects static credentials', async () => {
+  const credential = Buffer.from('Authorization: Bearer STATIC_PLACEHOLDER_SECRET_123456789');
+  const map = Buffer.from('{"version":3,"sources":["src/index.ts"]}');
+  const entries = [...validEntries.map(entry => entry.path === 'README.md' ? { ...entry, size: credential.byteLength } : entry),
+    { path: 'lib/index.js.map', size: map.byteLength }];
   await assert.rejects(inspectPackageEntries(
-    [...validEntries, { path: 'lib/index.js.map', size: 100 }],
-    async path => path === 'README.md'
-      ? 'Authorization: Bearer STATIC_PLACEHOLDER_SECRET_123456789'
-      : path.endsWith('.map') ? '{"version":3,"sources":["../src/index.ts"]}' : 'safe content',
+    entries, fixtureReader(entries, { 'README.md': credential, 'lib/index.js.map': map }),
   ), /credential_value_forbidden/);
 });
 
 test('package scanner rejects absolute source-map paths', async () => {
-  await assert.rejects(inspectPackageEntries(
-    [...validEntries, { path: 'lib/index.js.map', size: 100 }],
-    async path => path.endsWith('.map')
-      ? JSON.stringify({ version: 3, sources: ['/Users/example/project/src/index.ts'] })
-      : 'safe content',
-  ), /absolute_source_path/);
+  const unsafe = ['/root/index.ts', 'C:\\root\\index.ts', 'C:/root/index.ts',
+    '\\\\server\\share\\index.ts', '\\rooted\\index.ts', '//server/share/index.ts',
+    'file:///root/index.ts', 'https://example.test/index.ts', '../src/index.ts'];
+  for (const source of unsafe) {
+    const map = Buffer.from(JSON.stringify({ version: 3, sources: [source] }));
+    const entries = [...validEntries, { path: 'lib/index.js.map', size: map.byteLength }];
+    await assert.rejects(inspectPackageEntries(entries, fixtureReader(entries, { 'lib/index.js.map': map })),
+      /absolute_source_path/);
+    const rooted = Buffer.from(JSON.stringify({ version: 3, sourceRoot: source, sources: ['src/index.ts'] }));
+    const rootedEntries = [...validEntries, { path: 'lib/index.js.map', size: rooted.byteLength }];
+    await assert.rejects(inspectPackageEntries(rootedEntries,
+      fixtureReader(rootedEntries, { 'lib/index.js.map': rooted })), /absolute_source_path/);
+  }
 });
 
 test('package scanner rejects token-shaped values even when unlabeled', async () => {
-  await assert.rejects(inspectPackageEntries(validEntries, async path => path === 'README.md'
-    ? '00000000-1111-4222-8333-444444444444'
-    : 'safe content'), /credential_value_forbidden/);
+  const token = Buffer.from('00000000-1111-4222-8333-444444444444');
+  const entries = validEntries.map(entry => entry.path === 'README.md' ? { ...entry, size: token.byteLength } : entry);
+  await assert.rejects(inspectPackageEntries(entries, fixtureReader(entries, { 'README.md': token })),
+    /credential_value_forbidden/);
 });
 
 test('package preview contains required artifacts and excludes fixtures', async () => {
