@@ -21,9 +21,9 @@
   "engines": { "node": ">=22", "dsh": ">=0.2.1-rc.5 <0.3.0" },
   "keywords": ["dsh-plugin", "deepseek-harness", "v2ex", "read-only"],
   "author": "oday0311 <oday0311@hotmail.com>",
-  "repository": { "type": "git", "url": "git+https://github.com/oday0311/-dsh-v2ex-client.git" },
-  "homepage": "https://github.com/oday0311/-dsh-v2ex-client#readme",
-  "bugs": { "url": "https://github.com/oday0311/-dsh-v2ex-client/issues" },
+  "repository": { "type": "git", "url": "git+https://github.com/oday0311/dsh-v2ex-client.git" },
+  "homepage": "https://github.com/oday0311/dsh-v2ex-client#readme",
+  "bugs": { "url": "https://github.com/oday0311/dsh-v2ex-client/issues" },
   "dsh": {
     "bundle": { "patch": "./cordis.patch.yml" },
     "client": {
