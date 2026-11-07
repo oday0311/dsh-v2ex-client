@@ -4,13 +4,17 @@ import type { BrowseView, V2exClientStore } from './store.js';
 import { LoginView } from './LoginView.js';
 import { TopicList } from './TopicList.js';
 import { TopicDetail } from './TopicDetail.js';
+import { TopicTabs } from './TopicTabs.js';
+import { NodeChips, type NodeChip } from './NodeChips.js';
+import { NodeCatalog } from './NodeCatalog.js';
 import { InterestView } from './InterestView.js';
 import { RecommendationView } from './RecommendationView.js';
 import { SettingsView } from './SettingsView.js';
 import { copyFor, formatTime, type LocaleSource } from './locales.js';
 
 const fallbackLocale = { active: 'zh' };
-const views: BrowseView[] = ['smart', 'latest', 'hot', 'node', 'interests', 'settings'];
+const views: BrowseView[] = ['tabs', 'smart', 'latest', 'hot', 'node', 'interests', 'settings'];
+const browsingViews: BrowseView[] = ['tabs', 'latest', 'hot', 'node'];
 
 export function V2exApp({ store, locale }: { store: V2exClientStore; locale?: LocaleSource }) {
   const state = useSyncExternalStore(store.subscribe, store.getSnapshot, store.getSnapshot);
@@ -21,24 +25,38 @@ export function V2exApp({ store, locale }: { store: V2exClientStore; locale?: Lo
   const [nodeInput, setNodeInput] = useState('');
   const [keyword, setKeyword] = useState('');
   const [filterNode, setFilterNode] = useState('');
+  const [nodeFilter, setNodeFilter] = useState('');
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [clearPersonalData, setClearPersonalData] = useState(false);
   useEffect(() => { if (state.phase === 'checking') void store.loadSession(); }, [store]);
   useEffect(() => { if (state.phase === 'ready' && state.view === 'latest' && !state.topics && !state.loading && !state.error) void store.loadLatest(); }, [store, state.phase, state.account]);
+  useEffect(() => { if (state.phase === 'ready' && state.view === 'node' && !state.nodes && !state.nodesLoading && !state.nodesError) void store.loadNodes(); }, [store, state.phase, state.view, state.nodes, state.nodesLoading, state.nodesError]);
   useEffect(() => { if (state.phase === 'ready') void store.loadRecommendations(); }, [store, state.phase, state.account]);
   if (state.phase === 'checking') return <section className="v2ex-app" role="status">{copy.loading}</section>;
   if (state.phase === 'guest') return <div className="v2ex-app"><LoginView store={store} busy={state.loading} error={state.error ? copy.errors[state.error] : null} copy={copy} /></div>;
   const refresh = () => {
-    if (state.view === 'hot') void store.loadHot(); else if (state.view === 'node') void store.loadNode(state.nodeName);
+    if (state.view === 'tabs') void store.loadTab();
+    else if (state.view === 'hot') void store.loadHot();
+    else if (state.view === 'node') { if (state.nodeName) void store.loadNode(state.nodeName); void store.loadNodes(); }
     else if (state.view === 'smart') void store.loadRecommendations(); else if (state.view === 'interests') void store.loadInterests();
     else if (state.view === 'settings') void store.loadSettings(); else void store.loadLatest();
   };
   const filtered = state.view === 'latest' && (keyword.trim() !== '' || filterNode.trim() !== '');
   const items = state.topics?.value.items.filter(item => !filtered || (item.title.toLocaleLowerCase().includes(keyword.trim().toLocaleLowerCase()) &&
     (item.node.name.toLocaleLowerCase().includes(filterNode.trim().toLocaleLowerCase()) || item.node.title.toLocaleLowerCase().includes(filterNode.trim().toLocaleLowerCase())))) ?? [];
+  const tabNodes: NodeChip[] = [];
+  if (state.view === 'tabs' && state.topics) {
+    const seen = new Set<string>();
+    for (const item of state.topics.value.items) {
+      if (seen.has(item.node.name)) continue;
+      seen.add(item.node.name);
+      tabNodes.push({ name: item.node.name, title: item.node.title });
+      if (tabNodes.length >= 10) break;
+    }
+  }
   const unread = state.recommendations?.items.filter(item => !item.read).length ?? 0;
   const tabLabel = (view: BrowseView) => view === 'smart' ? (unread ? copy.smartUnreadTemplate.replace('{count}', String(unread)) : copy.smartRecommendations) :
-    view === 'interests' ? copy.interests : view === 'settings' ? copy.settings : copy[view === 'node' ? 'nodes' : view];
+    view === 'tabs' ? copy.tabBrowse : view === 'interests' ? copy.interests : view === 'settings' ? copy.settings : copy[view === 'node' ? 'nodes' : view];
   const selectTab = (view: BrowseView, target?: HTMLElement) => { store.selectView(view); target?.focus(); };
   return <section className="v2ex-app" aria-label={copy.title}>
     <header className="v2ex-header"><strong>{copy.title}</strong><span className="v2ex-account">{state.account?.username}</span>
@@ -58,6 +76,8 @@ export function V2exApp({ store, locale }: { store: V2exClientStore; locale?: Lo
         }}>{tabLabel(view)}</button>)}
     </nav>
     <section id="v2ex-active-panel" role="tabpanel" aria-labelledby={`v2ex-tab-${state.view}`} className="v2ex-active-panel">
+      {browsingViews.includes(state.view) && <TopicTabs active={state.view === 'tabs' ? state.tab : null} copy={copy}
+        onSelect={tab => { store.selectTab(tab); }} />}
       {state.view === 'smart' && <div className="v2ex-layout"><div className="v2ex-list"><RecommendationView value={state.recommendations} loading={state.recommendationsLoading} error={state.recommendationsError}
         copy={copy} locale={activeLocale} onRetry={() => void store.loadRecommendations()} onOpen={id => { void store.markRecommendationRead(id); void store.openTopic(String(id)); }}
         onFeedback={(id, value) => void store.setRecommendationFeedback(id, value)} /></div>
@@ -67,14 +87,17 @@ export function V2exApp({ store, locale }: { store: V2exClientStore; locale?: Lo
         onUpdate={value => void store.changeInterests('update', value)} onPause={value => void store.changeInterests('update', { learningPaused: value })}
         onRelearn={() => void store.changeInterests('relearn')} onRevoke={() => void store.changeInterests('revoke')} onClear={() => void store.changeInterests('clear')} />}
       {state.view === 'settings' && <SettingsView settings={state.settings} loading={state.settingsLoading} error={state.settingsError} copy={copy} onSave={value => void store.saveSettings(value)} />}
-      {(state.view === 'latest' || state.view === 'hot' || state.view === 'node') && <>
+      {browsingViews.includes(state.view) && <>
+        {state.view === 'tabs' && <NodeChips nodes={tabNodes} onSelect={name => void store.loadNode(name)} copy={copy} />}
         {state.view === 'latest' && <div className="v2ex-filters"><label>{copy.keyword}<input value={keyword} onChange={event => setKeyword(event.target.value)} /></label><label>{copy.filterNode}<input value={filterNode} onChange={event => setFilterNode(event.target.value)} /></label></div>}
-        {state.view === 'node' && <form className="v2ex-node-form" onSubmit={event => { event.preventDefault(); void store.loadNode(nodeInput); }}><label htmlFor="v2ex-node">{copy.nodeLabel}</label><div><input id="v2ex-node" value={nodeInput} onChange={event => setNodeInput(event.target.value)} placeholder={copy.nodePlaceholder} /><button type="submit">{copy.browse}</button></div></form>}
+        {state.view === 'node' && <><NodeCatalog nodes={state.nodes?.value ?? null} loading={state.nodesLoading} error={state.nodesError}
+          filter={nodeFilter} onFilter={setNodeFilter} onSelect={name => void store.loadNode(name)} copy={copy} />
+          <form className="v2ex-node-form" onSubmit={event => { event.preventDefault(); void store.loadNode(nodeInput); }}><label htmlFor="v2ex-node">{copy.nodeLabel}</label><div><input id="v2ex-node" value={nodeInput} onChange={event => setNodeInput(event.target.value)} placeholder={copy.nodePlaceholder} /><button type="submit">{copy.browse}</button></div></form></>}
         <div className="v2ex-layout"><section className="v2ex-list" aria-label={copy.topicList}>{state.nodeInfo && <h2>{state.nodeInfo.value.title}</h2>}
           {state.loading && <p role="status">{copy.loading}</p>}{state.error && <p className="v2ex-error" role="alert">{copy.errors[state.error]} <button type="button" onClick={refresh}>{copy.retry}</button></p>}
           {state.topics?.stale && <p className="v2ex-stale" role="status">{copy.stale}</p>}{state.topics?.stale && state.topics.refreshError && <p className="v2ex-error">{copy.errors[state.topics.refreshError.code]}</p>}
           {state.topics && <TopicList items={items} onOpen={id => void store.openTopic(id)} copy={copy} locale={activeLocale} filtered={filtered} />}
-          {state.topics?.value.hasMore && <button type="button" disabled={state.loading} onClick={() => state.view === 'node' ? void store.loadNode(state.nodeName, state.topics!.value.page + 1) : void store.loadLatest(state.topics!.value.page + 1)}>{copy.loadMore}</button>}
+          {state.view !== 'tabs' && state.topics?.value.hasMore && <button type="button" disabled={state.loading} onClick={() => state.view === 'node' ? void store.loadNode(state.nodeName, state.topics!.value.page + 1) : void store.loadLatest(state.topics!.value.page + 1)}>{copy.loadMore}</button>}
         </section>{(state.thread || state.detailLoading || state.detailError) && <TopicDetail state={state} store={store} copy={copy} locale={activeLocale} />}</div>
       </>}
     </section>

@@ -24,13 +24,13 @@ Create a PAT in V2EX account settings, open the V2EX sidebar in DSH, and paste i
 
 ## Read-only guarantee
 
-Every request this plugin sends to V2EX uses `GET` and is restricted to official V2EX HTTPS API origins. It reads token status, member identity, latest/hot/node topics, topic details, and replies. It cannot create or change topics or replies, thank, favorite, ignore, block, boost, delete, or otherwise mutate V2EX data.
+Every request this plugin sends to V2EX uses `GET` and is restricted to official V2EX HTTPS origins. It reads token status, member identity, latest/hot/node topics, the public section tabs (`/?tab=tech`, `/?tab=jobs`, ...), the public node catalog, topic details, and replies. It cannot create or change topics or replies, thank, favorite, ignore, block, boost, delete, or otherwise mutate V2EX data.
 
 The sidebar uses same-origin Host routes to change local settings and state. Those local `POST`, `PUT`, and `DELETE` operations never become V2EX writes. All model-facing tools are read-only.
 
 ## Browsing and AI
 
-Latest, Hot, and Nodes support topic and paginated reply reading. Content is validated, size-limited, cached, and marked when stale. AI summaries are explicit actions and disclose topic and reply-page coverage. Without AI services, normal browsing still works.
+Latest, Hot, section tabs (Tech, Creative, Play, Apple, Jobs, Deals, City, Q&A, Hot, All, R2, VXNA), and Nodes support topic and paginated reply reading. Section tabs link into the nodes that appear in them, and the Nodes view lists the common node catalog so any node can be opened directly. Content is validated, size-limited, cached, and marked when stale. AI summaries are explicit actions and disclose topic and reply-page coverage. Without AI services, normal browsing still works.
 
 V2EX text is untrusted input. Only bounded normalized data goes to the current DSH model, model tools are disabled, and structured output is validated. AI output can be incomplete or wrong; the source discussion remains authoritative.
 

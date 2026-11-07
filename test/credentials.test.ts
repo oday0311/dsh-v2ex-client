@@ -24,6 +24,30 @@ test('login validates token and identity before saving and returns only browser-
   assert.doesNotMatch(JSON.stringify(status), /00000000/);
 });
 
+test('token validity is anchored at creation instead of showing a 1970 expiry', async () => {
+  const vault = new FakeCredentialVault();
+  const { api } = apiFrom({ '/api/v2/token': TOKEN_OK, '/api/v2/member': MEMBER_OK });
+  const auth = new AuthService(api, vault);
+  const status = await auth.login(TOKEN);
+  assert.equal(status.expiresAt, new Date((1_794_000_000 + 2_592_000) * 1000).toISOString());
+});
+
+test('legacy absolute token expiration timestamps remain supported', async () => {
+  const vault = new FakeCredentialVault();
+  const legacy = { success: true, message: '', result: { scope: 'read', expiration: 1_900_000_000, created: 1_794_000_000 } };
+  const { api } = apiFrom({ '/api/v2/token': legacy, '/api/v2/member': MEMBER_OK });
+  const auth = new AuthService(api, vault);
+  assert.equal((await auth.login(TOKEN)).expiresAt, '2030-03-17T17:46:40.000Z');
+});
+
+test('tokens without a validity duration report no expiry', async () => {
+  const vault = new FakeCredentialVault();
+  const indefinite = { success: true, message: '', result: { scope: 'read', expiration: null, created: 1_794_000_000 } };
+  const { api } = apiFrom({ '/api/v2/token': indefinite, '/api/v2/member': MEMBER_OK });
+  const auth = new AuthService(api, vault);
+  assert.equal((await auth.login(TOKEN)).expiresAt, null);
+});
+
 test('invalid token is never stored and existing credential survives a failed replacement', async () => {
   const vault = new FakeCredentialVault();
   vault.value = 'previous-credential';

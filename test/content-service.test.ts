@@ -7,6 +7,8 @@ import { createBrowsingTools } from '../src/tools.js';
 import { FakeContentStore, FakeCredentialVault } from './helpers/fakes.js';
 import { NODE_OK, REPLIES_OK, TOPIC } from './fixtures/v2ex.js';
 
+const TAB_TOPIC = { id: 9, title: 'Tab topic', node: { name: 'python', title: 'Python' }, author: 'alice', replyCount: 2, activityAt: '2026-11-06T00:00:00.000Z' };
+
 function fixture() {
   const vault = new FakeCredentialVault();
   vault.value = 'fixture-token';
@@ -18,6 +20,8 @@ function fixture() {
     rateLimit: { limit: 100, remaining: 90, resetAt: null },
     async latest(page: number) { calls.push(`latest:${page}`); return [TOPIC]; },
     async hot() { calls.push('hot'); return [TOPIC]; },
+    async tabTopics(tab: string) { calls.push(`tabTopics:${tab}`); return [TAB_TOPIC]; },
+    async allNodes() { calls.push('allNodes'); return [NODE_OK.result]; },
     async node(name: string) { calls.push(`node:${name}`); return NODE_OK.result; },
     async nodeTopics(name: string, page: number) { calls.push(`nodeTopics:${name}:${page}`); return [TOPIC]; },
     async topic(id: number) { calls.push(`topic:${id}`); return TOPIC; },
@@ -206,4 +210,45 @@ test('invalid identifiers fail before upstream I/O', async () => {
   assert.throws(() => f.service.nodeTopics({ node: '../bad', page: 1 }), { code: 'invalid_request' });
   await assert.rejects(f.service.topic({ topic: '001', replyPages: 1 }), { code: 'invalid_request' });
   assert.deepEqual(f.calls, []);
+});
+
+test('tab reads are cached and xna mirrors the VXNA node feed', async () => {
+  const f = fixture();
+  const result = await f.service.tab({ tab: 'tech' });
+  assert.deepEqual(f.calls, ['tabTopics:tech']);
+  assert.equal(result.value.items[0]?.title, 'Tab topic');
+  assert.equal(result.value.items[0]?.author.username, 'alice');
+  assert.equal(result.value.items[0]?.node.name, 'python');
+  assert.equal(result.value.items[0]?.createdAt, '2026-11-06T00:00:00.000Z');
+  assert.equal(result.value.items[0]?.lastReplyAt, '2026-11-06T00:00:00.000Z');
+  assert.equal(result.value.hasMore, false);
+  assert.equal(result.value.page, 1);
+  assert.equal((await f.service.tab({ tab: 'tech' })).source, 'cache');
+  assert.deepEqual(f.calls, ['tabTopics:tech']);
+  await f.service.tab({ tab: 'xna' });
+  assert.deepEqual(f.calls, ['tabTopics:tech', 'nodeTopics:vxna:1']);
+  await f.service.tab({ tab: 'r2' });
+  assert.deepEqual(f.calls, ['tabTopics:tech', 'nodeTopics:vxna:1', 'tabTopics:r2']);
+  assert.equal((await f.service.tab({ tab: 'r2' })).source, 'cache');
+  assert.deepEqual(f.calls, ['tabTopics:tech', 'nodeTopics:vxna:1', 'tabTopics:r2']);
+  assert.throws(() => f.service.tab({ tab: 'nope' as never }), { code: 'invalid_request' });
+});
+
+test('node catalog validates, dedupes and ranks nodes by activity', async () => {
+  const f = fixture();
+  f.api.allNodes = async () => {
+    f.calls.push('allNodes');
+    return [
+    { id: 1, name: 'python', title: 'Python', topics: 10, url: 'https://www.v2ex.com/go/python' },
+    { id: 2, name: 'dev', title: 'Dev', topics: 50, url: 'https://www.v2ex.com/go/dev' },
+    { id: 3, name: 'python', title: 'Duplicate', topics: 999, url: 'https://www.v2ex.com/go/python' },
+    { id: 4, name: '../bad', title: 'Bad', topics: 1000, url: 'https://www.v2ex.com/go/bad' },
+    { id: 5, name: 'empty', title: '', topics: 0, url: 'https://www.v2ex.com/go/empty' },
+    ];
+  };
+  const result = await f.service.nodes();
+  assert.deepEqual(result.value.map(node => node.name), ['dev', 'python', 'empty']);
+  assert.equal(result.value[2]?.title, 'empty');
+  assert.equal((await f.service.nodes()).source, 'cache');
+  assert.deepEqual(f.calls, ['allNodes']);
 });

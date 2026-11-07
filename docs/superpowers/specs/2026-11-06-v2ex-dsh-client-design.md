@@ -20,7 +20,7 @@ Both surfaces use one Host implementation so authentication, caching, rate limit
 
 - Mandatory login with a V2EX Personal Access Token.
 - Token validation and authenticated member display.
-- Latest topics, hot topics, node discovery, node topics, topic detail, and paginated replies.
+- Latest topics, hot topics, home-page section tabs (tech, creative, play, apple, jobs, deals, city, qna, hot, all, r2, xna), node discovery through a public node catalog, node topics, topic detail, and paginated replies.
 - Local keyword and node filtering over fetched content.
 - Per-topic AI summaries, viewpoint/controversy summaries, and notable-reply extraction.
 - Interest-aware recommendations in the sidebar and through Agent Tools.
@@ -43,11 +43,13 @@ Both surfaces use one Host implementation so authentication, caching, rate limit
 
 ## 3. External API Basis
 
-Use the official V2EX API 2.0 endpoints under `https://www.v2ex.com/api/v2/` for token validation, member identity, latest topics, nodes, node topics, individual topics, and replies. Authentication uses an `Authorization: Bearer ...` header.
+Use the official V2EX API 2.0 endpoints under `https://www.v2ex.com/api/v2/` for token validation, member identity, nodes, individual topics, and replies. Authentication uses an `Authorization: Bearer ...` header.
 
 The authenticated API is documented at <https://www.v2ex.com/help/api>. Personal Access Token lifetime and display behavior are documented at <https://www.v2ex.com/help/personal-access-token>.
 
-The legacy official public hot-topics endpoint may be used for the Hot view, but it must still be requested by the Host and the plugin UI remains inaccessible until login. All upstream responses are treated as untrusted and validated before caching or returning them.
+API 2.0 exposes no full-site latest or hot list, and its `nodes/:node_name/topics` list items omit the author and node objects the panel renders. Those list views therefore read the official public JSON feeds on the same origin — `/api/topics/latest.json`, `/api/topics/hot.json`, and `/api/topics/show.json?node_name=...` — which return complete topic objects. They are still requested by the Host, still validated before caching or returning, and the plugin UI remains inaccessible until login. Latest paging is done locally because the feed returns a single bounded page; the node feed has one page and later pages stay empty.
+
+V2EX publishes no JSON endpoint for the home-page section tabs, so the Host reads the official server-rendered `/?tab=<section>` page with the same bounded GET transport and extracts only the topic rows the panel renders (title, node, author, reply count, activity time). The page is parsed structurally, every field is length-bounded, control characters are removed, and only normalized text reaches the client; a page whose rows cannot be parsed fails closed as `invalid_response`. Tab pages are a single fixed page of up to 50 topics, so they expose no further paging. The `xna` tab has no upstream topic page (the site links to `/xna`), so it mirrors the VXNA node feed instead. The public node catalog comes from `/api/nodes/all.json`; the Host validates, dedupes, ranks, bounds it to the most active 240 nodes, and caches it for six hours.
 
 The V2EX API exposes rate-limit state through response headers. The implementation must honor the observed headers rather than relying on a hard-coded allowance.
 

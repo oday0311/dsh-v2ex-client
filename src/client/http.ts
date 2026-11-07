@@ -1,9 +1,9 @@
 import { z } from 'zod';
-import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, PublicTopicAiSummary, RecommendationList, ReplyItem, TopicListItem, TopicPage, TopicThread } from '../contract.js';
+import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, PublicTopicAiSummary, RecommendationList, ReplyItem, TopicListItem, TopicPage, TopicTab, TopicThread } from '../contract.js';
 import type { V2exErrorCode } from '../errors.js';
-import { account, cached, envelope, interestProfile, node, pluginSettings, recommendationList, reply, summary, thread, topicItem, topicPage, updated } from './schema.js';
+import { account, cached, envelope, interestProfile, node, nodeCatalog, pluginSettings, recommendationList, reply, summary, thread, topicItem, topicPage, updated } from './schema.js';
 
-export type ClientErrorCode = V2exErrorCode | 'cancelled';
+export type ClientErrorCode = V2exErrorCode | 'cancelled' | 'plugin_unavailable';
 const MAX_RESPONSE_BYTES = 256 * 1024;
 
 export class V2exClientError extends Error {
@@ -19,6 +19,8 @@ export interface V2exClientRemote {
   logout(clearPersonalData?: boolean, signal?: AbortSignal): Promise<AccountStatus>;
   latest(page: number, signal?: AbortSignal): Promise<Cached<TopicPage>>;
   hot(signal?: AbortSignal): Promise<Cached<TopicListItem[]>>;
+  tab?(tab: TopicTab, signal?: AbortSignal): Promise<Cached<TopicPage>>;
+  nodes?(signal?: AbortSignal): Promise<Cached<NodeInfo[]>>;
   node(node: string, signal?: AbortSignal): Promise<Cached<NodeInfo>>;
   nodeTopics(node: string, page: number, signal?: AbortSignal): Promise<Cached<TopicPage>>;
   topic(id: string, signal?: AbortSignal): Promise<Cached<TopicThread>>;
@@ -73,7 +75,19 @@ export function createV2exHttpClient(fetcher: typeof fetch = globalThis.fetch): 
       throw new V2exClientError(init.signal?.aborted ? 'cancelled' : 'offline');
     }
     if (init.signal?.aborted) throw new V2exClientError('cancelled');
-    const raw = await readJson(response, init.signal ?? undefined);
+    let raw: unknown;
+    try {
+      raw = await readJson(response, init.signal ?? undefined);
+    } catch (error) {
+      // The Host registers its V2EX routes while the plugin activates. A plain
+      // 404/403 or an HTML body means the route is not there yet (or the plugin
+      // failed to load), not that V2EX returned a malformed payload.
+      if (error instanceof V2exClientError && error.code === 'invalid_response' &&
+          (response.status === 404 || response.status === 403 || /^text\/html\b/i.test(response.headers.get('content-type') ?? ''))) {
+        throw new V2exClientError('plugin_unavailable');
+      }
+      throw error;
+    }
     if (init.signal?.aborted) throw new V2exClientError('cancelled');
     const parsed = envelope.safeParse(raw);
     if (!parsed.success) throw new V2exClientError('invalid_response');
@@ -95,6 +109,8 @@ export function createV2exHttpClient(fetcher: typeof fetch = globalThis.fetch): 
     logout: (clearPersonalData = false, signal) => request('/session', account, { method: 'DELETE', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ clearPersonalData }), signal }),
     latest: (page, signal) => request(`/latest${query({ page })}`, cached(topicPage), { signal }),
     hot: signal => request('/hot', cached(z.array(topicItem).max(20)), { signal }),
+    tab: (tab, signal) => request(`/tab${query({ tab })}`, cached(topicPage), { signal }),
+    nodes: signal => request('/nodes', cached(nodeCatalog), { signal }),
     node: (name, signal) => request(`/node${query({ node: name })}`, cached(node), { signal }),
     nodeTopics: (name, page, signal) => request(`/node/topics${query({ node: name, page })}`, cached(topicPage), { signal }),
     topic: (topicId, signal) => request(`/topic${query({ topic: topicId, replyPages: 0 })}`, cached(thread), { signal }),

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { runLiveVerification } from '../scripts/verify-live-api.js';
-import { MEMBER_OK, REPLIES_OK, TOKEN_OK, TOPIC_OK, TOPICS_OK } from './fixtures/v2ex.js';
+import { MEMBER_OK, REPLIES_OK, TOKEN_OK, TOPIC, TOPIC_OK } from './fixtures/v2ex.js';
 import { jsonResponse, recordingFetch } from './helpers/fakes.js';
 
 const PLACEHOLDER_TOKEN = 'fixture-token-for-live-verifier';
@@ -15,7 +15,7 @@ test('live verifier performs only the approved bounded GET sequence', async () =
   const fixtureByPath: Record<string, unknown> = {
     '/api/v2/token': TOKEN_OK,
     '/api/v2/member': MEMBER_OK,
-    '/api/v2/topics/latest?p=1': TOPICS_OK,
+    '/api/topics/latest.json': [TOPIC],
     '/api/v2/topics/123': TOPIC_OK,
     '/api/v2/topics/123/replies?p=1': REPLIES_OK,
   };
@@ -52,7 +52,7 @@ test('live verifier rejects an empty latest page without making arbitrary reads'
   const fixtureByPath: Record<string, unknown> = {
     '/api/v2/token': TOKEN_OK,
     '/api/v2/member': MEMBER_OK,
-    '/api/v2/topics/latest?p=1': { success: true, result: [] },
+    '/api/topics/latest.json': [],
   };
   const transport = recordingFetch((url) => jsonResponse(fixtureByPath[url.pathname + url.search]));
   const result = await runLiveVerification({ V2EX_TEST_TOKEN: PLACEHOLDER_TOKEN }, transport.fetch);

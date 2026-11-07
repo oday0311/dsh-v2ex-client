@@ -1,10 +1,24 @@
 import { createHash } from 'node:crypto';
 import type { AccountStatus, CredentialVault } from './contract.js';
 import { V2exError } from './errors.js';
-import type { V2exApi } from './v2ex-api.js';
+import type { V2exApi, V2exToken } from './v2ex-api.js';
 import { accountScope } from './account-scope.js';
 
 export const TOKEN_REF = 'V2EX_PERSONAL_ACCESS_TOKEN';
+
+/**
+ * V2EX reports `expiration` as the token's validity in seconds (for example
+ * 2592000 for 30 days), anchored at `created`; some historical responses used an
+ * absolute Unix time instead. Convert both shapes to an ISO instant so the panel
+ * never shows a 1970 expiry for a fresh token.
+ */
+export function tokenExpiresAt(info: Pick<V2exToken, 'expiration' | 'created'>): string | null {
+  const expiration = info.expiration;
+  if (expiration === null || expiration === undefined || expiration <= 0) return null;
+  const created = info.created && info.created > 0 ? info.created : Math.floor(Date.now() / 1000);
+  const absolute = expiration > 1_000_000_000 ? expiration : created + expiration;
+  return new Date(absolute * 1000).toISOString();
+}
 
 export interface CredentialProvider {
   resolve(ref: string): Promise<{ value: string } | undefined>;
@@ -225,7 +239,7 @@ export class AuthService {
       writable,
       username: member.username,
       tokenScope: info.scope ?? null,
-      expiresAt: info.expiration ? new Date(info.expiration * 1000).toISOString() : null,
+      expiresAt: tokenExpiresAt(info),
     };
   }
 }

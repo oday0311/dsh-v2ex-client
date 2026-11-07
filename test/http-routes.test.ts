@@ -7,7 +7,7 @@ import { Config } from '../src/index.js';
 import { Context } from '@deepseek-ai/cordis';
 
 const TOKEN = '00000000-0000-4000-8000-000000000000';
-const PATHS = ['/session', '/latest', '/hot', '/node', '/node/topics', '/topic', '/topic/summary', '/interests',
+const PATHS = ['/session', '/latest', '/hot', '/tab', '/nodes', '/node', '/node/topics', '/topic', '/topic/summary', '/interests',
   '/recommendations', '/recommendations/feedback', '/recommendations/read', '/settings', '/replies', '/health'];
 
 function fixture() {
@@ -27,6 +27,8 @@ function fixture() {
   const content = {
     async latest(input: { page: number }) { calls.push(`latest:${input.page}`); return { value: { items: [], page: input.page, hasMore: false, stale: false }, stale: false, source: 'network', fetchedAt: 'now' }; },
     async hot() { calls.push('hot'); return { value: [], stale: false, source: 'network', fetchedAt: 'now' }; },
+    async tab(input: { tab: string }) { calls.push(`tab:${input.tab}`); return { value: { items: [], page: 1, hasMore: false, stale: false }, stale: false, source: 'network', fetchedAt: 'now' }; },
+    async nodes() { calls.push('nodes'); return { value: [], stale: false, source: 'network', fetchedAt: 'now' }; },
     async node(input: { node: string }) { calls.push(`node:${input.node}`); return { value: { name: input.node }, stale: false, source: 'network', fetchedAt: 'now' }; },
     async nodeTopics(input: { node: string; page: number }) { calls.push(`nodeTopics:${input.node}:${input.page}`); return { value: { items: [] }, stale: false, source: 'network', fetchedAt: 'now' }; },
     async topic(input: { topic: string; replyPages: number }) { calls.push(`topic:${input.topic}:${input.replyPages}`); return { value: { topic: { id: Number(input.topic) }, content: '', replies: [], replyPage: input.replyPages, hasMoreReplies: false }, stale: false, source: 'network', fetchedAt: 'now' }; },
@@ -402,20 +404,21 @@ test('connection lookup failures are bounded before opening storage', async () =
 test('browsing routes validate query before invoking services', async () => {
   const f = fixture();
   for (const path of ['/latest?page=0', '/node?node=../bad', '/node/topics?node=ok&page=x',
-    '/topic?topic=01', '/replies?topic=2&page=1001', '/hot?extra=1']) {
+    '/topic?topic=01', '/replies?topic=2&page=1001', '/hot?extra=1', '/tab', '/tab?tab=bad',
+    '/tab?tab=tech&extra=1', '/nodes?page=2']) {
     const response = await f.fetch(`/api/v2ex${path}`);
     assert.equal(response.status, 400, path);
     assert.equal((await response.json() as { error: { code: string } }).error.code, 'invalid_request');
   }
   assert.deepEqual(f.calls, []);
-  for (const path of ['/latest?page=2', '/hot', '/node?node=python', '/node/topics?node=python&page=3',
+  for (const path of ['/latest?page=2', '/hot', '/tab?tab=tech', '/nodes', '/node?node=python', '/node/topics?node=python&page=3',
     '/topic?topic=123&replyPages=2', '/replies?topic=123&page=2', '/health']) {
     const response = await f.fetch(`/api/v2ex${path}`);
     assert.equal(response.status, 200, path);
     assert.equal(response.headers.get('cache-control'), 'no-store');
     assert.equal((await response.json() as { ok: boolean }).ok, true);
   }
-  assert.deepEqual(f.calls, ['latest:2', 'hot', 'node:python', 'nodeTopics:python:3', 'topic:123:2', 'replies:123:2']);
+  assert.deepEqual(f.calls, ['latest:2', 'hot', 'tab:tech', 'nodes', 'node:python', 'nodeTopics:python:3', 'topic:123:2', 'replies:123:2']);
 });
 
 test('service errors use bounded public messages and stable statuses', async () => {
@@ -518,4 +521,36 @@ test('composed logout can clear personal profile and recommendations', async () 
   assert.equal(global.profile, null);
   assert.equal(recommendations.size, 0);
   await plugin.dispose();
+});
+
+test('tab and node catalog responses are bounded with truthful omission metadata', async () => {
+  const routes = new Map<string, { fetch(request: Request): Promise<Response> }>();
+  const item = (id: number) => ({ id, title: 'Topic', node: { name: 'python', title: 'Python' }, author: { username: 'alice' },
+    replyCount: 1, createdAt: '2026-11-06T00:00:00Z', lastReplyAt: null, url: `https://www.v2ex.com/t/${id}` });
+  const items = Array.from({ length: 80 }, (_, index) => item(index + 1));
+  const nodes = Array.from({ length: 300 }, (_, index) => ({ name: `node${index}`, title: `节点 ${index}`.repeat(10),
+    topicCount: index, url: `https://www.v2ex.com/go/node${index}` }));
+  const cached = { stale: false, source: 'network', fetchedAt: '2026-11-06T00:00:00Z' };
+  registerV2exHttpRoutes({ fetch: { register(route) { routes.set(route.path, route); return () => {}; } } }, {
+    credential: { async resolve() { return undefined; } }, auth: {} as never,
+    content: { async tab() { return { ...cached, value: { items, page: 1, hasMore: false, stale: false } }; },
+      async nodes() { return { ...cached, value: nodes }; } },
+  } as never);
+  const tab = await routes.get('/api/v2ex/tab')!.fetch(new Request('https://host.test/api/v2ex/tab?tab=all'));
+  const tabText = await tab.text();
+  const tabBody = JSON.parse(tabText) as { ok: boolean; data: { value: { items: unknown[]; page: number; hasMore: boolean }; truncated: boolean; omittedItems: number } };
+  assert.equal(tab.status, 200);
+  assert.equal(tabBody.data.value.items.length, 50);
+  assert.equal(tabBody.data.value.page, 1);
+  assert.equal(tabBody.data.value.hasMore, false);
+  assert.equal(tabBody.data.truncated, true);
+  assert.equal(tabBody.data.omittedItems, 30);
+  const catalog = await routes.get('/api/v2ex/nodes')!.fetch(new Request('https://host.test/api/v2ex/nodes'));
+  const catalogText = await catalog.text();
+  const catalogBody = JSON.parse(catalogText) as { ok: boolean; data: { value: unknown[]; truncated: boolean; omittedItems: number } };
+  assert.equal(catalog.status, 200);
+  assert.ok(catalogBody.data.value.length > 0 && catalogBody.data.value.length <= 240);
+  assert.equal(catalogBody.data.truncated, true);
+  assert.equal(catalogBody.data.omittedItems, 300 - catalogBody.data.value.length);
+  assert.ok(Buffer.byteLength(catalogText) <= 256 * 1024);
 });

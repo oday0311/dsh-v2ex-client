@@ -1,8 +1,8 @@
 import type { AuthService } from './credentials.js';
 import type { ContentService } from './content-service.js';
-import type { AccountStatus, ApiResult, Cached, PluginSettings, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
+import type { AccountStatus, ApiResult, Cached, NodeInfo, PluginSettings, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
 import { V2exError, toPublicError } from './errors.js';
-import { assertNodeName, assertPage, assertTopicId } from './validation.js';
+import { assertNodeName, assertPage, assertTab, assertTopicId } from './validation.js';
 import type { IntelligenceService, SummaryMode } from './intelligence.js';
 import type { InterestService } from './interests.js';
 import type { RecommendationService } from './recommendations.js';
@@ -17,7 +17,7 @@ const MAX_EMBEDDED_REPLY_PAGES = 3;
 const ROUTED_METHODS = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD', 'OPTIONS'];
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
-export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'>; interests?: Pick<InterestService, 'perform'>; recommendations?: Pick<RecommendationService, 'list' | 'feedback' | 'markRead' | 'clear'>; settings?: { get(): Promise<PluginSettings>; update(settings: PluginSettings): Promise<PluginSettings> } }
+export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'tab' | 'nodes' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'>; interests?: Pick<InterestService, 'perform'>; recommendations?: Pick<RecommendationService, 'list' | 'feedback' | 'markRead' | 'clear'>; settings?: { get(): Promise<PluginSettings>; update(settings: PluginSettings): Promise<PluginSettings> } }
 export interface V2exFetchRoute { path: string; methods: string[]; requestBody: 'buffered'; fetch(request: Request): Promise<Response> }
 export interface FetchConnection { fetch?: { register(route: V2exFetchRoute): unknown } }
 
@@ -68,6 +68,24 @@ function boundedHot(result: Cached<TopicListItem[]>): Cached<TopicListItem[]> & 
   const value = result.value.slice(0, PAGE_SIZE);
   const omittedItems = result.value.length - value.length;
   return { ...result, value, truncated: omittedItems > 0, omittedItems };
+}
+
+/** V2EX tab pages render one fixed page of up to 50 topics. */
+function boundedTabPage(result: Cached<TopicPage>): Cached<TopicPage> & { truncated: boolean; omittedItems: number } {
+  const items = result.value.items.slice(0, 50);
+  const omittedItems = result.value.items.length - items.length;
+  return { ...result, value: { ...result.value, page: 1, hasMore: false, items },
+    truncated: omittedItems > 0, omittedItems };
+}
+
+function boundedNodeCatalog(result: Cached<NodeInfo[]>): Cached<NodeInfo[]> & { truncated: boolean; omittedItems: number } {
+  const value = result.value.slice(0, 240);
+  const bounded = { ...result, value, truncated: value.length < result.value.length,
+    omittedItems: result.value.length - value.length };
+  while (Buffer.byteLength(JSON.stringify({ ok: true, data: bounded })) > MAX_RESPONSE_BYTES && bounded.value.length) {
+    bounded.value.pop(); bounded.truncated = true; bounded.omittedItems++;
+  }
+  return bounded;
 }
 
 function boundedRecommendationList(result: Awaited<ReturnType<RecommendationService['list']>>) {
@@ -312,6 +330,14 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
         params(query, []);
         return json({ ok: true, data: boundedHot(await services.content.hot(request.signal)) });
       }
+      if (path === '/tab') {
+        const input = params(query, ['tab']);
+        return json({ ok: true, data: boundedTabPage(await services.content.tab({ tab: assertTab(input.get('tab')) }, request.signal)) });
+      }
+      if (path === '/nodes') {
+        params(query, []);
+        return json({ ok: true, data: boundedNodeCatalog(await services.content.nodes(request.signal)) });
+      }
       if (path === '/node') {
         const input = params(query, ['node']);
         return json({ ok: true, data: await services.content.node({ node: assertNodeName(input.get('node')) }, request.signal) });
@@ -354,6 +380,7 @@ export async function registerV2exHttpRoutes(connection: FetchConnection, servic
   try {
     for (const [path, methods] of [
       ['/session', ['GET', 'POST', 'DELETE']], ['/latest', ['GET']], ['/hot', ['GET']],
+      ['/tab', ['GET']], ['/nodes', ['GET']],
       ['/node', ['GET']], ['/node/topics', ['GET']], ['/topic', ['GET']],
       ['/topic/summary', ['POST']],
       ['/interests', ['GET', 'PUT', 'POST', 'DELETE']],

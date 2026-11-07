@@ -9,12 +9,14 @@ const expectedRoutes = [
   { path: '/api/v2ex/latest', methods: ['GET'] },
   { path: '/api/v2ex/node', methods: ['GET'] },
   { path: '/api/v2ex/node/topics', methods: ['GET'] },
+  { path: '/api/v2ex/nodes', methods: ['GET'] },
   { path: '/api/v2ex/recommendations', methods: ['GET'] },
   { path: '/api/v2ex/recommendations/feedback', methods: ['POST'] },
   { path: '/api/v2ex/recommendations/read', methods: ['POST'] },
   { path: '/api/v2ex/replies', methods: ['GET'] },
   { path: '/api/v2ex/session', methods: ['GET', 'POST', 'DELETE'] },
   { path: '/api/v2ex/settings', methods: ['GET', 'PUT'] },
+  { path: '/api/v2ex/tab', methods: ['GET'] },
   { path: '/api/v2ex/topic', methods: ['GET'] },
   { path: '/api/v2ex/topic/summary', methods: ['POST'] },
 ];
@@ -46,7 +48,7 @@ test('real Cordis loader exposes all seven V2EX tools and disposes without leaks
     assert.deepEqual(runtime.clientEffectLabels(), [
       'v2ex: store', 'v2ex: styles', 'v2ex: locale', 'v2ex: sidebar entry', 'v2ex: main panel',
     ]);
-    assert.deepEqual(runtime.leaks(), { domains: 1, tools: 7, routes: 14, clientSlots: 2,
+    assert.deepEqual(runtime.leaks(), { domains: 1, tools: 7, routes: 16, clientSlots: 2,
       clientEffects: 5, clientStyles: 1, clientLocales: 1, clientMounts: 2,
       hostListeners: 2, postCloseAttempts: 0, lateMutations: 0 });
     const response = await runtime.fetchRoute('/api/v2ex/session', {

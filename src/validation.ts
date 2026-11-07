@@ -1,3 +1,4 @@
+import { TOPIC_TABS, type TopicTab } from './contract.js';
 import { V2exError } from './errors.js';
 
 function positiveInteger(value: unknown, max: number): number {
@@ -24,6 +25,13 @@ export function assertNodeName(value: unknown): string {
 
 export function assertPage(value: unknown): number {
   return positiveInteger(value, 1_000);
+}
+
+export function assertTab(value: unknown): TopicTab {
+  if (typeof value !== 'string' || !(TOPIC_TABS as readonly string[]).includes(value)) {
+    throw new V2exError('invalid_request');
+  }
+  return value as TopicTab;
 }
 
 export function assertLimit(value: unknown): number {

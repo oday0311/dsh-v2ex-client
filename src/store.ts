@@ -2,7 +2,7 @@ import { defineDomain, domainTable, type Domain, type KvTable } from '@deepseek-
 import { z } from 'zod';
 import type { CacheRecord, ContentStore, InterestEditFlags, InterestProfile, PendingReminderNotice, PluginSettings, Recommendation, RecommendationBatch, RecommendationSnapshot, TopicAiSummary } from './contract.js';
 import { V2exError } from './errors.js';
-import { assertPage, assertTopicId } from './validation.js';
+import { assertPage, assertTab, assertTopicId } from './validation.js';
 import { isUnsafeReminder, validReminderField } from './reminder-safety.js';
 
 const timestamp = z.iso.datetime({ offset: true });
@@ -166,10 +166,12 @@ export const v2exDomainSpec = defineDomain({
   },
 });
 
-const cacheKeyPattern = /^(?:(?:latest|hot):[1-9]\d{0,3}|node:[A-Za-z0-9_-]{1,64}:[1-9]\d{0,3}|node-info:[A-Za-z0-9_-]{1,64}|topic:[1-9]\d*|replies:[1-9]\d*:[1-9]\d{0,3})$/;
+const cacheKeyPattern = /^(?:(?:latest|hot):[1-9]\d{0,3}|tab:[a-z0-9]{2,12}|nodes:catalog|node:[A-Za-z0-9_-]{1,64}:[1-9]\d{0,3}|node-info:[A-Za-z0-9_-]{1,64}|topic:[1-9]\d*|replies:[1-9]\d*:[1-9]\d{0,3})$/;
 export function assertCacheKey(key: string): string {
   if (!cacheKeyPattern.test(key) || key.length > 100) throw new V2exError('invalid_request');
   const [kind, id, page] = key.split(':');
+  if (kind === 'tab') { assertTab(id); return key; }
+  if (kind === 'nodes') return key;
   if (kind === 'topic' || kind === 'replies') assertTopicId(id);
   if (kind !== 'topic' && kind !== 'node-info') assertPage(Number(page ?? id));
   return key;
@@ -263,10 +265,10 @@ export class DomainContentStore implements ContentStore {
     const parsed = CacheRecordSchema.safeParse(record);
     if (!parsed.success) throw new V2exError('invalid_response');
     const table = this.domain.table('cache');
-    const isList = /^(latest|hot|node):/.test(key);
+    const isList = /^(latest|hot|node|tab):/.test(key);
     const cap = isList ? 100 : 300;
     await this.boundedPut('cache', table, key, parsed.data, cap,
-      (entryKey) => /^(latest|hot|node):/.test(entryKey) === isList,
+      (entryKey) => /^(latest|hot|node|tab):/.test(entryKey) === isList,
       (entry) => Date.parse(entry.accessedAt));
   }
 

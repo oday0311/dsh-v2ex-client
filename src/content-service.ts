@@ -1,12 +1,17 @@
-import type { Cached, CredentialVault, NodeInfo, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
+import type { Cached, CredentialVault, NodeInfo, ReplyItem, TopicListItem, TopicPage, TopicTab, TopicThread } from './contract.js';
 import { ContentCache, RequestBudget } from './cache.js';
 import { V2exError, toPublicError } from './errors.js';
-import { assertNodeName, assertPage, assertTopicId } from './validation.js';
-import type { V2exApi, V2exNode, V2exReply, V2exTopic } from './v2ex-api.js';
+import { assertNodeName, assertPage, assertTab, assertTopicId } from './validation.js';
+import { LIST_PAGE_SIZE } from './v2ex-api.js';
+import type { V2exApi, V2exNode, V2exReply, V2exTabTopic, V2exTopic } from './v2ex-api.js';
 
 const LIST_TTL = 60_000;
 const DETAIL_TTL = 10 * 60_000;
-const PAGE_SIZE = 20;
+const NODES_TTL = 6 * 60 * 60_000;
+const NODE_CATALOG_LIMIT = 240;
+const PAGE_SIZE = LIST_PAGE_SIZE;
+/** `xna` has no upstream tab page; its tab mirrors the VXNA node discussion. */
+const XNA_NODE = 'vxna';
 
 function item(topic: V2exTopic): TopicListItem {
   return {
@@ -22,6 +27,24 @@ function item(topic: V2exTopic): TopicListItem {
 function reply(value: V2exReply): ReplyItem {
   return { id: value.id, author: { username: value.member.username },
     content: (value.content ?? '').slice(0, 100_000), createdAt: new Date(value.created * 1000).toISOString() };
+}
+
+/** Tab rows only expose the last activity, so both timestamps share that value. */
+function tabItem(value: V2exTabTopic): TopicListItem {
+  return {
+    id: value.id, title: value.title.slice(0, 500),
+    node: { name: value.node.name, title: value.node.title.slice(0, 200) },
+    author: { username: value.author }, replyCount: value.replyCount,
+    createdAt: value.activityAt, lastReplyAt: value.replyCount > 0 ? value.activityAt : null,
+    url: `https://www.v2ex.com/t/${value.id}`,
+  };
+}
+
+function nodeInfo(value: V2exNode): NodeInfo | null {
+  if (!/^[a-zA-Z0-9_-]{1,64}$/.test(value.name)) return null;
+  const title = value.title.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80);
+  return { name: value.name, title: title || value.name, topicCount: value.topics ?? null,
+    url: `https://www.v2ex.com/go/${value.name}` };
 }
 
 interface Flight { key: string; promise: Promise<Cached<unknown>>; controller: AbortController; waiters: number }
@@ -146,6 +169,34 @@ export class ContentService {
   hot(signal?: AbortSignal): Promise<Cached<TopicListItem[]>> {
     return this.load('hot:1', LIST_TTL, async (token, requestSignal) =>
       (await this.api.hot(token, requestSignal)).map(item), signal);
+  }
+
+  tab(input: { tab: TopicTab }, signal?: AbortSignal, kind: 'interactive' | 'background' = 'interactive'): Promise<Cached<TopicPage>> {
+    const tab = assertTab(input.tab);
+    return this.load(`tab:${tab}`, LIST_TTL, async (token, requestSignal) => {
+      if (tab === 'xna') {
+        const topics = await this.api.nodeTopics(XNA_NODE, 1, token, requestSignal);
+        return { items: topics.map(item), page: 1, hasMore: false, stale: false };
+      }
+      const topics = await this.api.tabTopics(tab, token, requestSignal);
+      return { items: topics.map(tabItem), page: 1, hasMore: false, stale: false };
+    }, signal, kind).then((result) => ({ ...result, value: { ...result.value, stale: result.stale } }));
+  }
+
+  /** Read the public node catalog once and keep the most active nodes. */
+  nodes(signal?: AbortSignal): Promise<Cached<NodeInfo[]>> {
+    return this.load('nodes:catalog', NODES_TTL, async (token, requestSignal) => {
+      const seen = new Set<string>();
+      const values: NodeInfo[] = [];
+      for (const raw of await this.api.allNodes(token, requestSignal)) {
+        const value = nodeInfo(raw);
+        if (!value || seen.has(value.name)) continue;
+        seen.add(value.name);
+        values.push(value);
+      }
+      values.sort((left, right) => (right.topicCount ?? 0) - (left.topicCount ?? 0) || left.name.localeCompare(right.name));
+      return values.slice(0, NODE_CATALOG_LIMIT);
+    }, signal);
   }
 
   node(input: { node: string }, signal?: AbortSignal): Promise<Cached<NodeInfo>> {

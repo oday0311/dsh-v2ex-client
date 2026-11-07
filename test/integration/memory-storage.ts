@@ -87,7 +87,7 @@ export function createMemoryDomain(): MemoryDomain {
 }
 
 const tokenResult = { success: true, message: '', result: {
-  scope: 'read', expiration: 1_900_000_000, created: 1_700_000_000,
+  scope: 'read', expiration: 2_592_000, good_for_days: 30, created: 1_794_000_000,
 } };
 const memberResult = { success: true, message: '', result: {
   id: 42, username: 'fixture-reader', url: 'https://www.v2ex.com/member/fixture-reader', created: 1_700_000_000,

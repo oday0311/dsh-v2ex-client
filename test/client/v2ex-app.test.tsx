@@ -21,7 +21,10 @@ const cached = <T,>(value: T): Cached<T> => ({ value, fetchedAt: '2026-11-06T00:
 function remote(authenticated: boolean): V2exClientRemote {
   return { session: async () => account(authenticated), login: async () => account(true), logout: async () => account(false),
     latest: async () => cached<TopicPage>({ items: [item], page: 1, hasMore: false, stale: false }),
-    hot: async () => cached([item]), node: async () => cached({ name: 'dev', title: '开发', topicCount: 1, url: 'https://www.v2ex.com/go/dev' }),
+    hot: async () => cached([item]),
+    tab: async () => cached<TopicPage>({ items: [{ ...item, id: 8, title: 'Tab topic' }], page: 1, hasMore: false, stale: false }),
+    nodes: async () => cached([{ name: 'dev', title: '开发', topicCount: 1, url: 'https://www.v2ex.com/go/dev' }]),
+    node: async () => cached({ name: 'dev', title: '开发', topicCount: 1, url: 'https://www.v2ex.com/go/dev' }),
     nodeTopics: async () => cached<TopicPage>({ items: [item], page: 1, hasMore: false, stale: false }),
     topic: async () => cached<TopicThread>({ topic: item, content: '正文', replies: [], replyPage: 0, hasMoreReplies: true, stale: false }),
     replies: async () => cached([{ id: 1, author: { username: 'bob' }, content: '第 1 页回复', createdAt: '2026-11-06T00:00:00.000Z' }]),
@@ -187,5 +190,61 @@ test('DSH locale changes update the mounted UI without resetting browsing state'
   await act(async () => { snapshot = { active: 'en' }; notify(); });
   assert.ok(screen.getByRole('tab', { name: 'Latest' }));
   assert.ok(screen.getByRole('button', { name: /TypeScript/ }));
+  store.dispose();
+});
+
+test('topic tabs load the selected V2EX section and link into its nodes', async () => {
+  const store = new V2exClientStore(remote(true));
+  await store.loadSession();
+  render(<V2exApp store={store} />);
+  assert.ok(screen.getByRole('tab', { name: '技术' }));
+  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: '酷工作' })); });
+  assert.ok(await screen.findByRole('button', { name: /Tab topic/ }));
+  assert.equal(screen.getByRole('tab', { name: '酷工作' }).getAttribute('aria-selected'), 'true');
+  assert.equal(store.getSnapshot().tab, 'jobs');
+  const chip = await screen.findByRole('button', { name: '开发' });
+  await act(async () => { fireEvent.click(chip); });
+  assert.ok(await screen.findByText('开发', { selector: 'h2' }));
+  assert.equal(store.getSnapshot().view, 'node');
+  store.dispose();
+});
+
+test('node view lists the common node catalog and opens a node', async () => {
+  const store = new V2exClientStore(remote(true));
+  await store.loadSession();
+  render(<V2exApp store={store} />);
+  await act(async () => { fireEvent.click(screen.getByRole('tab', { name: '节点' })); });
+  assert.ok(await screen.findByText('节点目录'));
+  const catalog = await screen.findByRole('button', { name: /开发/ });
+  await act(async () => { fireEvent.click(catalog); });
+  assert.ok(await screen.findByText('开发', { selector: 'h2' }));
+  fireEvent.change(screen.getByLabelText('搜索节点'), { target: { value: 'python' } });
+  assert.ok(screen.getByText('没有匹配的节点'));
+  store.dispose();
+});
+
+test('English copy includes the V2EX topic tabs', async () => {
+  const store = new V2exClientStore(remote(true));
+  await store.loadSession();
+  const snapshot = { active: 'en' };
+  const locale = { getSnapshot: () => snapshot, subscribe: () => () => {} };
+  render(<V2exApp store={store} locale={locale} />);
+  assert.ok(screen.getByRole('tab', { name: 'Tech' }));
+  assert.ok(screen.getByRole('tab', { name: 'Jobs' }));
+  assert.ok(screen.getByRole('tab', { name: 'Sections' }));
+  store.dispose();
+});
+
+test('topic tabs support arrow-key navigation', async () => {
+  const store = new V2exClientStore(remote(true));
+  await store.loadSession();
+  render(<V2exApp store={store} />);
+  const tech = screen.getByRole('tab', { name: '技术' });
+  assert.equal(tech.getAttribute('tabindex'), '0');
+  await act(async () => { fireEvent.keyDown(tech, { key: 'ArrowRight' }); });
+  assert.equal(store.getSnapshot().view, 'tabs');
+  assert.equal(store.getSnapshot().tab, 'creative');
+  await act(async () => { fireEvent.keyDown(screen.getByRole('tab', { name: '创意' }), { key: 'ArrowLeft' }); });
+  assert.equal(store.getSnapshot().tab, 'tech');
   store.dispose();
 });

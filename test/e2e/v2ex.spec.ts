@@ -82,6 +82,8 @@ async function api(route: Route, state: ApiState): Promise<void> {
     ok(cached({ items: [{ ...topic(), title: 'bad\u0000title' }], page: 1, hasMore: false, stale: false })) :
     ok(cached({ items: [topic(), topic(62, 'Rust 异步运行时对比')], page: 1, hasMore: false, stale: false }));
   else if (path === '/hot') result = ok(cached([topic(63, '本周热门开发讨论')]));
+  else if (path === '/tab') result = ok(cached({ items: [topic(64, '分类主题：TypeScript 6'), topic(65, '另一个分类主题')], page: 1, hasMore: false, stale: false }));
+  else if (path === '/nodes') result = ok(cached([{ name: 'typescript', title: 'TypeScript', topicCount: 2, url: 'https://www.v2ex.com/go/typescript' }]));
   else if (path === '/node') result = ok(cached({ name: 'typescript', title: 'TypeScript', topicCount: 2, url: 'https://www.v2ex.com/go/typescript' }));
   else if (path === '/node/topics') result = ok(cached({ items: [topic()], page: 1, hasMore: false, stale: false }));
   else if (path === '/topic') {
@@ -236,6 +238,23 @@ test('login to recommendation to summary workflow', async ({ page }, testInfo) =
   });
   if (testInfo.project.name === 'mobile-390') expect(captures).toEqual(['workflow-top', 'workflow-mid', 'workflow-bottom']);
   assertNoEscapes(state);
+});
+
+test('V2EX section tabs and the node catalog browse without layout escapes', async ({ page }, testInfo) => {
+  const state = await setup(page); await page.goto('/'); await login(page);
+  await page.getByRole('tab', { name: '技术' }).click();
+  await expect(page.getByRole('button', { name: /分类主题：TypeScript 6/ })).toBeVisible();
+  await expect(page.locator('.v2ex-node-chips')).toBeVisible();
+  await assertLayout(page);
+  const tabShot = await page.locator('.v2ex-app').screenshot({ path: testInfo.outputPath('sections-tab.png'), animations: 'disabled' });
+  expect(informativeImageFailures(analyzePng(tabShot))).toEqual([]);
+  await page.getByRole('button', { name: 'TypeScript', exact: true }).click();
+  await expect(page.locator('.v2ex-node-catalog h2')).toBeVisible();
+  await expect(page.getByRole('button', { name: /TypeScript 6 严格模式实践/ })).toBeVisible();
+  await page.getByLabel('搜索节点').fill('rust');
+  await expect(page.getByText('没有匹配的节点')).toBeVisible();
+  await page.getByLabel('搜索节点').fill('');
+  await traverseScrollSlices(page, testInfo, 'sections'); assertNoEscapes(state);
 });
 
 test('interest consent, editing, settings, account switch, and clear logout', async ({ page }, testInfo) => {

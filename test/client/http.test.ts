@@ -38,9 +38,9 @@ test('abort during response decoding remains a cancellation', async () => {
   await assert.rejects(client.hot(controller.signal), (error: unknown) => error instanceof V2exClientError && error.code === 'cancelled');
 });
 
-test('transport rejects JSON behind an HTML content type', async () => {
+test('an HTML response means the Host route is unavailable, not a malformed account', async () => {
   const client = createV2exHttpClient(async () => new Response(JSON.stringify({ ok: true, data: { authenticated: false, writable: false, username: null, tokenScope: null, expiresAt: null } }), { headers: { 'content-type': 'text/html' } }));
-  await assert.rejects(client.session(), (error: unknown) => error instanceof V2exClientError && error.code === 'invalid_response');
+  await assert.rejects(client.session(), (error: unknown) => error instanceof V2exClientError && error.code === 'plugin_unavailable');
 });
 
 test('transport rejects an oversized streamed envelope before exposing data', async () => {
@@ -123,4 +123,43 @@ test('summary transport rejects internal routing and cache identity fields', asy
     coveredReplyPages: [1], completeDiscussion: true, mode: 'quick', modelRoute: 'private/model', topicUpdatedAt: '2026-11-06T00:00:00.000Z',
   } }), { headers: { 'content-type': 'application/json' } }));
   await assert.rejects(client.summary!('7', 'quick', 1), { code: 'invalid_response' });
+});
+
+test('tab and node catalog transport target same-origin read routes', async () => {
+  const calls: string[] = [];
+  const freshness = { fetchedAt: '2026-11-06T00:00:00.000Z', stale: false, source: 'network' };
+  const client = createV2exHttpClient(async (input) => {
+    const path = String(input); calls.push(path);
+    const data = path.startsWith('/api/v2ex/tab')
+      ? { ...freshness, value: { items: [], page: 1, hasMore: false, stale: false } }
+      : { ...freshness, value: [{ name: 'python', title: 'Python', topicCount: 1, url: 'https://www.v2ex.com/go/python' }] };
+    return new Response(JSON.stringify({ ok: true, data }), { headers: { 'content-type': 'application/json' } });
+  });
+  assert.deepEqual((await client.tab!('tech')).value.items, []);
+  assert.deepEqual((await client.nodes!()).value.map(node => node.name), ['python']);
+  assert.deepEqual(calls, ['/api/v2ex/tab?tab=tech', '/api/v2ex/nodes']);
+});
+
+test('node catalog transport rejects malformed catalog entries', async () => {
+  const client = createV2exHttpClient(async () => new Response(JSON.stringify({ ok: true, data: {
+    fetchedAt: '2026-11-06T00:00:00.000Z', stale: false, source: 'network',
+    value: [{ name: 'python', title: 'Python', topicCount: -1, url: 'https://www.v2ex.com/go/python' }],
+  } }), { headers: { 'content-type': 'application/json' } }));
+  await assert.rejects(client.nodes!(), (error: unknown) => error instanceof V2exClientError && error.code === 'invalid_response');
+});
+
+test('missing Host routes are reported as plugin unavailable instead of malformed data', async () => {
+  const missing = createV2exHttpClient(async () => new Response('not found', { status: 404, headers: { 'content-type': 'text/plain' } }));
+  await assert.rejects(missing.latest(1), (error: unknown) =>
+    error instanceof V2exClientError && error.code === 'plugin_unavailable');
+  const html = createV2exHttpClient(async () => new Response('<!doctype html><title>V2EX</title>', { headers: { 'content-type': 'text/html' } }));
+  await assert.rejects(html.session(), (error: unknown) =>
+    error instanceof V2exClientError && error.code === 'plugin_unavailable');
+});
+
+test('host error envelopes keep the invalid_response code', async () => {
+  const client = createV2exHttpClient(async () => new Response(JSON.stringify({ ok: false,
+    error: { code: 'invalid_response', message: 'upstream', retryable: true } }), { status: 502, headers: { 'content-type': 'application/json' } }));
+  await assert.rejects(client.latest(1), (error: unknown) =>
+    error instanceof V2exClientError && error.code === 'invalid_response');
 });

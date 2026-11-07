@@ -5,7 +5,7 @@
   "description": "Read-only V2EX browsing and discovery for DeepSeek Harness",
   "entry": {
     "name": "v2ex-dsh-client",
-    "inject": ["credentials", "storageDomain", "tools"]
+    "inject": ["credentials", "storageDomain", "tools", "connection"]
   },
   "client": { "platform": "web" },
   "bundle": { "patch": "./cordis.patch.yml" }

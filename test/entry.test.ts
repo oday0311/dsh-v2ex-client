@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import test from 'node:test';
-import { apply, Config } from '../src/index.js';
+import { apply, Config, inject } from '../src/index.js';
 
 test('guarded entry contains incompatible runtime failure and exposes an idempotent disposer', async () => {
   const warnings: string[] = [];
@@ -74,4 +74,20 @@ test('guarded entry contains a real dynamic import failure without exposing its 
   assert.deepEqual(JSON.parse(output), {
     importBlocked: true, warnings: ['incompatible_runtime'], disposerType: 'function',
   });
+});
+
+test('config export defaults values and satisfies the Cordis Standard Schema contract', () => {
+  assert.deepEqual(Config({}), { requestTimeoutMs: 15_000, responseLimitBytes: 2_000_000 });
+  assert.deepEqual(Config({ requestTimeoutMs: 1_000 }), { requestTimeoutMs: 1_000, responseLimitBytes: 2_000_000 });
+  const schema = Config['~standard'];
+  assert.equal(schema.version, 1);
+  assert.equal(typeof schema.validate, 'function');
+  assert.deepEqual(schema.validate(undefined), { value: { requestTimeoutMs: 15_000, responseLimitBytes: 2_000_000 } });
+  assert.deepEqual(schema.validate({ requestTimeoutMs: 1_000 }), { value: { requestTimeoutMs: 1_000, responseLimitBytes: 2_000_000 } });
+  assert.equal(schema.validate({ requestTimeoutMs: 0 }).issues?.length, 1);
+  assert.equal(schema.validate('not-an-object').issues?.length, 1);
+});
+
+test('the Host entry waits for every service it reads, including connection', () => {
+  assert.deepEqual(inject, ['credentials', 'storageDomain', 'tools', 'connection']);
 });

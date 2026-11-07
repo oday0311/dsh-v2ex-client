@@ -22,9 +22,10 @@ export const account = z.object({ authenticated: z.boolean(), writable: z.boolea
 export const topicItem = z.object({ id, title: label(10_000), node: z.object({ name: nodeName, title: label(500) }),
   author: z.object({ username: label(100) }), replyCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   createdAt: date, lastReplyAt: date.nullable(), url: officialUrl });
-export const topicPage = z.object({ items: z.array(topicItem).max(20), page: z.number().int().min(1).max(1_000),
+export const topicPage = z.object({ items: z.array(topicItem).max(50), page: z.number().int().min(1).max(1_000),
   hasMore: z.boolean(), stale: z.boolean() });
 export const node = z.object({ name: nodeName, title: label(500), topicCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(), url: officialUrl });
+export const nodeCatalog = z.array(node).max(240);
 export const reply = z.object({ id, author: z.object({ username: label(100) }), content: z.string().max(256), createdAt: date });
 export const thread = z.object({ topic: topicItem, content: z.string().max(4_000), replies: z.array(reply).max(60),
   replyPage: z.number().int().min(0).max(3), hasMoreReplies: z.boolean(), stale: z.boolean() });

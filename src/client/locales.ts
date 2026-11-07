@@ -1,8 +1,11 @@
+import type { TopicTab } from '../contract.js';
 import type { ClientErrorCode } from './http.js';
 
 export interface Copy {
   title: string; loginLabel: string; login: string; loginHelp: string;
   latest: string; hot: string; nodes: string; nodeLabel: string; nodePlaceholder: string; browse: string;
+  tabBrowse: string; topicTabs: string; tabLabels: Record<TopicTab, string>; tabNodes: string;
+  nodeCatalog: string; nodeSearch: string; nodesEmpty: string; topicCountTemplate: string;
   logout: string; clearPersonalData: string; reload: string; retry: string; back: string;
   loading: string; empty: string; noMatches: string; repliesEmpty: string; loadMore: string; moreReplies: string;
   stale: string; page: string; replies: string; topicList: string; topicDetail: string; viewTabs: string;
@@ -25,6 +28,9 @@ export interface Copy {
 export const zh: Copy = {
   title: 'V2EX', loginLabel: 'V2EX Personal Access Token', login: '登录', loginHelp: '令牌仅用于本次登录，由 DSH 凭据服务保存。',
   latest: '最新', hot: '热门', nodes: '节点', nodeLabel: '节点名称', nodePlaceholder: '输入节点名称', browse: '浏览',
+  tabBrowse: '分类', topicTabs: '帖子分类',
+  tabLabels: { tech: '技术', creative: '创意', play: '好玩', apple: 'Apple', jobs: '酷工作', deals: '交易', city: '城市', qna: '问与答', hot: '最热', all: '全部', r2: 'R2', xna: 'VXNA' },
+  tabNodes: '相关节点', nodeCatalog: '节点目录', nodeSearch: '搜索节点', nodesEmpty: '没有匹配的节点', topicCountTemplate: '{count} 个主题',
   logout: '退出登录', clearPersonalData: '同时清除个人数据', reload: '刷新', retry: '重试', back: '返回列表',
   loading: '加载中…', empty: '暂无主题', noMatches: '没有匹配的主题', repliesEmpty: '暂无回复', loadMore: '加载更多', moreReplies: '加载更多回复',
   stale: '显示缓存内容，数据可能已过期', page: '第', replies: '页回复',
@@ -43,7 +49,7 @@ export const zh: Copy = {
   smartRecommendations: '智能推荐', smartUnreadTemplate: '智能推荐，{count} 条未读', recommendationSource: '来源：', sourceStored: '已保存', sourceGenerated: '刚刚生成',
   noRecommendations: '暂无智能推荐', unread: '未读', interested: '感兴趣', notInterested: '不感兴趣',
   errors: {
-    not_authenticated: '请先登录 V2EX。', token_invalid: '令牌无效，请更换后重试。', token_expired: '令牌已过期，请重新登录。',
+    not_authenticated: '请先登录 V2EX。', token_invalid: '令牌无效，请更换后重试。', token_expired: '令牌已过期，请重新登录。', plugin_unavailable: 'V2EX 插件尚未就绪，请完全退出 DSH 后重新打开，再试一次。',
     rate_limited: '请求过于频繁，请稍后重试。', offline: '网络不可用，请检查连接。', timeout: '请求超时，请重试。',
     not_found: '内容不存在或已删除。', invalid_request: '输入有误，请检查后重试。', invalid_response: '返回内容异常，请稍后重试。',
     upstream: 'V2EX 暂时无法完成请求。', ai_unavailable: '智能功能暂不可用。', history_access_denied: '未授权读取历史记录。',
@@ -54,6 +60,9 @@ export const zh: Copy = {
 export const en: Copy = {
   title: 'V2EX', loginLabel: 'V2EX Personal Access Token', login: 'Log in', loginHelp: 'The token is used for this sign-in and saved by DSH Credentials.',
   latest: 'Latest', hot: 'Hot', nodes: 'Nodes', nodeLabel: 'Node name', nodePlaceholder: 'Enter a node', browse: 'Browse',
+  tabBrowse: 'Sections', topicTabs: 'Topic sections',
+  tabLabels: { tech: 'Tech', creative: 'Creative', play: 'Play', apple: 'Apple', jobs: 'Jobs', deals: 'Deals', city: 'City', qna: 'Q&A', hot: 'Hot', all: 'All', r2: 'R2', xna: 'VXNA' },
+  tabNodes: 'Nodes here', nodeCatalog: 'Node directory', nodeSearch: 'Filter nodes', nodesEmpty: 'No matching nodes', topicCountTemplate: '{count} topics',
   logout: 'Log out', clearPersonalData: 'Also clear personal data', reload: 'Refresh', retry: 'Retry', back: 'Back to topics',
   loading: 'Loading…', empty: 'No topics', noMatches: 'No matching topics', repliesEmpty: 'No replies', loadMore: 'Load more', moreReplies: 'Load more replies',
   stale: 'Showing cached content that may be outdated', page: 'Page', replies: 'replies',
@@ -72,7 +81,7 @@ export const en: Copy = {
   smartRecommendations: 'Smart recommendations', smartUnreadTemplate: 'Smart recommendations, {count} unread', recommendationSource: 'Source: ', sourceStored: 'Stored', sourceGenerated: 'Just generated',
   noRecommendations: 'No smart recommendations yet', unread: 'Unread', interested: 'Interested', notInterested: 'Not interested',
   errors: {
-    not_authenticated: 'Log in to V2EX first.', token_invalid: 'The token is invalid. Replace it and retry.', token_expired: 'The token expired. Log in again.',
+    not_authenticated: 'Log in to V2EX first.', token_invalid: 'The token is invalid. Replace it and retry.', token_expired: 'The token expired. Log in again.', plugin_unavailable: 'The V2EX plugin is not ready yet. Quit DSH completely, reopen it, and try again.',
     rate_limited: 'Too many requests. Try again later.', offline: 'Network unavailable. Check your connection.', timeout: 'The request timed out. Retry.',
     not_found: 'Content was not found.', invalid_request: 'Check your input and retry.', invalid_response: 'Unexpected response. Try again later.',
     upstream: 'V2EX could not complete the request.', ai_unavailable: 'AI features are unavailable.', history_access_denied: 'History access is not authorized.',
@@ -80,12 +89,14 @@ export const en: Copy = {
   },
 };
 
-export type LocaleKey = Exclude<keyof Copy, 'errors' | 'summaryModes'> | `summaryModes.${keyof Copy['summaryModes']}` | `errors.${ClientErrorCode}`;
+export type LocaleKey = Exclude<keyof Copy, 'errors' | 'summaryModes' | 'tabLabels'> |
+  `summaryModes.${keyof Copy['summaryModes']}` | `tabLabels.${TopicTab}` | `errors.${ClientErrorCode}`;
 export const LOCALE_NS = 'v2ex';
 export function dictionary(copy: Copy): Record<LocaleKey, string> {
   return Object.fromEntries([
-    ...Object.entries(copy).filter(([key]) => key !== 'errors' && key !== 'summaryModes'),
+    ...Object.entries(copy).filter(([key]) => key !== 'errors' && key !== 'summaryModes' && key !== 'tabLabels'),
     ...Object.entries(copy.summaryModes).map(([key, value]) => [`summaryModes.${key}`, value]),
+    ...Object.entries(copy.tabLabels).map(([key, value]) => [`tabLabels.${key}`, value]),
     ...Object.entries(copy.errors).map(([key, value]) => [`errors.${key}`, value]),
   ]) as Record<LocaleKey, string>;
 }

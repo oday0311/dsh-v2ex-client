@@ -2,6 +2,13 @@ export type { PublicError, V2exErrorCode } from './errors.js';
 
 export type ApiResult<T> = { ok: true; data: T } | { ok: false; error: import('./errors.js').PublicError };
 
+/**
+ * The topic tabs V2EX exposes on its home page (`/?tab=...`). `xna` has no
+ * topic page of its own upstream, so the Host maps it to the VXNA node feed.
+ */
+export const TOPIC_TABS = ['tech', 'creative', 'play', 'apple', 'jobs', 'deals', 'city', 'qna', 'hot', 'all', 'r2', 'xna'] as const;
+export type TopicTab = (typeof TOPIC_TABS)[number];
+
 export interface AccountStatus {
   authenticated: boolean;
   writable: boolean;
