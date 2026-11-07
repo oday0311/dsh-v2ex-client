@@ -2,21 +2,39 @@
 
 这是一个面向 DeepSeek Harness（DSH）的只读 V2EX 插件，提供登录后的主题浏览、AI 摘要、兴趣推荐，以及能力一致且有边界的 Agent Tools。
 
-## 环境与安装
+## 环境要求
 
 - Node.js 22 或更高版本
 - DSH `>=0.2.1-rc.5 <0.3.0`
 - V2EX Personal Access Token（PAT）
 
-把本包安装到 DSH 工作区，并在插件 bundle 中启用 `v2ex-dsh-client`。本地源码可执行：
+## 从 npm 安装
+
+把已发布的插件安装到你使用的 DSH profile；出现提示时重启 DSH：
+
+```bash
+dsh plugin --profile <name> add v2ex-dsh-client
+```
+
+将 `<name>` 替换为你的 DSH profile 名称。安装后可执行以下命令确认：
+
+```bash
+dsh plugin --profile <name> list v2ex-dsh-client --depth 0
+```
+
+DSH 重启后，在侧边栏打开 V2EX，使用 V2EX Personal Access Token 登录。也可以在 [npm](https://www.npmjs.com/package/v2ex-dsh-client) 查看已发布版本。
+
+## 从本地源码安装
+
+用于开发时，先安装依赖并构建：
 
 ```bash
 pnpm install
 pnpm build
-pnpm pack
+dsh plugin --profile <name> add /absolute/path/to/dsh-v2ex-client
 ```
 
-通过当前 DSH 使用的包管理流程安装生成的包。Host 入口为 `v2ex-dsh-client`，浏览器入口为 `v2ex-dsh-client/client`；包内的 `dsh.plugin.json` 与 `cordis.patch.yml` 提供 bundle 元数据。
+请使用源码目录的绝对路径。Host 入口为 `v2ex-dsh-client`，浏览器入口为 `v2ex-dsh-client/client`；包内的 `dsh.plugin.json` 与 `cordis.patch.yml` 提供 bundle 元数据。
 
 ## 登录
 

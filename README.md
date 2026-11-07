@@ -2,21 +2,39 @@
 
 Read-only V2EX browsing and intelligent discovery for DeepSeek Harness (DSH). The plugin offers an authenticated sidebar and the same bounded capabilities through Agent Tools. [中文说明](./README_ZH.md)
 
-## Requirements and installation
+## Requirements
 
 - Node.js 22 or newer
 - DSH `>=0.2.1-rc.5 <0.3.0`
 - A V2EX Personal Access Token (PAT)
 
-Install the package in the DSH workspace and enable `v2ex-dsh-client` in the plugin bundle. For a local checkout:
+## Install from npm
+
+Install the published package into the DSH profile you use, then restart DSH when prompted:
+
+```bash
+dsh plugin --profile <name> add v2ex-dsh-client
+```
+
+Replace `<name>` with your DSH profile name. Verify that the package is installed:
+
+```bash
+dsh plugin --profile <name> list v2ex-dsh-client --depth 0
+```
+
+After DSH restarts, open the V2EX item in the sidebar and sign in with a V2EX Personal Access Token. The package is also available on [npm](https://www.npmjs.com/package/v2ex-dsh-client).
+
+## Install from a local checkout
+
+For development, install dependencies and build the package first:
 
 ```bash
 pnpm install
 pnpm build
-pnpm pack
+dsh plugin --profile <name> add /absolute/path/to/dsh-v2ex-client
 ```
 
-Install the resulting package through the package workflow used by your DSH installation. The Host entry is `v2ex-dsh-client`, the browser entry is `v2ex-dsh-client/client`, and the included `dsh.plugin.json` and `cordis.patch.yml` contain bundle metadata.
+Use an absolute path to the checkout. The Host entry is `v2ex-dsh-client`, the browser entry is `v2ex-dsh-client/client`, and the included `dsh.plugin.json` and `cordis.patch.yml` contain bundle metadata.
 
 ## Sign in
 
