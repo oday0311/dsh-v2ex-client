@@ -80,3 +80,39 @@ test('login rejects an unauthenticated account inside a successful envelope', as
   await assert.rejects(client.login('test-secret'), (error: unknown) =>
     error instanceof V2exClientError && error.code === 'invalid_response');
 });
+
+test('intelligent transport sends same-origin JSON mutations and validates settings DTOs', async () => {
+  const calls: Array<{ path: string; method: string; body: unknown }> = [];
+  const profile = { authorized: false, learningPaused: false, labels: [], preferredNodes: [], exclusions: [], feedback: [],
+    updatedAt: '2026-11-06T00:00:00.000Z', source: 'manual' };
+  const settings = { refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2, aiCandidateBudget: 10,
+    maxModelCallsPerRefresh: 1, notificationThreshold: 0.7, quietHours: null };
+  const client = createV2exHttpClient(async (input, init) => {
+    const path = String(input); const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    calls.push({ path, method: init?.method ?? 'GET', body });
+    const data = path.endsWith('/topic/summary') ? { topicId: 7, summary: 'Summary', viewpoints: [], notableReplies: [],
+      generatedAt: '2026-11-06T00:00:00.000Z', coveredReplyPages: [1], completeDiscussion: true } :
+      path.endsWith('/interests') ? profile : path.endsWith('/settings') ? settings : { updated: true };
+    return new Response(JSON.stringify({ ok: true, data }), { headers: { 'content-type': 'application/json' } });
+  });
+  assert.equal((await client.summary!('7', 'quick', 1)).topicId, 7);
+  await client.interests!('update', { labels: [] });
+  await client.recommendationFeedback!(7, 'interested');
+  await client.recommendationRead!(7);
+  assert.equal((await client.updateSettings!({ ...settings, refreshIntervalMinutes: 60 })).refreshIntervalMinutes, 30);
+  assert.deepEqual(calls.map(value => [value.path, value.method]), [
+    ['/api/v2ex/topic/summary', 'POST'], ['/api/v2ex/interests', 'PUT'], ['/api/v2ex/recommendations/feedback', 'POST'],
+    ['/api/v2ex/recommendations/read', 'POST'], ['/api/v2ex/settings', 'PUT'],
+  ]);
+  assert.deepEqual(calls[0]?.body, { topic: '7', mode: 'quick', replyPages: 1 });
+  assert.deepEqual(calls[2]?.body, { topicId: 7, value: 'interested' });
+});
+
+test('intelligent transport rejects malformed profile and settings responses', async () => {
+  const fake = (data: unknown) => createV2exHttpClient(async () => new Response(JSON.stringify({ ok: true, data }),
+    { headers: { 'content-type': 'application/json' } }));
+  await assert.rejects(fake({ authorized: true, rawHistory: 'must not render' }).interests!(),
+    (error: unknown) => error instanceof V2exClientError && error.code === 'invalid_response');
+  await assert.rejects(fake({ refreshIntervalMinutes: 0 }).settings!(),
+    (error: unknown) => error instanceof V2exClientError && error.code === 'invalid_response');
+});

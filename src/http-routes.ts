@@ -1,11 +1,12 @@
 import type { AuthService } from './credentials.js';
 import type { ContentService } from './content-service.js';
-import type { AccountStatus, ApiResult, Cached, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
+import type { AccountStatus, ApiResult, Cached, PluginSettings, ReplyItem, TopicListItem, TopicPage, TopicThread } from './contract.js';
 import { V2exError, toPublicError } from './errors.js';
 import { assertNodeName, assertPage, assertTopicId } from './validation.js';
 import type { IntelligenceService, SummaryMode } from './intelligence.js';
 import type { InterestService } from './interests.js';
 import type { RecommendationService } from './recommendations.js';
+import { PluginSettingsSchema } from './store.js';
 
 const PREFIX = '/api/v2ex';
 const MAX_LOGIN_BYTES = 4 * 1024;
@@ -15,7 +16,7 @@ const MAX_EMBEDDED_REPLY_PAGES = 3;
 const ROUTED_METHODS = ['GET', 'POST', 'DELETE', 'PUT', 'PATCH', 'HEAD', 'OPTIONS'];
 const JSON_HEADERS = { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' };
 
-export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'>; interests?: Pick<InterestService, 'perform'>; recommendations?: Pick<RecommendationService, 'list' | 'feedback' | 'markRead'> }
+export interface V2exRouteServices { auth: Pick<AuthService, 'status' | 'login' | 'logout'>; credential: { resolve(): Promise<string | undefined> }; content: Pick<ContentService, 'latest' | 'hot' | 'node' | 'nodeTopics' | 'topic' | 'replies'>; intelligence?: Pick<IntelligenceService, 'summarizeTopic'>; interests?: Pick<InterestService, 'perform'>; recommendations?: Pick<RecommendationService, 'list' | 'feedback' | 'markRead' | 'clear'>; settings?: { get(): Promise<PluginSettings>; update(settings: PluginSettings): Promise<PluginSettings> } }
 export interface V2exFetchRoute { path: string; methods: string[]; requestBody: 'buffered'; fetch(request: Request): Promise<Response> }
 export interface FetchConnection { fetch?: { register(route: V2exFetchRoute): unknown } }
 
@@ -202,6 +203,12 @@ async function recommendationMutation(request: Request, feedback: boolean): Prom
   return { topicId, value };
 }
 
+async function settingsBody(request: Request): Promise<PluginSettings> {
+  const parsed = PluginSettingsSchema.safeParse(await readBody(request));
+  if (!parsed.success || parsed.data.pagesPerNode > 2) throw new V2exError('invalid_request');
+  return parsed.data;
+}
+
 class BodyTooLarge extends Error {}
 
 function route(path: string, methods: string[], services: V2exRouteServices): V2exFetchRoute {
@@ -264,7 +271,9 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
             payload = { topicId: Reflect.get(body, 'topicId'), interested: Reflect.get(body, 'interested') };
           } else if (keys.length !== 1 || !['authorize', 'revoke', 'relearn'].includes(action)) throw new V2exError('invalid_request');
         }
-        return json({ ok: true, data: await services.interests.perform(action, payload, request.signal) });
+        const result = await services.interests.perform(action, payload, request.signal);
+        if (action === 'clear') await services.recommendations?.clear();
+        return json({ ok: true, data: result });
       }
       if (path === '/recommendations') {
         params(query, []);
@@ -284,6 +293,14 @@ function route(path: string, methods: string[], services: V2exRouteServices): V2
         const input = await recommendationMutation(request, false);
         await services.recommendations.markRead(input.topicId);
         return json({ ok: true, data: { updated: true } });
+      }
+      if (path === '/settings') {
+        params(query, []);
+        if (!services.settings) throw new V2exError('incompatible_runtime');
+        const value = request.method === 'GET' ? await services.settings.get() : await services.settings.update(await settingsBody(request));
+        const parsed = PluginSettingsSchema.safeParse(value);
+        if (!parsed.success) throw new V2exError('invalid_response');
+        return json({ ok: true, data: parsed.data });
       }
       if (path === '/latest') {
         const input = params(query, ['page']);
@@ -341,6 +358,7 @@ export async function registerV2exHttpRoutes(connection: FetchConnection, servic
       ['/recommendations', ['GET']],
       ['/recommendations/feedback', ['POST']],
       ['/recommendations/read', ['POST']],
+      ['/settings', ['GET', 'PUT']],
       ['/replies', ['GET']], ['/health', ['GET']],
     ] as const) {
       const release = connection.fetch.register(route(path, [...methods], services));

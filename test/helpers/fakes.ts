@@ -54,7 +54,7 @@ export class FakeContentStore implements ContentStore {
   private recommendationOperation: Promise<void> = Promise.resolve();
   settings: PluginSettings = {
     refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
-    aiCandidateBudget: 10, notificationThreshold: 0.7, quietHours: null,
+    aiCandidateBudget: 10, maxModelCallsPerRefresh: 1, notificationThreshold: 0.7, quietHours: null,
   };
   profile: InterestProfile | null = null;
   profileEdits: InterestEditFlags = { labels: false, preferredNodes: false, exclusions: false };

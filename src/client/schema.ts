@@ -30,6 +30,29 @@ export const thread = z.object({ topic: topicItem, content: z.string().max(4_000
   replyPage: z.number().int().min(0).max(3), hasMoreReplies: z.boolean(), stale: z.boolean() });
 export const cached = <T extends z.ZodType>(value: T) => z.object({ value, fetchedAt: date, stale: z.boolean(),
   source: z.enum(['network', 'cache']), refreshError: publicError.optional() });
+const weight = z.object({ name: label(80), weight: z.number().min(0).max(1) }).strict();
+export const summary = z.object({ topicId: id, summary: label(20_000), viewpoints: z.array(label(2_000)).max(100),
+  notableReplies: z.array(id).max(100), generatedAt: date, coveredReplyPages: z.array(z.number().int().min(1).max(1_000)).max(1_000),
+  completeDiscussion: z.boolean(), coverage: z.object({ loadedReplyPages: z.number().int().nonnegative(), totalReplyPages: z.number().int().nonnegative(),
+    complete: z.boolean(), includedReplies: z.number().int().nonnegative().optional(), omittedReplies: z.number().int().nonnegative().optional(),
+    contentTruncated: z.boolean().optional() }).strict().optional(), mode: z.enum(['quick', 'viewpoints', 'full']).optional(),
+  modelRoute: label(512).optional(), topicUpdatedAt: date.optional() }).strict();
+export const interestProfile = z.object({ authorized: z.boolean(), learningPaused: z.boolean(), labels: z.array(weight).max(100),
+  preferredNodes: z.array(weight.extend({ name: nodeName })).max(100), exclusions: z.array(label(100)).max(100),
+  feedback: z.array(z.object({ topicId: id, interested: z.boolean() }).strict()).max(500), updatedAt: date,
+  source: z.enum(['manual', 'history', 'mixed']) }).strict();
+export const recommendation = z.object({ topic: topicItem, score: z.number().min(0).max(1), reason: label(2_000),
+  matchedInterests: z.array(label(80)).max(100), generatedAt: date, read: z.boolean(),
+  feedback: z.enum(['interested', 'not_interested']).nullable() }).strict();
+export const recommendationList = z.object({ items: z.array(recommendation).max(100), generatedAt: date.nullable(), stale: z.boolean(),
+  source: z.enum(['generated', 'stored']), truncated: z.boolean().optional(), omittedItems: z.number().int().nonnegative().optional() });
+const time = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/);
+export const pluginSettings = z.object({ refreshIntervalMinutes: z.number().int().min(1).max(1440),
+  scannedNodes: z.array(nodeName).max(100), pagesPerNode: z.number().int().min(1).max(1000),
+  aiCandidateBudget: z.number().int().min(0).max(100), maxModelCallsPerRefresh: z.number().int().min(0).max(10),
+  notificationThreshold: z.number().min(0).max(1), quietHours: z.object({ start: time, end: time,
+    timeZone: label(100).refine(value => { try { new Intl.DateTimeFormat('en-US', { timeZone: value }).format(); return true; } catch { return false; } }) }).strict().nullable() }).strict();
+export const updated = z.object({ updated: z.literal(true) }).strict();
 export const envelope = z.discriminatedUnion('ok', [
   z.object({ ok: z.literal(true), data: z.unknown() }),
   z.object({ ok: z.literal(false), error: publicError }),

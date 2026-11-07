@@ -153,7 +153,7 @@ export class RefreshService {
     if (signal.aborted) throw new V2exError('timeout');
     await this.drainPending(lease);
     if (signal.aborted) throw new V2exError('timeout');
-    if (!this.options.budget.canRunBackground(this.clock.now())) return;
+    if (!this.options.budget.canRunBackground(this.clock.now()) || settings.maxModelCallsPerRefresh < 1) return;
 
     const candidates = new Map<number, TopicListItem>();
     const append = (page: TopicPage) => {

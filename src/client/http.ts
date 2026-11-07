@@ -1,7 +1,7 @@
 import { z } from 'zod';
-import type { AccountStatus, Cached, NodeInfo, ReplyItem, TopicListItem, TopicPage, TopicThread } from '../contract.js';
+import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, RecommendationList, ReplyItem, TopicAiSummary, TopicListItem, TopicPage, TopicThread } from '../contract.js';
 import type { V2exErrorCode } from '../errors.js';
-import { account, cached, envelope, node, reply, thread, topicItem, topicPage } from './schema.js';
+import { account, cached, envelope, interestProfile, node, pluginSettings, recommendationList, reply, summary, thread, topicItem, topicPage, updated } from './schema.js';
 
 export type ClientErrorCode = V2exErrorCode | 'cancelled';
 const MAX_RESPONSE_BYTES = 256 * 1024;
@@ -23,6 +23,13 @@ export interface V2exClientRemote {
   nodeTopics(node: string, page: number, signal?: AbortSignal): Promise<Cached<TopicPage>>;
   topic(id: string, signal?: AbortSignal): Promise<Cached<TopicThread>>;
   replies(id: string, page: number, signal?: AbortSignal): Promise<Cached<ReplyItem[]>>;
+  summary?(id: string, mode: 'quick' | 'viewpoints' | 'full', replyPages: number, signal?: AbortSignal): Promise<TopicAiSummary>;
+  interests?(method?: 'get' | 'authorize' | 'revoke' | 'relearn' | 'clear' | 'update', payload?: unknown, signal?: AbortSignal): Promise<InterestProfile>;
+  recommendations?(signal?: AbortSignal): Promise<RecommendationList>;
+  recommendationFeedback?(topicId: number, value: 'interested' | 'not_interested', signal?: AbortSignal): Promise<void>;
+  recommendationRead?(topicId: number, signal?: AbortSignal): Promise<void>;
+  settings?(signal?: AbortSignal): Promise<PluginSettings>;
+  updateSettings?(settings: PluginSettings, signal?: AbortSignal): Promise<PluginSettings>;
 }
 
 async function readJson(response: Response, signal?: AbortSignal): Promise<unknown> {
@@ -92,5 +99,20 @@ export function createV2exHttpClient(fetcher: typeof fetch = globalThis.fetch): 
     nodeTopics: (name, page, signal) => request(`/node/topics${query({ node: name, page })}`, cached(topicPage), { signal }),
     topic: (topicId, signal) => request(`/topic${query({ topic: topicId, replyPages: 0 })}`, cached(thread), { signal }),
     replies: (topicId, page, signal) => request(`/replies${query({ topic: topicId, page })}`, cached(z.array(reply).max(20)), { signal }),
+    summary: (topicId, mode, replyPages, signal) => request('/topic/summary', summary, { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ topic: topicId, mode, replyPages }), signal }),
+    interests: (method = 'get', payload, signal) => {
+      if (method === 'get') return request('/interests', interestProfile, { signal });
+      if (method === 'clear') return request('/interests', interestProfile, { method: 'DELETE', signal });
+      if (method === 'update') return request('/interests', interestProfile, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload), signal });
+      return request('/interests', interestProfile, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ action: method }), signal });
+    },
+    recommendations: signal => request('/recommendations', recommendationList, { signal }),
+    recommendationFeedback: async (topicId, value, signal) => { await request('/recommendations/feedback', updated,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topicId, value }), signal }); },
+    recommendationRead: async (topicId, signal) => { await request('/recommendations/read', updated,
+      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ topicId }), signal }); },
+    settings: signal => request('/settings', pluginSettings, { signal }),
+    updateSettings: (settings, signal) => request('/settings', pluginSettings, { method: 'PUT', headers: { 'content-type': 'application/json' }, body: JSON.stringify(settings), signal }),
   };
 }

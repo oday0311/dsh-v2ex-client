@@ -80,7 +80,13 @@ export async function composePlugin(ctx: unknown, config: Config): Promise<{ dis
     disposers.push(host.tools.register(createSummaryTool(service, intelligence)));
     disposers.push(host.tools.register(createInterestTool(interests)));
     disposers.push(host.tools.register(createRecommendationTool(service, recommendations)));
-    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence, interests, recommendations }));
+    const settings = {
+      get: () => auth.withRead(lease => store.getSettings(lease.scope)),
+      update: (value: import('./contract.js').PluginSettings) => auth.withMutation(async lease => {
+        await store.putSettings(value, lease.scope); return store.getSettings(lease.scope);
+      }),
+    };
+    disposers.push(await registerV2exHttpRoutes(connection, { auth, credential: vault, content: service, intelligence, interests, recommendations, settings }));
   } catch (error) {
     for (const dispose of disposers.reverse()) { try { await dispose(); } catch { /* Preserve startup error. */ } }
     await domain.close();

@@ -1,7 +1,7 @@
-import type { AccountStatus, Cached, NodeInfo, TopicPage, TopicThread } from '../contract.js';
+import type { AccountStatus, Cached, InterestProfile, NodeInfo, PluginSettings, RecommendationList, TopicAiSummary, TopicPage, TopicThread } from '../contract.js';
 import { V2exClientError, type V2exClientRemote, type ClientErrorCode } from './http.js';
 
-export type BrowseView = 'latest' | 'hot' | 'node';
+export type BrowseView = 'smart' | 'latest' | 'hot' | 'node' | 'interests' | 'settings';
 export interface ClientState {
   phase: 'checking' | 'guest' | 'ready';
   account: AccountStatus | null;
@@ -16,10 +16,27 @@ export interface ClientState {
   error: ClientErrorCode | null;
   detailError: ClientErrorCode | null;
   repliesError: ClientErrorCode | null;
+  summary: TopicAiSummary | null;
+  summaryMode: 'quick' | 'viewpoints' | 'full';
+  summaryLoading: boolean;
+  summaryError: ClientErrorCode | null;
+  interests: InterestProfile | null;
+  interestsLoading: boolean;
+  interestsError: ClientErrorCode | null;
+  recommendations: RecommendationList | null;
+  recommendationsLoading: boolean;
+  recommendationsError: ClientErrorCode | null;
+  settings: PluginSettings | null;
+  settingsLoading: boolean;
+  settingsError: ClientErrorCode | null;
 }
 
-const initial: ClientState = { phase: 'checking', account: null, view: 'latest', nodeName: '', nodeInfo: null, topics: null, thread: null, loading: false, detailLoading: false, repliesLoading: false, error: null, detailError: null, repliesError: null };
-type Lane = 'session' | 'list' | 'detail' | 'replies';
+const initial: ClientState = { phase: 'checking', account: null, view: 'latest', nodeName: '', nodeInfo: null, topics: null, thread: null, loading: false, detailLoading: false, repliesLoading: false, error: null, detailError: null, repliesError: null,
+  summary: null, summaryMode: 'quick', summaryLoading: false, summaryError: null,
+  interests: null, interestsLoading: false, interestsError: null,
+  recommendations: null, recommendationsLoading: false, recommendationsError: null,
+  settings: null, settingsLoading: false, settingsError: null };
+type Lane = 'session' | 'list' | 'detail' | 'replies' | 'summary' | 'interests' | 'recommendations' | 'recommendationAction' | 'settings';
 
 export class V2exClientStore {
   private state: Readonly<ClientState> = initial;
@@ -32,6 +49,7 @@ export class V2exClientStore {
 
   subscribe = (listener: () => void): (() => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   getSnapshot = (): Readonly<ClientState> => this.state;
+  hasSummary = (): boolean => typeof this.remote.summary === 'function';
   private set(patch: Partial<ClientState>): void {
     if (this.disposed) return;
     this.state = { ...this.state, ...patch };
@@ -55,9 +73,11 @@ export class V2exClientStore {
     } else this.set(patch);
   }
   private sessionStatus(account: AccountStatus): void {
-    this.stop('list', 'detail', 'replies');
+    this.stop('list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'recommendationAction', 'settings');
     this.selectedTopicId = null;
-    this.set({ account, phase: account.authenticated ? 'ready' : 'guest', topics: null, thread: null, nodeInfo: null, loading: false, detailLoading: false, repliesLoading: false, error: null, detailError: null, repliesError: null });
+    this.set({ account, phase: account.authenticated ? 'ready' : 'guest', topics: null, thread: null, nodeInfo: null, loading: false, detailLoading: false, repliesLoading: false, error: null, detailError: null, repliesError: null,
+      summary: null, summaryLoading: false, summaryError: null, interests: null, interestsLoading: false, interestsError: null,
+      recommendations: null, recommendationsLoading: false, recommendationsError: null, settings: null, settingsLoading: false, settingsError: null });
   }
   async loadSession(): Promise<void> {
     if (this.disposed) return;
@@ -78,19 +98,22 @@ export class V2exClientStore {
   async logout(clearPersonalData = false): Promise<void> {
     if (this.disposed) return;
     const request = this.start('session');
-    this.stop('list', 'detail', 'replies');
+    this.stop('list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'recommendationAction', 'settings');
     this.set({ loading: true, error: null });
     try { const status = await this.remote.logout(clearPersonalData, request.signal); if (request.current()) this.sessionStatus(status); }
     catch (error) { if (request.current()) this.set({ error: this.code(error), loading: false }); }
   }
   selectView(view: BrowseView): void {
     if (this.disposed || this.state.phase !== 'ready') return;
-    this.stop('list', 'detail', 'replies');
+    this.stop('list', 'detail', 'replies', 'summary');
     this.selectedTopicId = null;
     this.set({ view, topics: null, thread: null, nodeInfo: null, error: null, detailError: null, repliesError: null,
       loading: false, detailLoading: false, repliesLoading: false });
     if (view === 'latest') void this.loadLatest();
     if (view === 'hot') void this.loadHot();
+    if (view === 'smart') void this.loadRecommendations();
+    if (view === 'interests') void this.loadInterests();
+    if (view === 'settings') void this.loadSettings();
   }
   async loadLatest(page = 1): Promise<void> { await this.loadList(signal => this.remote.latest(page, signal), page); }
   private async loadList(fetchPage: (signal: AbortSignal) => Promise<Cached<TopicPage>>, page: number): Promise<void> {
@@ -127,12 +150,13 @@ export class V2exClientStore {
     if (this.disposed || this.state.phase !== 'ready') return;
     if (!/^[1-9][0-9]*$/.test(topicId)) { this.set({ detailError: 'invalid_request' }); return; }
     this.selectedTopicId = topicId;
-    this.stop('replies'); const request = this.start('detail');
-    this.set({ thread: null, detailLoading: true, repliesLoading: false, detailError: null, repliesError: null });
+    this.stop('replies', 'summary'); const request = this.start('detail');
+    this.set({ thread: null, detailLoading: true, repliesLoading: false, detailError: null, repliesError: null,
+      summary: null, summaryLoading: false, summaryError: null });
     try { const thread = await this.remote.topic(topicId, request.signal); if (request.current()) this.set({ thread, detailLoading: false }); }
     catch (error) { if (request.current()) this.fail(error, { detailLoading: false, detailError: this.code(error) }); }
   }
-  closeTopic(): void { this.stop('detail', 'replies'); this.selectedTopicId = null; this.set({ thread: null, detailError: null, repliesError: null, detailLoading: false, repliesLoading: false }); }
+  closeTopic(): void { this.stop('detail', 'replies', 'summary'); this.selectedTopicId = null; this.set({ thread: null, detailError: null, repliesError: null, detailLoading: false, repliesLoading: false, summary: null, summaryLoading: false, summaryError: null }); }
   async loadMoreReplies(): Promise<void> {
     const thread = this.state.thread;
     if (this.disposed || this.state.phase !== 'ready' || !thread || !thread.value.hasMoreReplies) return;
@@ -146,6 +170,64 @@ export class V2exClientStore {
       }
     } catch (error) { if (request.current()) this.fail(error, { repliesLoading: false, repliesError: this.code(error) }); }
   }
+  async generateSummary(mode: 'quick' | 'viewpoints' | 'full' = this.state.summaryMode): Promise<void> {
+    const thread = this.state.thread;
+    if (this.disposed || this.state.phase !== 'ready' || !thread || !this.remote.summary) return;
+    const request = this.start('summary');
+    this.set({ summaryMode: mode, summaryLoading: true, summaryError: null });
+    try {
+      const summary = await this.remote.summary(String(thread.value.topic.id), mode, Math.max(1, thread.value.replyPage || 1), request.signal);
+      if (request.current() && this.state.thread?.value.topic.id === thread.value.topic.id) this.set({ summary, summaryLoading: false });
+    } catch (error) { if (request.current()) this.fail(error, { summaryLoading: false, summaryError: this.code(error) }); }
+  }
+  setSummaryMode(mode: 'quick' | 'viewpoints' | 'full'): void {
+    if (!this.state.summaryLoading) this.set({ summaryMode: mode });
+  }
+  async loadInterests(): Promise<void> {
+    if (this.disposed || this.state.phase !== 'ready' || !this.remote.interests) return;
+    const request = this.start('interests'); this.set({ interestsLoading: true, interestsError: null });
+    try { const interests = await this.remote.interests('get', undefined, request.signal); if (request.current()) this.set({ interests, interestsLoading: false }); }
+    catch (error) { if (request.current()) this.fail(error, { interestsLoading: false, interestsError: this.code(error) }); }
+  }
+  async changeInterests(action: 'authorize' | 'revoke' | 'relearn' | 'clear' | 'update', payload?: unknown): Promise<void> {
+    if (this.disposed || this.state.phase !== 'ready' || !this.remote.interests) return;
+    const request = this.start('interests'); this.set({ interestsLoading: true, interestsError: null });
+    try { const interests = await this.remote.interests(action, payload, request.signal); if (request.current()) this.set({ interests,
+      interestsLoading: false, ...(action === 'clear' ? { recommendations: null } : {}) }); }
+    catch (error) { if (request.current()) this.fail(error, { interestsLoading: false, interestsError: this.code(error) }); }
+  }
+  async loadRecommendations(): Promise<void> {
+    if (this.disposed || this.state.phase !== 'ready' || !this.remote.recommendations) return;
+    const request = this.start('recommendations'); this.set({ recommendationsLoading: true, recommendationsError: null });
+    try { const recommendations = await this.remote.recommendations(request.signal); if (request.current()) this.set({ recommendations, recommendationsLoading: false }); }
+    catch (error) { if (request.current()) this.fail(error, { recommendationsLoading: false, recommendationsError: this.code(error) }); }
+  }
+  async markRecommendationRead(topicId: number): Promise<void> {
+    if (this.disposed || !this.remote.recommendationRead) return;
+    const request = this.start('recommendationAction');
+    try { await this.remote.recommendationRead(topicId, request.signal); if (request.current() && this.state.recommendations) this.set({ recommendations: {
+      ...this.state.recommendations, items: this.state.recommendations.items.map(item => item.topic.id === topicId ? { ...item, read: true } : item) } }); }
+    catch (error) { if (request.current()) this.set({ recommendationsError: this.code(error) }); }
+  }
+  async setRecommendationFeedback(topicId: number, value: 'interested' | 'not_interested'): Promise<void> {
+    if (this.disposed || !this.remote.recommendationFeedback) return;
+    const request = this.start('recommendationAction');
+    try { await this.remote.recommendationFeedback(topicId, value, request.signal); if (request.current() && this.state.recommendations) this.set({ recommendations: {
+      ...this.state.recommendations, items: this.state.recommendations.items.map(item => item.topic.id === topicId ? { ...item, feedback: value } : item) } }); }
+    catch (error) { if (request.current()) this.set({ recommendationsError: this.code(error) }); }
+  }
+  async loadSettings(): Promise<void> {
+    if (this.disposed || this.state.phase !== 'ready' || !this.remote.settings) return;
+    const request = this.start('settings'); this.set({ settingsLoading: true, settingsError: null });
+    try { const settings = await this.remote.settings(request.signal); if (request.current()) this.set({ settings, settingsLoading: false }); }
+    catch (error) { if (request.current()) this.fail(error, { settingsLoading: false, settingsError: this.code(error) }); }
+  }
+  async saveSettings(settings: PluginSettings): Promise<void> {
+    if (this.disposed || this.state.phase !== 'ready' || !this.remote.updateSettings) return;
+    const request = this.start('settings'); this.set({ settingsLoading: true, settingsError: null });
+    try { const saved = await this.remote.updateSettings(settings, request.signal); if (request.current()) this.set({ settings: saved, settingsLoading: false }); }
+    catch (error) { if (request.current()) this.fail(error, { settingsLoading: false, settingsError: this.code(error) }); }
+  }
   retry(): void {
     if (this.state.detailError && this.selectedTopicId) { void this.openTopic(this.selectedTopicId); return; }
     if (this.state.repliesError) { void this.loadMoreReplies(); return; }
@@ -154,5 +236,5 @@ export class V2exClientStore {
     else if (this.state.view === 'node') void this.loadNode(this.state.nodeName);
     else void this.loadLatest();
   }
-  dispose(): void { if (this.disposed) return; this.disposed = true; this.stop('session', 'list', 'detail', 'replies'); this.controllers.clear(); this.listeners.clear(); }
+  dispose(): void { if (this.disposed) return; this.disposed = true; this.stop('session', 'list', 'detail', 'replies', 'summary', 'interests', 'recommendations', 'recommendationAction', 'settings'); this.controllers.clear(); this.listeners.clear(); }
 }

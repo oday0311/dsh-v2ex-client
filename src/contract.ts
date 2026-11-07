@@ -22,6 +22,7 @@ export interface PluginSettings {
   scannedNodes: string[];
   pagesPerNode: number;
   aiCandidateBudget: number;
+  maxModelCallsPerRefresh: number;
   notificationThreshold: number;
   quietHours: { start: string; end: string; timeZone: string } | null;
 }

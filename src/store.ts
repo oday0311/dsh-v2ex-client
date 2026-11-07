@@ -36,6 +36,7 @@ export const PluginSettingsSchema = z.strictObject({
   scannedNodes: z.array(nodeName).max(100),
   pagesPerNode: z.number().int().min(1).max(1000),
   aiCandidateBudget: z.number().int().min(0).max(100),
+  maxModelCallsPerRefresh: z.number().int().min(0).max(10).default(1),
   notificationThreshold: z.number().min(0).max(1),
   quietHours: z.strictObject({ start: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
     end: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/),
@@ -143,7 +144,7 @@ const NotificationStatesSchema = z.record(accountScope, z.union([
 
 export const defaultSettings: PluginSettings = {
   refreshIntervalMinutes: 30, scannedNodes: [], pagesPerNode: 2,
-  aiCandidateBudget: 10, notificationThreshold: 0.7, quietHours: null,
+  aiCandidateBudget: 10, maxModelCallsPerRefresh: 1, notificationThreshold: 0.7, quietHours: null,
 };
 
 export const v2exDomainSpec = defineDomain({

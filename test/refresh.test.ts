@@ -112,6 +112,15 @@ test('timer skips all content and model work near the V2EX rate limit', async ()
   assert.equal(f.refreshCalls, 0);
 });
 
+test('zero model-call budget drains pending state but skips content and ranking work', async () => {
+  const f = fixture();
+  f.store.settings = { ...f.store.settings, maxModelCallsPerRefresh: 0 };
+  await f.service.runNow('manual');
+  assert.deepEqual(f.contentCalls, []);
+  assert.equal(f.refreshCalls, 0);
+  assert.equal(f.identity.readCalls, 1);
+});
+
 test('budget exhaustion drains cached-account pending before returning and never duplicates later', async () => {
   for (const reason of ['timer', 'manual'] as const) {
     const f = fixture({ budget: false, items: [] }); const scope = accountScope('alice');
