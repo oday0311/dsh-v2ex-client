@@ -3,3 +3,6 @@ lib/
 playwright-report/
 test-results/
 /test/e2e/harness/dist/
+.env
+.env.*
+*.tgz

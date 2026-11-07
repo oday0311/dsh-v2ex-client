@@ -2,6 +2,7 @@
   "name": "v2ex-dsh-client",
   "version": "0.1.0",
   "description": "Read-only V2EX browsing and discovery for DeepSeek Harness",
+  "license": "MIT",
   "type": "module",
   "main": "./lib/index.js",
   "types": "./lib/types/index.d.ts",
@@ -16,7 +17,7 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["lib", "cordis.patch.yml", "dsh.plugin.json", "README.md"],
+  "files": ["lib", "cordis.patch.yml", "dsh.plugin.json", "README.md", "README_ZH.md", "LICENSE"],
   "engines": { "node": ">=22", "dsh": ">=0.2.1-rc.5 <0.3.0" },
   "keywords": ["dsh-plugin", "deepseek-harness", "v2ex", "read-only"],
   "dsh": {
@@ -40,6 +41,7 @@
     "test": "node --import tsx --test test/*.test.ts test/client/*.test.ts test/client/*.test.tsx",
     "test:integration": "node --import tsx --test test/integration/*.test.ts",
     "test:e2e": "node test/e2e/harness/build.mjs && playwright test",
+    "verify:live-api": "tsx scripts/verify-live-api.ts",
     "verify:package": "node scripts/verify-package.mjs",
     "verify:release": "node scripts/verify-release.mjs"
   },
